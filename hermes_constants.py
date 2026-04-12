@@ -5,7 +5,11 @@ without risk of circular imports.
 """
 
 import os
+import re
 from pathlib import Path
+
+
+DEFAULT_TENANT = "default"
 
 
 def get_hermes_home() -> Path:
@@ -15,6 +19,37 @@ def get_hermes_home() -> Path:
     This is the single source of truth — all other copies should import this.
     """
     return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+
+
+def normalize_tenant(user_id: str | None) -> str:
+    """Normalize tenant/user identity for storage and filesystem paths.
+
+    - ``None`` or blank → ``"default"``
+    - Strips surrounding whitespace
+    - Replaces path separators and ``..`` segments with underscores to
+      prevent directory traversal while preserving caller intent.
+    """
+    if user_id is None:
+        return DEFAULT_TENANT
+    value = str(user_id).strip()
+    if not value:
+        return DEFAULT_TENANT
+    # Replace path separators and collapse traversal tokens
+    value = re.sub(r"[\\/]+", "_", value)
+    value = value.replace("..", "_")
+    if not value:
+        return DEFAULT_TENANT
+    return value
+
+
+def get_user_home(user_id: str | None) -> Path:
+    """Return the tenant-scoped home directory under ``<HERMES_HOME>/users``."""
+    return get_hermes_home() / "users" / normalize_tenant(user_id)
+
+
+def get_user_subpath(user_id: str | None, *subpaths: str) -> Path:
+    """Return a tenant-scoped subpath (e.g., sessions, processes files)."""
+    return get_user_home(user_id).joinpath(*subpaths)
 
 
 def get_optional_skills_dir(default: Path | None = None) -> Path:
