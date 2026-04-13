@@ -466,3 +466,65 @@ class TestTenantIsolation:
         recovered = registry.recover_from_checkpoint()
         assert recovered == 1
         assert registry.get("proc_legacy") is not None
+
+    def test_same_task_id_isolated_per_tenant(self, registry, monkeypatch):
+        shared_task = "shared"
+        s_alice = _make_session(sid="proc_a", task_id=shared_task, user_id="alice", output="alice out")
+        s_bob = _make_session(sid="proc_b", task_id=shared_task, user_id="bob", output="bob out")
+        registry._running[s_alice.id] = s_alice
+        registry._running[s_bob.id] = s_bob
+
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        alice_list = registry.list_sessions(task_id=shared_task)
+        assert [p["session_id"] for p in alice_list] == ["proc_a"]
+        assert registry.poll("proc_b")["status"] == "not_found"
+        assert registry.read_log("proc_b")["status"] == "not_found"
+
+        monkeypatch.setenv("HERMES_USER_ID", "bob")
+        bob_list = registry.list_sessions(task_id=shared_task)
+        assert [p["session_id"] for p in bob_list] == ["proc_b"]
+        assert "bob out" in registry.poll("proc_b")["output_preview"]
+
+        monkeypatch.delenv("HERMES_USER_ID", raising=False)
+        assert registry.list_sessions(task_id=shared_task) == []
+
+    def test_kill_foreign_tenant_returns_not_found(self, registry, monkeypatch):
+        s_bob = _make_session(sid="proc_b", task_id="t1", user_id="bob")
+        registry._running[s_bob.id] = s_bob
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        assert registry.kill_process("proc_b")["status"] == "not_found"
+
+    def test_recover_shared_checkpoint_filters_foreign_entries(self, registry, tmp_path, monkeypatch):
+        shared_checkpoint = tmp_path / "procs.json"
+        shared_checkpoint.write_text(json.dumps([
+            {
+                "session_id": "proc_alice",
+                "command": "sleep 1",
+                "pid": os.getpid(),
+                "task_id": "t1",
+                "user_id": "alice",
+            },
+            {
+                "session_id": "proc_bob",
+                "command": "sleep 1",
+                "pid": os.getpid(),
+                "task_id": "t1",
+                "user_id": "bob",
+            },
+            {
+                "session_id": "proc_missing",
+                "command": "sleep 1",
+                "pid": os.getpid(),
+                "task_id": "t1",
+            },
+        ]))
+
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        with patch("tools.process_registry.CHECKPOINT_PATH", shared_checkpoint):
+            recovered = registry.recover_from_checkpoint()
+
+        assert recovered == 2  # alice + missing user_id normalized to alice
+        assert registry.get("proc_bob") is None
+
+        remaining = json.loads(shared_checkpoint.read_text())
+        assert any(entry["session_id"] == "proc_bob" for entry in remaining)

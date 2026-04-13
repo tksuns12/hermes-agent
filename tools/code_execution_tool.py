@@ -48,6 +48,8 @@ from typing import Any, Dict, List, Optional
 # Availability gate: UDS requires a POSIX OS
 logger = logging.getLogger(__name__)
 
+from hermes_constants import resolve_runtime_key, split_runtime_key
+
 SANDBOX_AVAILABLE = sys.platform != "win32"
 
 # The 7 tools allowed inside the sandbox. The intersection of this list
@@ -427,42 +429,38 @@ def _rpc_server_loop(
 # Remote execution support (file-based RPC via terminal backend)
 # ---------------------------------------------------------------------------
 
-def _get_or_create_env(task_id: str):
-    """Get or create the terminal environment for *task_id*.
-
-    Reuses the same environment (container/sandbox/SSH session) that the
-    terminal and file tools use, creating one if it doesn't exist yet.
-    Returns ``(env, env_type)`` tuple.
-    """
+def _get_or_create_env(task_id: Optional[str]):
+    """Get or create the terminal environment for execute_code."""
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks, _creation_locks_lock, _task_env_overrides,
     )
+    import time
 
-    effective_task_id = task_id or "default"
+    runtime_key, tenant, normalized_task = resolve_runtime_key(task_id)
 
     # Fast path: environment already exists
     with _env_lock:
-        if effective_task_id in _active_environments:
-            _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
+        if runtime_key in _active_environments:
+            _last_activity[runtime_key] = time.time()
+            return _active_environments[runtime_key], _get_env_config()["env_type"]
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
     with _creation_locks_lock:
-        if effective_task_id not in _creation_locks:
-            _creation_locks[effective_task_id] = threading.Lock()
-        task_lock = _creation_locks[effective_task_id]
+        if runtime_key not in _creation_locks:
+            _creation_locks[runtime_key] = threading.Lock()
+        task_lock = _creation_locks[runtime_key]
 
     with task_lock:
         with _env_lock:
-            if effective_task_id in _active_environments:
-                _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
+            if runtime_key in _active_environments:
+                _last_activity[runtime_key] = time.time()
+                return _active_environments[runtime_key], _get_env_config()["env_type"]
 
         config = _get_env_config()
         env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        overrides = _task_env_overrides.get(runtime_key, {})
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -503,8 +501,8 @@ def _get_or_create_env(task_id: str):
                 "persistent": config.get("local_persistent", False),
             }
 
-        logger.info("Creating new %s environment for execute_code task %s...",
-                     env_type, effective_task_id[:8])
+        logger.info("Creating new %s environment for execute_code tenant %s task %s...",
+                     env_type, tenant, normalized_task[:8])
         env = _create_environment(
             env_type=env_type,
             image=image,
@@ -513,18 +511,21 @@ def _get_or_create_env(task_id: str):
             ssh_config=ssh_config,
             container_config=container_config,
             local_config=local_config,
-            task_id=effective_task_id,
+            task_id=runtime_key,
             host_cwd=config.get("host_cwd"),
         )
 
         with _env_lock:
-            _active_environments[effective_task_id] = env
-            _last_activity[effective_task_id] = time.time()
+            _active_environments[runtime_key] = env
+            _last_activity[runtime_key] = time.time()
 
         _start_cleanup_thread()
-        logger.info("%s environment ready for execute_code task %s",
-                     env_type, effective_task_id[:8])
+        logger.info("%s environment ready for execute_code tenant %s task %s",
+                     env_type, tenant, normalized_task[:8])
         return env, env_type
+
+
+
 
 
 def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
@@ -703,8 +704,8 @@ def _execute_remote(
     if not sandbox_tools:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
-    effective_task_id = task_id or "default"
-    env, env_type = _get_or_create_env(effective_task_id)
+    runtime_key, tenant, normalized_task = resolve_runtime_key(task_id)
+    env, env_type = _get_or_create_env(runtime_key)
 
     sandbox_id = uuid.uuid4().hex[:12]
     sandbox_dir = f"/tmp/hermes_exec_{sandbox_id}"
@@ -749,7 +750,7 @@ def _execute_remote(
         rpc_thread = threading.Thread(
             target=_rpc_poll_loop,
             args=(
-                env, f"{sandbox_dir}/rpc", effective_task_id,
+                env, f"{sandbox_dir}/rpc", runtime_key,
                 tool_call_log, tool_call_counter, max_tool_calls,
                 sandbox_tools, stop_event,
             ),
@@ -767,8 +768,8 @@ def _execute_remote(
             env_prefix += f" TZ={tz}"
 
         # Execute the script on the remote backend
-        logger.info("Executing code on %s backend (task %s)...",
-                     env_type, effective_task_id[:8])
+        logger.info("Executing code on %s backend (tenant %s task %s)...",
+                     env_type, tenant, normalized_task[:8])
         script_result = env.execute(
             f"cd {sandbox_dir} && {env_prefix} python3 script.py",
             timeout=timeout,
@@ -892,11 +893,13 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    runtime_key, tenant, normalized_task = resolve_runtime_key(task_id)
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config
     env_type = _get_env_config()["env_type"]
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(code, runtime_key, enabled_tools)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -948,7 +951,7 @@ def execute_code(
         rpc_thread = threading.Thread(
             target=_rpc_server_loop,
             args=(
-                server_sock, task_id, tool_call_log,
+                server_sock, runtime_key, tool_call_log,
                 tool_call_counter, max_tool_calls, sandbox_tools,
             ),
             daemon=True,

@@ -19,6 +19,8 @@ _CURRENT_TENANT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "hermes_current_tenant", default=None
 )
 
+RUNTIME_KEY_DELIMITER = "::"
+
 
 def get_current_tenant(user_id: str | None = None) -> str:
     """Return the effective tenant for the current execution context.
@@ -40,6 +42,56 @@ def get_current_tenant(user_id: str | None = None) -> str:
     return normalize_tenant(env_user)
 
 
+
+
+def normalize_task_id(task_id: str | None) -> str:
+    """Normalize task identifiers for runtime caches.
+
+    - ``None`` or blank → ``"default"``
+    - Strips surrounding whitespace
+    """
+    if task_id is None:
+        return DEFAULT_TENANT
+    value = str(task_id).strip()
+    return value or DEFAULT_TENANT
+
+
+def derive_runtime_key(task_id: str | None = None, user_id: str | None = None) -> tuple[str, str, str]:
+    """Return a tenant-aware runtime cache key.
+
+    Returns (runtime_key, tenant, normalized_task_id).
+    """
+    tenant = get_current_tenant(user_id)
+    normalized_task = normalize_task_id(task_id)
+    return f"{tenant}{RUNTIME_KEY_DELIMITER}{normalized_task}", tenant, normalized_task
+
+
+def split_runtime_key(runtime_key: str) -> tuple[str, str]:
+    """Split a runtime cache key into (tenant, task_id).
+
+    Accepts legacy plain task_ids (no delimiter) and falls back to
+    ``DEFAULT_TENANT`` for missing/blank segments.
+    """
+    if not runtime_key:
+        return DEFAULT_TENANT, DEFAULT_TENANT
+    if RUNTIME_KEY_DELIMITER in runtime_key:
+        tenant, task = runtime_key.split(RUNTIME_KEY_DELIMITER, 1)
+    else:
+        tenant, task = DEFAULT_TENANT, runtime_key
+    return normalize_tenant(tenant), normalize_task_id(task)
+
+
+def resolve_runtime_key(task_id: str | None = None, user_id: str | None = None) -> tuple[str, str, str]:
+    """Coerce *task_id* into a tenant-aware runtime key.
+
+    If *task_id* already looks like a runtime key (contains the delimiter),
+    its tenant is preserved; otherwise the current tenant is applied.
+    Returns (runtime_key, tenant, normalized_task_id).
+    """
+    if isinstance(task_id, str) and RUNTIME_KEY_DELIMITER in task_id:
+        tenant, parsed_task = split_runtime_key(task_id)
+        return derive_runtime_key(parsed_task, tenant)
+    return derive_runtime_key(task_id, user_id)
 @contextmanager
 def tenant_context(user_id: str | None):
     """Bind *user_id* for the lifetime of a tool call.

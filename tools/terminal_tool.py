@@ -46,6 +46,7 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+from hermes_constants import resolve_runtime_key, split_runtime_key
 
 # ---------------------------------------------------------------------------
 # Global interrupt event: set by the agent when a user interrupt arrives.
@@ -463,7 +464,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
     """
-    _task_env_overrides[task_id] = overrides
+    runtime_key, _, _ = resolve_runtime_key(task_id)
+    _task_env_overrides[runtime_key] = overrides
 
 
 def clear_task_env_overrides(task_id: str):
@@ -472,8 +474,11 @@ def clear_task_env_overrides(task_id: str):
 
     Called during cleanup to avoid stale entries accumulating.
     """
-    _task_env_overrides.pop(task_id, None)
+    runtime_key, _, _ = resolve_runtime_key(task_id)
+    _task_env_overrides.pop(runtime_key, None)
 
+
+# Configuration from environment variables
 # Configuration from environment variables
 
 def _parse_env_var(name: str, default: str, converter=int, type_label: str = "integer"):
@@ -720,9 +725,12 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # background processes (their _last_activity gets refreshed to keep them alive).
     try:
         from tools.process_registry import process_registry
-        for task_id in list(_last_activity.keys()):
-            if process_registry.has_active_processes(task_id):
-                _last_activity[task_id] = current_time  # Keep sandbox alive
+        from hermes_constants import tenant_context, split_runtime_key
+        for runtime_key in list(_last_activity.keys()):
+            tenant, _task = split_runtime_key(runtime_key)
+            with tenant_context(tenant):
+                if process_registry.has_active_processes(runtime_key):
+                    _last_activity[runtime_key] = current_time  # Keep sandbox alive
     except ImportError:
         pass
 
@@ -730,29 +738,30 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # holding the lock.  Do NOT call env.cleanup() inside the lock -- Modal and
     # Docker teardown can block for 10-15s, which would stall every concurrent
     # terminal/file tool call waiting on _env_lock.
-    envs_to_stop = []  # list of (task_id, env) pairs
+    envs_to_stop = []  # list of (runtime_key, env) pairs
 
     with _env_lock:
-        for task_id, last_time in list(_last_activity.items()):
+        for runtime_key, last_time in list(_last_activity.items()):
             if current_time - last_time > lifetime_seconds:
-                env = _active_environments.pop(task_id, None)
-                _last_activity.pop(task_id, None)
+                env = _active_environments.pop(runtime_key, None)
+                _last_activity.pop(runtime_key, None)
                 if env is not None:
-                    envs_to_stop.append((task_id, env))
+                    envs_to_stop.append((runtime_key, env))
 
         # Also purge per-task creation locks for cleaned-up tasks
         with _creation_locks_lock:
-            for task_id, _ in envs_to_stop:
-                _creation_locks.pop(task_id, None)
+            for runtime_key, _ in envs_to_stop:
+                _creation_locks.pop(runtime_key, None)
 
     # Phase 2: stop the actual sandboxes OUTSIDE the lock so other tool calls
     # are not blocked while Modal/Docker sandboxes shut down.
-    for task_id, env in envs_to_stop:
+    for runtime_key, env in envs_to_stop:
+        tenant, task_label = split_runtime_key(runtime_key)
         # Invalidate stale file_ops cache entry (Bug fix: prevents
         # ShellFileOperations from referencing a dead sandbox)
         try:
             from tools.file_tools import clear_file_ops_cache
-            clear_file_ops_cache(task_id)
+            clear_file_ops_cache(runtime_key)
         except ImportError:
             pass
 
@@ -764,16 +773,14 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
             elif hasattr(env, 'terminate'):
                 env.terminate()
 
-            logger.info("Cleaned up inactive environment for task: %s", task_id)
+            logger.info("Cleaned up inactive environment for tenant=%s task=%s", tenant, task_label)
 
         except Exception as e:
             error_str = str(e)
             if "404" in error_str or "not found" in error_str.lower():
-                logger.info("Environment for task %s already cleaned up", task_id)
+                logger.info("Environment for tenant=%s task=%s already cleaned up", tenant, task_label)
             else:
-                logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
-
-
+                logger.warning("Error cleaning up environment for tenant=%s task=%s: %s", tenant, task_label, e)
 def _cleanup_thread_worker():
     """Background thread worker that periodically cleans up inactive environments."""
     while _cleanup_running:
@@ -817,13 +824,20 @@ def get_active_environments_info() -> Dict[str, Any]:
         "count": len(_active_environments),
         "task_ids": list(_active_environments.keys()),
         "workdirs": {},
+        "runtimes": [],
     }
-    
+
     # Calculate total disk usage (per-task to avoid double-counting)
     total_size = 0
-    for task_id in _active_environments:
+    for runtime_key in _active_environments:
+        tenant, task_label = split_runtime_key(runtime_key)
+        info["runtimes"].append({
+            "runtime_key": runtime_key,
+            "tenant": tenant,
+            "task_id": task_label,
+        })
         scratch_dir = _get_scratch_dir()
-        pattern = f"hermes-*{task_id[:8]}*"
+        pattern = f"hermes-*{task_label[:8]}*"
         import glob
         for path in glob.glob(str(scratch_dir / pattern)):
             try:
@@ -831,9 +845,36 @@ def get_active_environments_info() -> Dict[str, Any]:
                 total_size += size
             except OSError as e:
                 logger.debug("Could not stat path %s: %s", path, e)
-    
+
     info["total_disk_usage_mb"] = round(total_size / (1024 * 1024), 2)
     return info
+
+
+def cleanup_all_environments():
+    """Clean up ALL active environments. Use with caution."""
+    task_ids = list(_active_environments.keys())
+    cleaned = 0
+
+    for task_id in task_ids:
+        try:
+            cleanup_vm(task_id)
+            cleaned += 1
+        except Exception as e:
+            logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
+
+    # Also clean any orphaned directories
+    scratch_dir = _get_scratch_dir()
+    import glob
+    for path in glob.glob(str(scratch_dir / "hermes-*")):
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+            logger.info("Removed orphaned: %s", path)
+        except OSError as e:
+            logger.debug("Failed to remove orphaned path %s: %s", path, e)
+
+    if cleaned > 0:
+        logger.info("Cleaned %d environments", cleaned)
+    return cleaned
 
 
 def cleanup_all_environments():
@@ -865,22 +906,24 @@ def cleanup_all_environments():
 
 def cleanup_vm(task_id: str):
     """Manually clean up a specific environment by task_id."""
+    runtime_key, tenant, task_label = resolve_runtime_key(task_id)
+
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
     env = None
     with _env_lock:
-        env = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
+        env = _active_environments.pop(runtime_key, None)
+        _last_activity.pop(runtime_key, None)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
+        _creation_locks.pop(runtime_key, None)
 
     # Invalidate stale file_ops cache entry
     try:
         from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
+        clear_file_ops_cache(runtime_key)
     except ImportError:
         pass
 
@@ -895,15 +938,23 @@ def cleanup_vm(task_id: str):
         elif hasattr(env, 'terminate'):
             env.terminate()
 
-        logger.info("Manually cleaned up environment for task: %s", task_id)
+        logger.info("Manually cleaned up environment for tenant=%s task=%s", tenant, task_label)
 
     except Exception as e:
         error_str = str(e)
         if "404" in error_str or "not found" in error_str.lower():
-            logger.info("Environment for task %s already cleaned up", task_id)
+            logger.info("Environment for tenant=%s task=%s already cleaned up", tenant, task_label)
         else:
-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+            logger.warning("Error cleaning up environment for tenant=%s task=%s: %s", tenant, task_label, e)
 
+
+def _atexit_cleanup():
+    """Stop cleanup thread and shut down all remaining sandboxes on exit."""
+    _stop_cleanup_thread()
+    if _active_environments:
+        count = len(_active_environments)
+        logger.info("Shutting down %d remaining sandbox(es)...", count)
+        cleanup_all_environments()
 
 def _atexit_cleanup():
     """Stop cleanup thread and shut down all remaining sandboxes on exit."""
@@ -1034,12 +1085,12 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
-        # Use task_id for environment isolation
-        effective_task_id = task_id or "default"
+        # Use tenant-aware runtime key for environment isolation
+        runtime_key, tenant, effective_task_id = resolve_runtime_key(task_id)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        overrides = _task_env_overrides.get(runtime_key, {})
         
         # Select image based on env type, with per-task override support
         if env_type == "docker":
@@ -1065,9 +1116,9 @@ def terminal_tool(
         # task_id wait for the first one to finish creating the sandbox,
         # instead of each creating their own (wasting Modal resources).
         with _env_lock:
-            if effective_task_id in _active_environments:
-                _last_activity[effective_task_id] = time.time()
-                env = _active_environments[effective_task_id]
+            if runtime_key in _active_environments:
+                _last_activity[runtime_key] = time.time()
+                env = _active_environments[runtime_key]
                 needs_creation = False
             else:
                 needs_creation = True
@@ -1075,22 +1126,22 @@ def terminal_tool(
         if needs_creation:
             # Per-task lock: only one thread creates the sandbox, others wait
             with _creation_locks_lock:
-                if effective_task_id not in _creation_locks:
-                    _creation_locks[effective_task_id] = threading.Lock()
-                task_lock = _creation_locks[effective_task_id]
+                if runtime_key not in _creation_locks:
+                    _creation_locks[runtime_key] = threading.Lock()
+                task_lock = _creation_locks[runtime_key]
 
             with task_lock:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
-                    if effective_task_id in _active_environments:
-                        _last_activity[effective_task_id] = time.time()
-                        env = _active_environments[effective_task_id]
+                    if runtime_key in _active_environments:
+                        _last_activity[runtime_key] = time.time()
+                        env = _active_environments[runtime_key]
                         needs_creation = False
 
                 if needs_creation:
                     if env_type == "singularity":
                         _check_disk_usage_warning()
-                    logger.info("Creating new %s environment for task %s...", env_type, effective_task_id[:8])
+                    logger.info("Creating new %s environment for tenant %s task %s...", env_type, tenant, effective_task_id[:8])
                     try:
                         ssh_config = None
                         if env_type == "ssh":
@@ -1128,7 +1179,7 @@ def terminal_tool(
                             ssh_config=ssh_config,
                             container_config=container_config,
                             local_config=local_config,
-                            task_id=effective_task_id,
+                            task_id=runtime_key,
                             host_cwd=config.get("host_cwd"),
                         )
                     except ImportError as e:
@@ -1140,10 +1191,10 @@ def terminal_tool(
                         }, ensure_ascii=False)
 
                     with _env_lock:
-                        _active_environments[effective_task_id] = new_env
-                        _last_activity[effective_task_id] = time.time()
+                        _active_environments[runtime_key] = new_env
+                        _last_activity[runtime_key] = time.time()
                         env = new_env
-                    logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
+                    logger.info("%s environment ready for tenant %s task %s", env_type, tenant, effective_task_id[:8])
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
@@ -1210,7 +1261,7 @@ def terminal_tool(
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
-                        task_id=effective_task_id,
+                        task_id=runtime_key,
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=pty,
@@ -1220,7 +1271,7 @@ def terminal_tool(
                         env=env,
                         command=command,
                         cwd=effective_cwd,
-                        task_id=effective_task_id,
+                        task_id=runtime_key,
                         session_key=session_key,
                     )
 
@@ -1327,12 +1378,12 @@ def terminal_tool(
                         retry_count += 1
                         wait_time = 2 ** retry_count
                         logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                       wait_time, retry_count, max_retries, command[:200], type(e).__name__, e, effective_task_id, env_type)
+                                       wait_time, retry_count, max_retries, command[:200], type(e).__name__, e, runtime_key, env_type)
                         time.sleep(wait_time)
                         continue
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                 max_retries, command[:200], type(e).__name__, e, effective_task_id, env_type)
+                                 max_retries, command[:200], type(e).__name__, e, runtime_key, env_type)
                     return json.dumps({
                         "output": "",
                         "exit_code": -1,

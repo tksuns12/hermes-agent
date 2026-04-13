@@ -814,8 +814,18 @@ class ProcessRegistry:
         except Exception:
             return 0
 
+        shared_checkpoint = CHECKPOINT_PATH is not None or path == _legacy_checkpoint_path()
         recovered = 0
+        entries_to_keep: list = []
+
         for entry in entries:
+            entry_tenant = normalize_tenant(entry.get("user_id") or current_tenant)
+            if entry_tenant != current_tenant:
+                # Leave foreign-tenant sessions in the shared checkpoint file so their
+                # owners can recover them. Avoid attaching them under the current tenant.
+                entries_to_keep.append(entry)
+                continue
+
             pid = entry.get("pid")
             if not pid:
                 continue
@@ -834,7 +844,7 @@ class ProcessRegistry:
                     command=entry.get("command", "unknown"),
                     task_id=entry.get("task_id", ""),
                     session_key=entry.get("session_key", ""),
-                    user_id=normalize_tenant(entry.get("user_id") or current_tenant),
+                    user_id=entry_tenant,
                     pid=pid,
                     cwd=entry.get("cwd"),
                     started_at=entry.get("started_at", time.time()),
@@ -861,10 +871,13 @@ class ProcessRegistry:
                         "thread_id": session.watcher_thread_id,
                     })
 
-        # Clear the checkpoint we recovered from (will be rewritten as processes finish)
+        # Clear the recovered checkpoint entries while leaving foreign-tenant rows intact
         try:
             from utils import atomic_json_write
-            atomic_json_write(path, [])
+            if shared_checkpoint:
+                atomic_json_write(path, entries_to_keep)
+            else:
+                atomic_json_write(path, [])
         except Exception as e:
             logger.debug("Could not clear checkpoint file: %s", e, exc_info=True)
 

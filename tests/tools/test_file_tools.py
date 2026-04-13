@@ -8,6 +8,7 @@ import json
 import logging
 from unittest.mock import MagicMock, patch
 
+from hermes_constants import resolve_runtime_key, tenant_context
 from tools.file_operations import ShellFileOperations
 
 from tools.file_tools import (
@@ -358,5 +359,40 @@ class TestTenantScopedWriteRoots:
         assert "/users/bob/" in bob_cmd
         assert "/users/default/" in default_cmd
         assert alice_cmd != bob_cmd != default_cmd
+
+
+    def test_read_tracker_uses_runtime_key_per_tenant(self, monkeypatch):
+        from tools import file_tools as ft
+
+        ft.clear_read_tracker()
+        task_id = "shared-task"
+
+        with tenant_context("alice"):
+            runtime_key_alice, _, _ = resolve_runtime_key(task_id)
+        with tenant_context("bob"):
+            runtime_key_bob, _, _ = resolve_runtime_key(task_id)
+
+        with ft._read_tracker_lock:
+            ft._read_tracker[runtime_key_alice] = {
+                "read_history": {("a.txt", 1, 5)},
+                "last_key": None,
+                "consecutive": 0,
+                "dedup": {},
+            }
+            ft._read_tracker[runtime_key_bob] = {
+                "read_history": {("b.txt", 1, 5)},
+                "last_key": None,
+                "consecutive": 0,
+                "dedup": {},
+            }
+
+        with tenant_context("alice"):
+            summary_alice = ft.get_read_files_summary(task_id)
+        with tenant_context("bob"):
+            summary_bob = ft.get_read_files_summary(task_id)
+
+        assert summary_alice == [{"path": "a.txt", "regions": ["lines 1-5"]}]
+        assert summary_bob == [{"path": "b.txt", "regions": ["lines 1-5"]}]
+        ft.clear_read_tracker()
 
 

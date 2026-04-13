@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+from hermes_constants import resolve_runtime_key, tenant_context
+
 
 class TestScreenshotPathRecovery:
     def test_extracts_standard_absolute_path(self):
@@ -64,6 +66,34 @@ class TestBrowserCleanup:
         assert "task-1" not in browser_tool._session_last_activity
         mock_stop.assert_called_once_with("task-1")
         mock_run.assert_called_once_with("task-1", "close", [], timeout=10)
+
+    def test_cleanup_browser_is_tenant_scoped(self):
+        browser_tool = self.browser_tool
+        with tenant_context("alice"):
+            alice_key, _, _ = resolve_runtime_key("shared-task")
+        with tenant_context("bob"):
+            bob_key, _, _ = resolve_runtime_key("shared-task")
+
+        browser_tool._active_sessions[alice_key] = {"session_name": "sess-a"}
+        browser_tool._active_sessions[bob_key] = {"session_name": "sess-b"}
+        browser_tool._session_last_activity[alice_key] = 123.0
+        browser_tool._session_last_activity[bob_key] = 456.0
+
+        with (
+            patch("tools.browser_tool._maybe_stop_recording") as mock_stop,
+            patch("tools.browser_tool._run_browser_command", return_value={"success": True}) as mock_run,
+            patch("tools.browser_tool.os.path.exists", return_value=False),
+            patch("tools.browser_tool._is_camofox_mode", return_value=False),
+        ):
+            with tenant_context("alice"):
+                browser_tool.cleanup_browser("shared-task")
+
+        assert alice_key not in browser_tool._active_sessions
+        assert bob_key in browser_tool._active_sessions
+        assert alice_key not in browser_tool._session_last_activity
+        assert bob_key in browser_tool._session_last_activity
+        mock_stop.assert_called_once_with(alice_key)
+        mock_run.assert_called_once_with(alice_key, "close", [], timeout=10)
 
     def test_emergency_cleanup_clears_all_tracking_state(self):
         browser_tool = self.browser_tool
