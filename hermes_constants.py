@@ -6,10 +6,55 @@ without risk of circular imports.
 
 import os
 import re
+import contextvars
+from contextlib import contextmanager
 from pathlib import Path
 
 
 DEFAULT_TENANT = "default"
+
+# Context-local tenant binding. Defaults to None; callers use
+# get_current_tenant() to fall back to env/default when unbound.
+_CURRENT_TENANT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "hermes_current_tenant", default=None
+)
+
+
+def get_current_tenant(user_id: str | None = None) -> str:
+    """Return the effective tenant for the current execution context.
+
+    Resolution order (normalized):
+      1. Explicit ``user_id`` argument (if provided)
+      2. Bound context-local tenant (set via :func:`tenant_context`)
+      3. Environment variables ``HERMES_USER_ID`` / ``HERMES_SESSION_USER_ID``
+      4. ``DEFAULT_TENANT``
+    """
+    if user_id is not None:
+        return normalize_tenant(user_id)
+
+    bound = _CURRENT_TENANT.get()
+    if bound:
+        return bound
+
+    env_user = os.getenv("HERMES_USER_ID") or os.getenv("HERMES_SESSION_USER_ID")
+    return normalize_tenant(env_user)
+
+
+@contextmanager
+def tenant_context(user_id: str | None):
+    """Bind *user_id* for the lifetime of a tool call.
+
+    Restores the previous binding even if the caller raises.
+    """
+    resolved = get_current_tenant(user_id)
+    token = _CURRENT_TENANT.set(resolved)
+    try:
+        yield resolved
+    finally:
+        try:
+            _CURRENT_TENANT.reset(token)
+        except Exception:
+            _CURRENT_TENANT.set(None)
 
 
 def get_hermes_home() -> Path:

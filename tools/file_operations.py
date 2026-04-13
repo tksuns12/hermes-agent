@@ -32,7 +32,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from hermes_constants import get_hermes_home, get_user_home, normalize_tenant
+from hermes_constants import get_current_tenant, get_hermes_home, get_user_home, normalize_tenant
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +385,7 @@ class ShellFileOperations(FileOperations):
             cwd: Working directory (defaults to env's cwd or current directory)
         """
         self.env = terminal_env
-        self.user_id = normalize_tenant(os.getenv("HERMES_USER_ID") or os.getenv("HERMES_SESSION_USER_ID"))
+        self.user_id = get_current_tenant()
         self._tenant_home = get_user_home(self.user_id)
         # Determine cwd from various possible sources.
         # IMPORTANT: do NOT fall back to os.getcwd() -- that's the HOST's local

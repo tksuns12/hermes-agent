@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hermes_constants import get_current_tenant, tenant_context
 import run_agent
 from run_agent import AIAgent
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
@@ -1258,12 +1259,28 @@ class TestConcurrentToolExecution:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
                 "web_search", {"q": "test"}, "task-1",
+                tenant_id=agent._tenant_id,
                 tool_call_id=None,
                 session_id=agent.session_id,
                 enabled_tools=list(agent.valid_tool_names),
 
             )
             assert result == "result"
+
+    def test_invoke_tool_binds_tenant_context(self, agent):
+        agent._tenant_id = "alice"
+        seen = []
+
+        def _fake_handle(function_name, function_args, task_id=None, **kwargs):
+            seen.append(get_current_tenant())
+            return "ok"
+
+        with tenant_context("outer"):
+            with patch("run_agent.handle_function_call", side_effect=_fake_handle):
+                agent._invoke_tool("web_search", {}, "task-1")
+            assert get_current_tenant() == "outer"
+
+        assert seen == ["alice"]
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")

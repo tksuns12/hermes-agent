@@ -5,6 +5,7 @@ from unittest.mock import call, patch
 
 import pytest
 
+from hermes_constants import get_current_tenant, tenant_context
 from model_tools import (
     handle_function_call,
     get_all_tool_names,
@@ -73,6 +74,25 @@ class TestHandleFunctionCall:
                 tool_call_id="call-1",
             ),
         ]
+
+    def test_handle_function_call_binds_tenant_context(self):
+        seen = []
+
+        def _capture_dispatch(*_args, **_kwargs):
+            tenant = get_current_tenant()
+            seen.append(tenant)
+            return json.dumps({"tenant": tenant})
+
+        with tenant_context("outer"):
+            with (
+                patch("model_tools.registry.dispatch", side_effect=_capture_dispatch),
+                patch("model_tools.registry.get_schema", return_value={"parameters": {"properties": {}}}),
+            ):
+                result = json.loads(handle_function_call("web_search", {}, tenant_id="alice"))
+                assert result["tenant"] == "alice"
+            assert get_current_tenant() == "outer"
+
+        assert seen == ["alice"]
 
 
 # =========================================================================

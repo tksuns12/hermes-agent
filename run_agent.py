@@ -43,7 +43,7 @@ import fire
 from datetime import datetime
 from pathlib import Path
 
-from hermes_constants import get_hermes_home, get_user_subpath, normalize_tenant
+from hermes_constants import get_hermes_home, get_user_subpath, normalize_tenant, tenant_context
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -5977,71 +5977,73 @@ class AIAgent:
         tools. Used by the concurrent execution path; the sequential path retains
         its own inline invocation for backward-compatible display handling.
         """
-        if function_name == "todo":
-            from tools.todo_tool import todo_tool as _todo_tool
-            return _todo_tool(
-                todos=function_args.get("todos"),
-                merge=function_args.get("merge", False),
-                store=self._todo_store,
-            )
-        elif function_name == "session_search":
-            if not self._session_db:
-                return json.dumps({"success": False, "error": "Session database not available."})
-            from tools.session_search_tool import session_search as _session_search
-            return _session_search(
-                query=function_args.get("query", ""),
-                role_filter=function_args.get("role_filter"),
-                limit=function_args.get("limit", 3),
-                db=self._session_db,
-                current_session_id=self.session_id,
-            )
-        elif function_name == "memory":
-            target = function_args.get("target", "memory")
-            from tools.memory_tool import memory_tool as _memory_tool
-            result = _memory_tool(
-                action=function_args.get("action"),
-                target=target,
-                content=function_args.get("content"),
-                old_text=function_args.get("old_text"),
-                store=self._memory_store,
-            )
-            # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
-                try:
-                    self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
-                    )
-                except Exception:
-                    pass
-            return result
-        elif self._memory_manager and self._memory_manager.has_tool(function_name):
-            return self._memory_manager.handle_tool_call(function_name, function_args)
-        elif function_name == "clarify":
-            from tools.clarify_tool import clarify_tool as _clarify_tool
-            return _clarify_tool(
-                question=function_args.get("question", ""),
-                choices=function_args.get("choices"),
-                callback=self.clarify_callback,
-            )
-        elif function_name == "delegate_task":
-            from tools.delegate_tool import delegate_task as _delegate_task
-            return _delegate_task(
-                goal=function_args.get("goal"),
-                context=function_args.get("context"),
-                toolsets=function_args.get("toolsets"),
-                tasks=function_args.get("tasks"),
-                max_iterations=function_args.get("max_iterations"),
-                parent_agent=self,
-            )
-        else:
-            return handle_function_call(
-                function_name, function_args, effective_task_id,
-                tool_call_id=tool_call_id,
-                session_id=self.session_id or "",
-                enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-            )
+        with tenant_context(self._tenant_id):
+            if function_name == "todo":
+                from tools.todo_tool import todo_tool as _todo_tool
+                return _todo_tool(
+                    todos=function_args.get("todos"),
+                    merge=function_args.get("merge", False),
+                    store=self._todo_store,
+                )
+            elif function_name == "session_search":
+                if not self._session_db:
+                    return json.dumps({"success": False, "error": "Session database not available."})
+                from tools.session_search_tool import session_search as _session_search
+                return _session_search(
+                    query=function_args.get("query", ""),
+                    role_filter=function_args.get("role_filter"),
+                    limit=function_args.get("limit", 3),
+                    db=self._session_db,
+                    current_session_id=self.session_id,
+                )
+            elif function_name == "memory":
+                target = function_args.get("target", "memory")
+                from tools.memory_tool import memory_tool as _memory_tool
+                result = _memory_tool(
+                    action=function_args.get("action"),
+                    target=target,
+                    content=function_args.get("content"),
+                    old_text=function_args.get("old_text"),
+                    store=self._memory_store,
+                )
+                # Bridge: notify external memory provider of built-in memory writes
+                if self._memory_manager and function_args.get("action") in ("add", "replace"):
+                    try:
+                        self._memory_manager.on_memory_write(
+                            function_args.get("action", ""),
+                            target,
+                            function_args.get("content", ""),
+                        )
+                    except Exception:
+                        pass
+                return result
+            elif self._memory_manager and self._memory_manager.has_tool(function_name):
+                return self._memory_manager.handle_tool_call(function_name, function_args)
+            elif function_name == "clarify":
+                from tools.clarify_tool import clarify_tool as _clarify_tool
+                return _clarify_tool(
+                    question=function_args.get("question", ""),
+                    choices=function_args.get("choices"),
+                    callback=self.clarify_callback,
+                )
+            elif function_name == "delegate_task":
+                from tools.delegate_tool import delegate_task as _delegate_task
+                return _delegate_task(
+                    goal=function_args.get("goal"),
+                    context=function_args.get("context"),
+                    toolsets=function_args.get("toolsets"),
+                    tasks=function_args.get("tasks"),
+                    max_iterations=function_args.get("max_iterations"),
+                    parent_agent=self,
+                )
+            else:
+                return handle_function_call(
+                    function_name, function_args, effective_task_id,
+                    tenant_id=self._tenant_id,
+                    tool_call_id=tool_call_id,
+                    session_id=self.session_id or "",
+                    enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                )
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
@@ -6395,7 +6397,6 @@ class AIAgent:
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
-                from tools.delegate_tool import delegate_task as _delegate_task
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
                     spinner_label = f"🔀 delegating {len(tasks_arg)} tasks"
@@ -6410,14 +6411,7 @@ class AIAgent:
                 self._delegate_spinner = spinner
                 _delegate_result = None
                 try:
-                    function_result = _delegate_task(
-                        goal=function_args.get("goal"),
-                        context=function_args.get("context"),
-                        toolsets=function_args.get("toolsets"),
-                        tasks=tasks_arg,
-                        max_iterations=function_args.get("max_iterations"),
-                        parent_agent=self,
-                    )
+                    function_result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
                     _delegate_result = function_result
                 finally:
                     self._delegate_spinner = None
@@ -6439,7 +6433,7 @@ class AIAgent:
                     spinner.start()
                 _mem_result = None
                 try:
-                    function_result = self._memory_manager.handle_tool_call(function_name, function_args)
+                    function_result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
                     _mem_result = function_result
                 except Exception as tool_error:
                     function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
@@ -6461,16 +6455,11 @@ class AIAgent:
                     spinner.start()
                 _spinner_result = None
                 try:
-                    function_result = handle_function_call(
-                        function_name, function_args, effective_task_id,
-                        tool_call_id=tool_call.id,
-                        session_id=self.session_id or "",
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                    )
+                    function_result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
                     _spinner_result = function_result
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
-                    logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                    logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
                 finally:
                     tool_duration = time.time() - tool_start_time
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
@@ -6480,15 +6469,10 @@ class AIAgent:
                         self._vprint(f"  {cute_msg}")
             else:
                 try:
-                    function_result = handle_function_call(
-                        function_name, function_args, effective_task_id,
-                        tool_call_id=tool_call.id,
-                        session_id=self.session_id or "",
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                    )
+                    function_result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
-                    logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                    logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
 
             result_preview = function_result if self.verbose_logging else (

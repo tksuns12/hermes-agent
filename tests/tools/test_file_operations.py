@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from hermes_constants import get_user_home, tenant_context
 from tools.file_operations import (
     _is_write_denied,
     WRITE_DENIED_PATHS,
@@ -341,8 +342,16 @@ class TestTenantPathResolution:
         monkeypatch.setenv("HERMES_USER_ID", "alice")
         ops = ShellFileOperations(mock_env)
         resolved = ops._expand_path("notes.txt")
-        from hermes_constants import get_user_home
         assert resolved == str(get_user_home("alice") / "notes.txt")
+
+    def test_bound_tenant_overrides_env_for_home_resolution(self, monkeypatch, tmp_path, mock_env):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_USER_ID", "envuser")
+        with tenant_context("alice"):
+            ops = ShellFileOperations(mock_env)
+            resolved = ops._expand_path("notes.txt")
+        assert resolved == str(get_user_home("alice") / "notes.txt")
+        assert os.getenv("HERMES_USER_ID") == "envuser"
 
     def test_safe_root_relative_is_tenant_scoped(self, monkeypatch, tmp_path, mock_env):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

@@ -45,7 +45,7 @@ from tools.environments.local import _find_shell, _sanitize_subprocess_env
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from hermes_constants import DEFAULT_TENANT, get_user_subpath, normalize_tenant
+from hermes_constants import DEFAULT_TENANT, get_current_tenant, get_user_subpath, normalize_tenant
 from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -148,9 +148,8 @@ class ProcessRegistry:
 
     @staticmethod
     def _current_tenant() -> str:
-        """Resolve current tenant from environment or default."""
-        env_user = os.getenv("HERMES_USER_ID") or os.getenv("HERMES_SESSION_USER_ID")
-        return normalize_tenant(env_user)
+        """Resolve current tenant (prefers bound context, falls back to env/default)."""
+        return get_current_tenant()
 
 
     @staticmethod

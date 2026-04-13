@@ -7,6 +7,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from hermes_constants import get_current_tenant, tenant_context
 from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
     ProcessRegistry,
@@ -45,6 +46,14 @@ def _make_session(
         user_id=user_id,
     )
     return s
+
+
+class TestTenantResolution:
+    def test_current_tenant_prefers_context(self, monkeypatch, registry):
+        monkeypatch.setenv("HERMES_USER_ID", "envuser")
+        with tenant_context("alice"):
+            assert registry._current_tenant() == "alice"
+        assert registry._current_tenant() == "envuser"
 
 
 # =========================================================================
