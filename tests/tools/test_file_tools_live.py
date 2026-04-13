@@ -502,8 +502,11 @@ class TestExpandPath:
     def test_absolute_unchanged(self, ops):
         assert ops._expand_path("/tmp/test.txt") == "/tmp/test.txt"
 
-    def test_relative_unchanged(self, ops):
-        assert ops._expand_path("relative/path.txt") == "relative/path.txt"
+    def test_relative_anchored_to_tenant(self, ops, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        from hermes_constants import get_user_home
+        expected = str(get_user_home(None) / "relative/path.txt")
+        assert ops._expand_path("relative/path.txt") == expected
 
     def test_bare_tilde(self, ops):
         result = ops._expand_path("~")

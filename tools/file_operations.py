@@ -32,7 +32,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_user_home, normalize_tenant
 
 
 # ---------------------------------------------------------------------------
@@ -78,24 +78,30 @@ WRITE_DENIED_PREFIXES = [
 ]
 
 
-def _get_safe_write_root() -> Optional[str]:
+def _get_safe_write_root(user_id: str | None = None) -> Optional[str]:
     """Return the resolved HERMES_WRITE_SAFE_ROOT path, or None if unset.
 
     When set, all write_file/patch operations are constrained to this
     directory tree.  Writes outside it are denied even if the target is
     not on the static deny list.  Opt-in hardening for gateway/messaging
     deployments that should only touch a workspace checkout.
+
+    Relative safe roots are resolved against the tenant home to preserve
+    isolation across users.
     """
     root = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
     if not root:
         return None
     try:
-        return os.path.realpath(os.path.expanduser(root))
+        if os.path.isabs(root):
+            return os.path.realpath(os.path.expanduser(root))
+        tenant_home = get_user_home(normalize_tenant(user_id))
+        return os.path.realpath(os.path.expanduser(str(tenant_home / root)))
     except Exception:
         return None
 
 
-def _is_write_denied(path: str) -> bool:
+def _is_write_denied(path: str, user_id: str | None = None) -> bool:
     """Return True if path is on the write deny list."""
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
@@ -107,12 +113,14 @@ def _is_write_denied(path: str) -> bool:
             return True
 
     # 2) Optional safe-root sandbox
-    safe_root = _get_safe_write_root()
+    safe_root = _get_safe_write_root(user_id)
     if safe_root:
         if not (resolved == safe_root or resolved.startswith(safe_root + os.sep)):
             return True
 
     return False
+
+
 
 
 # =============================================================================
@@ -336,6 +344,8 @@ class ShellFileOperations(FileOperations):
             cwd: Working directory (defaults to env's cwd or current directory)
         """
         self.env = terminal_env
+        self.user_id = normalize_tenant(os.getenv("HERMES_USER_ID") or os.getenv("HERMES_SESSION_USER_ID"))
+        self._tenant_home = get_user_home(self.user_id)
         # Determine cwd from various possible sources.
         # IMPORTANT: do NOT fall back to os.getcwd() -- that's the HOST's local
         # path which doesn't exist inside container/cloud backends (modal, docker).
@@ -408,17 +418,16 @@ class ShellFileOperations(FileOperations):
                 line = line[:MAX_LINE_LENGTH] + "... [truncated]"
             numbered.append(f"{i:6d}|{line}")
         return '\n'.join(numbered)
-    
     def _expand_path(self, path: str) -> str:
         """
         Expand shell-style paths like ~ and ~user to absolute paths.
-        
+
         This must be done BEFORE shell escaping, since ~ doesn't expand
         inside single quotes.
         """
         if not path:
             return path
-        
+
         # Handle ~ and ~user
         if path.startswith('~'):
             # Get home directory via the terminal environment
@@ -443,8 +452,14 @@ class ShellFileOperations(FileOperations):
                         user_home = expand_result.stdout.strip()
                         suffix = path[1 + len(username):]  # e.g. "/rest/of/path"
                         return user_home + suffix
-        
+
+        # Relative paths resolve into the tenant home for isolation
+        if not os.path.isabs(path):
+            return str(self._tenant_home / path)
         return path
+
+
+        
     
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands."""
@@ -603,7 +618,7 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
 
         # Block writes to sensitive paths
-        if _is_write_denied(path):
+        if _is_write_denied(path, self.user_id):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
         # Create parent directories
@@ -660,7 +675,7 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
 
         # Block writes to sensitive paths
-        if _is_write_denied(path):
+        if _is_write_denied(path, self.user_id):
             return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
         # Read current content

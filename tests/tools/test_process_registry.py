@@ -31,6 +31,7 @@ def _make_session(
     exit_code=None,
     output="",
     started_at=None,
+    user_id="default",
 ) -> ProcessSession:
     """Helper to create a ProcessSession for testing."""
     s = ProcessSession(
@@ -41,6 +42,7 @@ def _make_session(
         exited=exited,
         exit_code=exit_code,
         output_buffer=output,
+        user_id=user_id,
     )
     return s
 
@@ -385,3 +387,33 @@ class TestProcessToolHandler:
         from tools.process_registry import _handle_process
         result = json.loads(_handle_process({"action": "unknown_action"}))
         assert "error" in result
+
+
+class TestTenantIsolation:
+    def test_list_filters_by_tenant(self, registry, monkeypatch):
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        s1 = _make_session(sid="proc_a", task_id="t1", user_id="alice")
+        s2 = _make_session(sid="proc_b", task_id="t1", user_id="bob")
+        registry._running[s1.id] = s1
+        registry._running[s2.id] = s2
+        result = registry.list_sessions()
+        assert len(result) == 1
+        assert result[0]["session_id"] == "proc_a"
+
+    def test_poll_denies_foreign_tenant(self, registry, monkeypatch):
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        s = _make_session(sid="proc_b", user_id="bob")
+        registry._running[s.id] = s
+        result = registry.poll(s.id)
+        assert result["status"] == "not_found"
+
+    def test_checkpoint_writes_per_tenant_path(self, registry, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        s = _make_session(sid="proc_tenant", user_id="alice")
+        registry._running[s.id] = s
+        registry._write_checkpoint()
+        from hermes_constants import get_user_subpath
+        checkpoint = get_user_subpath("alice", "processes.json")
+        data = json.loads(checkpoint.read_text())
+        assert data and data[0]["session_id"] == "proc_tenant"

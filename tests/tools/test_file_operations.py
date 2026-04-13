@@ -333,3 +333,26 @@ class TestShellFileOpsWriteDenied:
         result = file_ops.patch_replace("~/.ssh/authorized_keys", "old", "new")
         assert result.error is not None
         assert "denied" in result.error.lower()
+
+
+class TestTenantPathResolution:
+    def test_relative_paths_resolve_to_tenant_home(self, monkeypatch, tmp_path, mock_env):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        ops = ShellFileOperations(mock_env)
+        resolved = ops._expand_path("notes.txt")
+        from hermes_constants import get_user_home
+        assert resolved == str(get_user_home("alice") / "notes.txt")
+
+    def test_safe_root_relative_is_tenant_scoped(self, monkeypatch, tmp_path, mock_env):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "workspace")
+        ops = ShellFileOperations(mock_env)
+        denied = ops.write_file("outside.txt", "data")
+        assert denied.error is not None
+        assert "denied" in denied.error.lower()
+
+    def test_absolute_path_preserved(self, mock_env):
+        ops = ShellFileOperations(mock_env)
+        assert ops._expand_path("/tmp/file.txt") == "/tmp/file.txt"

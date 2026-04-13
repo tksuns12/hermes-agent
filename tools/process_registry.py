@@ -45,6 +45,7 @@ from tools.environments.local import _find_shell, _sanitize_subprocess_env
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from hermes_constants import DEFAULT_TENANT, get_user_subpath, normalize_tenant
 from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,29 @@ logger = logging.getLogger(__name__)
 
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+
+
+def _checkpoint_path_for(user_id: str | None) -> "os.PathLike[str]":
+    """Return the checkpoint path for *user_id*, falling back to legacy path.
+
+    Uses per-tenant storage under ``<HERMES_HOME>/users/<tenant>/processes.json``.
+    Falls back to the legacy root-level path when tenant resolution fails
+    (backward compatibility for older installations and tests that patch
+    ``CHECKPOINT_PATH``).
+    """
+
+    tenant = normalize_tenant(user_id)
+    _default_path = get_hermes_home() / "processes.json"
+    # Honor patched CHECKPOINT_PATH (tests/legacy)
+    if CHECKPOINT_PATH != _default_path:
+        path = CHECKPOINT_PATH
+    else:
+        try:
+            path = get_user_subpath(tenant, "processes.json")
+        except Exception:
+            path = CHECKPOINT_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -66,6 +90,7 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
+    user_id: str = DEFAULT_TENANT                # Tenant/owner for isolation
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -120,6 +145,13 @@ class ProcessRegistry:
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
 
     @staticmethod
+    def _current_tenant() -> str:
+        """Resolve current tenant from environment or default."""
+        env_user = os.getenv("HERMES_USER_ID") or os.getenv("HERMES_SESSION_USER_ID")
+        return normalize_tenant(env_user)
+
+
+    @staticmethod
     def _clean_shell_noise(text: str) -> str:
         """Strip shell startup warnings from the beginning of output."""
         lines = text.split("\n")
@@ -153,6 +185,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            user_id=self._current_tenant(),
             cwd=cwd or os.getcwd(),
             started_at=time.time(),
         )
@@ -266,6 +299,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            user_id=self._current_tenant(),
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
@@ -436,10 +470,16 @@ class ProcessRegistry:
 
     # ----- Query Methods -----
 
+    def _tenant_matches(self, session: ProcessSession) -> bool:
+        return session.user_id == self._current_tenant()
+
     def get(self, session_id: str) -> Optional[ProcessSession]:
         """Get a session by ID (running or finished)."""
         with self._lock:
-            return self._running.get(session_id) or self._finished.get(session_id)
+            s = self._running.get(session_id) or self._finished.get(session_id)
+        if s and not self._tenant_matches(s):
+            return None
+        return s
 
     def poll(self, session_id: str) -> dict:
         """Check status and get new output for a background process."""
@@ -640,6 +680,7 @@ class ProcessRegistry:
         with self._lock:
             all_sessions = list(self._running.values()) + list(self._finished.values())
 
+        all_sessions = [s for s in all_sessions if self._tenant_matches(s)]
         if task_id:
             all_sessions = [s for s in all_sessions if s.task_id == task_id]
 
@@ -668,7 +709,7 @@ class ProcessRegistry:
         """Check if there are active (running) processes for a task_id."""
         with self._lock:
             return any(
-                s.task_id == task_id and not s.exited
+                s.task_id == task_id and not s.exited and self._tenant_matches(s)
                 for s in self._running.values()
             )
 
@@ -676,7 +717,7 @@ class ProcessRegistry:
         """Check if there are active processes for a gateway session key."""
         with self._lock:
             return any(
-                s.session_key == session_key and not s.exited
+                s.session_key == session_key and not s.exited and self._tenant_matches(s)
                 for s in self._running.values()
             )
 
@@ -685,7 +726,7 @@ class ProcessRegistry:
         with self._lock:
             targets = [
                 s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id) and not s.exited
+                if (task_id is None or s.task_id == task_id) and not s.exited and self._tenant_matches(s)
             ]
 
         killed = 0
@@ -720,27 +761,35 @@ class ProcessRegistry:
         """Write running process metadata to checkpoint file atomically."""
         try:
             with self._lock:
-                entries = []
+                by_tenant: Dict[str, list] = {}
                 for s in self._running.values():
-                    if not s.exited:
-                        entries.append({
-                            "session_id": s.id,
-                            "command": s.command,
-                            "pid": s.pid,
-                            "cwd": s.cwd,
-                            "started_at": s.started_at,
-                            "task_id": s.task_id,
-                            "session_key": s.session_key,
-                            "watcher_platform": s.watcher_platform,
-                            "watcher_chat_id": s.watcher_chat_id,
-                            "watcher_thread_id": s.watcher_thread_id,
-                            "watcher_interval": s.watcher_interval,
-                            "notify_on_complete": s.notify_on_complete,
-                        })
-            
-            # Atomic write to avoid corruption on crash
+                    if s.exited:
+                        continue
+                    tenant = s.user_id or DEFAULT_TENANT
+                    by_tenant.setdefault(tenant, []).append({
+                        "session_id": s.id,
+                        "command": s.command,
+                        "pid": s.pid,
+                        "cwd": s.cwd,
+                        "started_at": s.started_at,
+                        "task_id": s.task_id,
+                        "session_key": s.session_key,
+                        "watcher_platform": s.watcher_platform,
+                        "watcher_chat_id": s.watcher_chat_id,
+                        "watcher_thread_id": s.watcher_thread_id,
+                        "watcher_interval": s.watcher_interval,
+                        "notify_on_complete": s.notify_on_complete,
+                        "user_id": tenant,
+                    })
+
             from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+            _default_path = get_hermes_home() / "processes.json"
+            if CHECKPOINT_PATH != _default_path:
+                entries = [item for lst in by_tenant.values() for item in lst]
+                atomic_json_write(CHECKPOINT_PATH, entries)
+            else:
+                for tenant, entries in by_tenant.items():
+                    atomic_json_write(_checkpoint_path_for(tenant), entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -750,11 +799,12 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
+        path = _checkpoint_path_for(self._current_tenant())
+        if not path.exists():
             return 0
 
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return 0
 
