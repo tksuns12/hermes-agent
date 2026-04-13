@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from hermes_constants import get_user_home, tenant_context
 from tools.file_operations import (
     _is_write_denied,
     WRITE_DENIED_PATHS,
@@ -355,3 +356,75 @@ class TestShellFileOpsWriteDenied:
         result = ops.move_file("/tmp/nonexistent.txt", "/tmp/dest.txt")
         assert result.error is not None
         assert "Failed to move" in result.error
+
+
+class TestTenantPathResolution:
+    def test_same_relative_filename_isolated_per_tenant_home(self, monkeypatch, tmp_path, mock_env):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+        with tenant_context("alice"):
+            alice_ops = ShellFileOperations(mock_env)
+            alice_path = alice_ops._expand_path("shared.txt")
+
+        with tenant_context("bob"):
+            bob_ops = ShellFileOperations(mock_env)
+            bob_path = bob_ops._expand_path("shared.txt")
+
+        with tenant_context(None):
+            default_ops = ShellFileOperations(mock_env)
+            default_path = default_ops._expand_path("shared.txt")
+
+        assert alice_path.endswith("/users/alice/shared.txt")
+        assert bob_path.endswith("/users/bob/shared.txt")
+        assert default_path.endswith("/users/default/shared.txt")
+        assert alice_path != bob_path != default_path
+
+    def test_relative_paths_resolve_to_tenant_home(self, monkeypatch, tmp_path, mock_env):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        ops = ShellFileOperations(mock_env)
+        resolved = ops._expand_path("notes.txt")
+        assert resolved == str(get_user_home("alice") / "notes.txt")
+
+    def test_bound_tenant_overrides_env_for_home_resolution(self, monkeypatch, tmp_path, mock_env):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_USER_ID", "envuser")
+        with tenant_context("alice"):
+            ops = ShellFileOperations(mock_env)
+            resolved = ops._expand_path("notes.txt")
+        assert resolved == str(get_user_home("alice") / "notes.txt")
+        assert os.getenv("HERMES_USER_ID") == "envuser"
+
+    def test_safe_root_relative_is_tenant_scoped(self, monkeypatch, tmp_path, mock_env):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "workspace")
+        ops = ShellFileOperations(mock_env)
+        denied = ops.write_file("outside.txt", "data")
+        assert denied.error is not None
+        assert "denied" in denied.error.lower()
+
+    def test_safe_root_blocks_cross_tenant_absolute_paths(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "workspace")
+
+        alice_workspace_file = get_user_home("alice") / "workspace" / "ok.txt"
+        bob_workspace_file = get_user_home("bob") / "workspace" / "blocked.txt"
+
+        assert _is_write_denied(str(alice_workspace_file), user_id="alice") is False
+        assert _is_write_denied(str(bob_workspace_file), user_id="alice") is True
+
+    def test_default_tenant_cannot_write_named_tenant_root(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.delenv("HERMES_USER_ID", raising=False)
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "workspace")
+
+        default_workspace_file = get_user_home("default") / "workspace" / "ok.txt"
+        alice_workspace_file = get_user_home("alice") / "workspace" / "blocked.txt"
+
+        assert _is_write_denied(str(default_workspace_file), user_id="default") is False
+        assert _is_write_denied(str(alice_workspace_file), user_id="default") is True
+
+    def test_absolute_path_preserved(self, mock_env):
+        ops = ShellFileOperations(mock_env)
+        assert ops._expand_path("/tmp/file.txt") == "/tmp/file.txt"

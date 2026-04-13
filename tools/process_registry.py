@@ -45,13 +45,38 @@ from tools.environments.local import _find_shell, _sanitize_subprocess_env
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.config import get_hermes_home
+from hermes_constants import DEFAULT_TENANT, get_current_tenant, get_hermes_home, get_user_subpath, normalize_tenant
 
 logger = logging.getLogger(__name__)
 
 
-# Checkpoint file for crash recovery (gateway only)
-CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+# Optional override for crash-recovery checkpoint path.
+#
+# None (default): use tenant-scoped checkpoints under
+# <HERMES_HOME>/users/<tenant>/processes.json.
+#
+# Path value: force a single legacy checkpoint file. This is used by tests
+# that patch CHECKPOINT_PATH and by any legacy runtime that explicitly opts in.
+CHECKPOINT_PATH = None
+
+
+def _legacy_checkpoint_path() -> Path:
+    """Return the legacy root-level checkpoint path."""
+    return get_hermes_home() / "processes.json"
+
+
+def _checkpoint_path_for(user_id: str | None) -> Path:
+    """Return checkpoint path for *user_id* with optional legacy override."""
+    if CHECKPOINT_PATH is not None:
+        path = CHECKPOINT_PATH
+    else:
+        tenant = normalize_tenant(user_id)
+        try:
+            path = get_user_subpath(tenant, "processes.json")
+        except Exception:
+            path = _legacy_checkpoint_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -71,6 +96,7 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
+    user_id: str = DEFAULT_TENANT                # Tenant/owner for isolation
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -139,6 +165,12 @@ class ProcessRegistry:
         # Track sessions whose completion was already consumed by the agent
         # via wait/poll/log.  Drain loops skip notifications for these.
         self._completion_consumed: set = set()
+
+    @staticmethod
+    def _current_tenant() -> str:
+        """Resolve current tenant (prefers bound context, falls back to env/default)."""
+        return get_current_tenant()
+
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -307,6 +339,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            user_id=self._current_tenant(),
             cwd=cwd or os.getcwd(),
             started_at=time.time(),
         )
@@ -420,6 +453,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            user_id=self._current_tenant(),
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
@@ -621,11 +655,17 @@ class ProcessRegistry:
         """Check if a completion notification was already consumed via wait/poll/log."""
         return session_id in self._completion_consumed
 
+    def _tenant_matches(self, session: ProcessSession) -> bool:
+        return session.user_id == self._current_tenant()
+
     def get(self, session_id: str) -> Optional[ProcessSession]:
         """Get a session by ID (running or finished)."""
         with self._lock:
             session = self._running.get(session_id) or self._finished.get(session_id)
-        return self._refresh_detached_session(session)
+        session = self._refresh_detached_session(session)
+        if session and not self._tenant_matches(session):
+            return None
+        return session
 
     def poll(self, session_id: str) -> dict:
         """Check status and get new output for a background process."""
@@ -878,7 +918,7 @@ class ProcessRegistry:
             all_sessions = list(self._running.values()) + list(self._finished.values())
 
         all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
-
+        all_sessions = [s for s in all_sessions if s and self._tenant_matches(s)]
         if task_id:
             all_sessions = [s for s in all_sessions if s.task_id == task_id]
 
@@ -913,7 +953,7 @@ class ProcessRegistry:
 
         with self._lock:
             return any(
-                s.task_id == task_id and not s.exited
+                s.task_id == task_id and not s.exited and self._tenant_matches(s)
                 for s in self._running.values()
             )
 
@@ -927,7 +967,7 @@ class ProcessRegistry:
 
         with self._lock:
             return any(
-                s.session_key == session_key and not s.exited
+                s.session_key == session_key and not s.exited and self._tenant_matches(s)
                 for s in self._running.values()
             )
 
@@ -936,7 +976,7 @@ class ProcessRegistry:
         with self._lock:
             targets = [
                 s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id) and not s.exited
+                if (task_id is None or s.task_id == task_id) and not s.exited and self._tenant_matches(s)
             ]
 
         killed = 0
@@ -971,31 +1011,39 @@ class ProcessRegistry:
         """Write running process metadata to checkpoint file atomically."""
         try:
             with self._lock:
-                entries = []
+                by_tenant: Dict[str, list] = {}
                 for s in self._running.values():
-                    if not s.exited:
-                        entries.append({
-                            "session_id": s.id,
-                            "command": s.command,
-                            "pid": s.pid,
-                            "pid_scope": s.pid_scope,
-                            "cwd": s.cwd,
-                            "started_at": s.started_at,
-                            "task_id": s.task_id,
-                            "session_key": s.session_key,
-                            "watcher_platform": s.watcher_platform,
-                            "watcher_chat_id": s.watcher_chat_id,
-                            "watcher_user_id": s.watcher_user_id,
-                            "watcher_user_name": s.watcher_user_name,
-                            "watcher_thread_id": s.watcher_thread_id,
-                            "watcher_interval": s.watcher_interval,
-                            "notify_on_complete": s.notify_on_complete,
-                            "watch_patterns": s.watch_patterns,
-                        })
-            
+                    if s.exited:
+                        continue
+                    tenant = s.user_id or DEFAULT_TENANT
+                    by_tenant.setdefault(tenant, []).append({
+                        "session_id": s.id,
+                        "command": s.command,
+                        "pid": s.pid,
+                        "pid_scope": s.pid_scope,
+                        "cwd": s.cwd,
+                        "started_at": s.started_at,
+                        "task_id": s.task_id,
+                        "session_key": s.session_key,
+                        "watcher_platform": s.watcher_platform,
+                        "watcher_chat_id": s.watcher_chat_id,
+                        "watcher_user_id": s.watcher_user_id,
+                        "watcher_user_name": s.watcher_user_name,
+                        "watcher_thread_id": s.watcher_thread_id,
+                        "watcher_interval": s.watcher_interval,
+                        "notify_on_complete": s.notify_on_complete,
+                        "watch_patterns": s.watch_patterns,
+                        "user_id": tenant,
+                    })
+
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+            if CHECKPOINT_PATH is not None:
+                entries = [item for lst in by_tenant.values() for item in lst]
+                atomic_json_write(CHECKPOINT_PATH, entries)
+            else:
+                for tenant, entries in by_tenant.items():
+                    atomic_json_write(_checkpoint_path_for(tenant), entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -1005,16 +1053,33 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
+        current_tenant = self._current_tenant()
+        path = _checkpoint_path_for(current_tenant)
+        if not path.exists() and CHECKPOINT_PATH is None:
+            # Backward compatibility: older versions used a single root-level
+            # checkpoint file. If tenant-scoped file is missing, fall back.
+            legacy_path = _legacy_checkpoint_path()
+            path = legacy_path if legacy_path.exists() else path
+        if not path.exists():
             return 0
 
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return 0
 
+        shared_checkpoint = CHECKPOINT_PATH is not None or path == _legacy_checkpoint_path()
         recovered = 0
+        entries_to_keep: list = []
+
         for entry in entries:
+            entry_tenant = normalize_tenant(entry.get("user_id") or current_tenant)
+            if entry_tenant != current_tenant:
+                # Leave foreign-tenant sessions in the shared checkpoint file so their
+                # owners can recover them. Avoid attaching them under the current tenant.
+                entries_to_keep.append(entry)
+                continue
+
             pid = entry.get("pid")
             if not pid:
                 continue
@@ -1036,11 +1101,13 @@ class ProcessRegistry:
             alive = self._is_host_pid_alive(pid)
 
             if alive:
+                entries_to_keep.append(entry)
                 session = ProcessSession(
                     id=entry["session_id"],
                     command=entry.get("command", "unknown"),
                     task_id=entry.get("task_id", ""),
                     session_key=entry.get("session_key", ""),
+                    user_id=entry_tenant,
                     pid=pid,
                     pid_scope=pid_scope,
                     cwd=entry.get("cwd"),
@@ -1074,7 +1141,13 @@ class ProcessRegistry:
                         "notify_on_complete": session.notify_on_complete,
                     })
 
-        self._write_checkpoint()
+        # Rewrite checkpoint with only still-live entries for this tenant,
+        # while preserving foreign-tenant rows in shared checkpoint files.
+        try:
+            from utils import atomic_json_write
+            atomic_json_write(path, entries_to_keep)
+        except Exception as e:
+            logger.debug("Could not rewrite checkpoint file: %s", e, exc_info=True)
 
         return recovered
 

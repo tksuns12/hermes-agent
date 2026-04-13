@@ -4,6 +4,7 @@ import time
 import pytest
 from pathlib import Path
 
+from hermes_constants import normalize_tenant
 from hermes_state import SessionDB
 
 
@@ -14,6 +15,62 @@ def db(tmp_path):
     session_db = SessionDB(db_path=db_path)
     yield session_db
     session_db.close()
+
+
+# =========================================================================
+# Tenant helpers and scoping
+# =========================================================================
+
+class TestTenantHelpers:
+    def test_normalize_tenant_defaults_and_sanitizes(self):
+        assert normalize_tenant(None) == "default"
+        assert normalize_tenant("") == "default"
+        assert normalize_tenant("   ") == "default"
+        assert normalize_tenant("../alice") == "__alice"
+        assert normalize_tenant("tenant/name") == "tenant_name"
+
+
+class TestTenantScoping:
+    def test_search_sessions_scoped_by_tenant(self, db):
+        db.create_session(session_id="s_default", source="cli")
+        db.create_session(session_id="s_alice", source="cli", user_id="alice")
+
+        default_sessions = db.search_sessions()
+        assert {s["id"] for s in default_sessions} == {"s_default"}
+
+        alice_sessions = db.search_sessions(user_id="alice")
+        assert {s["id"] for s in alice_sessions} == {"s_alice"}
+
+    def test_search_messages_scoped_by_tenant(self, db):
+        db.create_session(session_id="s_default", source="cli")
+        db.append_message("s_default", role="user", content="default only")
+
+        db.create_session(session_id="s_bob", source="cli", user_id="bob")
+        db.append_message("s_bob", role="user", content="bob only")
+
+        default_results = db.search_messages("only", user_id="default")
+        assert {r["session_id"] for r in default_results} == {"s_default"}
+
+        bob_results = db.search_messages("only", user_id="bob")
+        assert {r["session_id"] for r in bob_results} == {"s_bob"}
+
+    def test_exports_and_counts_are_tenant_scoped(self, db):
+        db.create_session(session_id="s_default", source="cli")
+        db.append_message("s_default", role="user", content="hi from default")
+
+        db.create_session(session_id="s_alice", source="cli", user_id="alice")
+        db.append_message("s_alice", role="user", content="hi from alice")
+
+        default_exports = db.export_all()
+        assert {e["id"] for e in default_exports} == {"s_default"}
+
+        alice_exports = db.export_all(user_id="alice")
+        assert {e["id"] for e in alice_exports} == {"s_alice"}
+
+        assert db.session_count() == 1
+        assert db.session_count(user_id="alice") == 1
+        assert db.message_count() == 1
+        assert db.message_count(user_id="alice") == 1
 
 
 # =========================================================================
@@ -935,7 +992,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 7
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -991,12 +1048,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to latest
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 7
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -1008,6 +1065,76 @@ class TestSchemaInit:
         session = migrated_db.get_session("existing")
         assert session["title"] == "Migrated Title"
 
+        migrated_db.close()
+
+    def test_migration_normalizes_null_user_id(self, tmp_path):
+        """Legacy rows with NULL/blank user_id are normalized to 'default'."""
+        import sqlite3
+
+        db_path = tmp_path / "null_user_migrate.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (6);
+
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                user_id TEXT,
+                model TEXT,
+                model_config TEXT,
+                system_prompt TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                end_reason TEXT,
+                message_count INTEGER DEFAULT 0,
+                tool_call_count INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                billing_provider TEXT,
+                billing_base_url TEXT,
+                billing_mode TEXT,
+                estimated_cost_usd REAL,
+                actual_cost_usd REAL,
+                cost_status TEXT,
+                cost_source TEXT,
+                pricing_version TEXT,
+                title TEXT
+            );
+
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_count INTEGER,
+                finish_reason TEXT,
+                reasoning TEXT,
+                reasoning_details TEXT,
+                codex_reasoning_items TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, source, user_id, started_at) VALUES (?, ?, ?, ?)",
+            ("legacy", "cli", None, 1234.0),
+        )
+        conn.commit()
+        conn.close()
+
+        migrated_db = SessionDB(db_path=db_path)
+        session = migrated_db.get_session("legacy")
+        assert session is not None
+        assert session["user_id"] == "default"
         migrated_db.close()
 
 

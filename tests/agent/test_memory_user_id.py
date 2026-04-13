@@ -287,3 +287,52 @@ class TestAIAgentUserIdPropagation:
             agent = object.__new__(AIAgent)
             agent._user_id = None
             assert agent._user_id is None
+
+
+class TestAIAgentDefaultTenantMemory:
+    def test_default_tenant_forwarded_to_memory_manager(self, monkeypatch, tmp_path):
+        from run_agent import AIAgent
+
+        class FakeProvider:
+            def is_available(self):
+                return True
+
+        instances = []
+
+        class FakeMemoryManager:
+            def __init__(self):
+                instances.append(self)
+                self.providers = []
+                self.init_kwargs = None
+
+            def add_provider(self, provider):
+                self.providers.append(provider)
+
+            def initialize_all(self, **kwargs):
+                self.init_kwargs = kwargs
+
+            def build_system_prompt(self):
+                return ""
+
+            def get_all_tool_schemas(self):
+                return []
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("agent.memory_manager.MemoryManager", FakeMemoryManager)
+        monkeypatch.setattr("plugins.memory.load_memory_provider", lambda name: FakeProvider())
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"memory": {"provider": "recording"}})
+        monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kwargs: [])
+        monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
+        monkeypatch.setattr("run_agent.OpenAI", MagicMock)
+
+        AIAgent(
+            api_key="test-key",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_db=MagicMock(),
+            platform="telegram",
+        )
+
+        assert instances, "MemoryManager was not initialized"
+        assert instances[0].init_kwargs.get("user_id") == "default"

@@ -631,7 +631,8 @@ class TestWhatsAppDMSessionKeyConsistency:
 
         assert first_entry.session_key == "agent:main:discord:group:guild-123"
         assert second_entry.session_key == "agent:main:discord:group:guild-123"
-        assert first_entry.session_id == second_entry.session_id
+        # Tenant isolation keeps session IDs distinct even when per-user grouping is disabled
+        assert first_entry.session_id != second_entry.session_id
 
     def test_telegram_dm_includes_chat_id(self):
         """Non-WhatsApp DMs should also include chat_id to separate users."""
@@ -1010,3 +1011,36 @@ class TestRewriteTranscriptPreservesReasoning:
         assert after[0].get("reasoning") == "I need to think step by step."
         assert after[0].get("reasoning_details") == [{"type": "summary", "text": "step by step"}]
         assert after[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
+
+class TestTenantScopedTranscripts:
+    def test_transcripts_are_tenant_scoped(self, tmp_path):
+        config = GatewayConfig(sessions_dir=tmp_path)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = None
+
+        default_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+        )
+        alice_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="alice",
+        )
+
+        default_entry = store.get_or_create_session(default_source)
+        alice_entry = store.get_or_create_session(alice_source)
+
+        default_path = store.get_transcript_path(default_entry.session_id)
+        alice_path = store.get_transcript_path(alice_entry.session_id)
+
+        store.append_to_transcript(default_entry.session_id, {"role": "user", "content": "hi"})
+        store.append_to_transcript(alice_entry.session_id, {"role": "user", "content": "hello"})
+
+        assert default_path.parent != alice_path.parent
+        assert "alice" in str(alice_path)
+        assert store.load_transcript(default_entry.session_id)[0]["content"] == "hi"
+        assert store.load_transcript(alice_entry.session_id)[0]["content"] == "hello"
+

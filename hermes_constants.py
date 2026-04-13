@@ -5,7 +5,110 @@ without risk of circular imports.
 """
 
 import os
+import re
+import contextvars
+from contextlib import contextmanager
 from pathlib import Path
+
+
+DEFAULT_TENANT = "default"
+
+# Context-local tenant binding. Defaults to None; callers use
+# get_current_tenant() to fall back to env/default when unbound.
+_CURRENT_TENANT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "hermes_current_tenant", default=None
+)
+
+RUNTIME_KEY_DELIMITER = "::"
+
+
+def get_current_tenant(user_id: str | None = None) -> str:
+    """Return the effective tenant for the current execution context.
+
+    Resolution order (normalized):
+      1. Explicit ``user_id`` argument (if provided)
+      2. Bound context-local tenant (set via :func:`tenant_context`)
+      3. Environment variables ``HERMES_USER_ID`` / ``HERMES_SESSION_USER_ID``
+      4. ``DEFAULT_TENANT``
+    """
+    if user_id is not None:
+        return normalize_tenant(user_id)
+
+    bound = _CURRENT_TENANT.get()
+    if bound:
+        return bound
+
+    env_user = os.getenv("HERMES_USER_ID") or os.getenv("HERMES_SESSION_USER_ID")
+    return normalize_tenant(env_user)
+
+
+
+
+def normalize_task_id(task_id: str | None) -> str:
+    """Normalize task identifiers for runtime caches.
+
+    - ``None`` or blank → ``"default"``
+    - Strips surrounding whitespace
+    """
+    if task_id is None:
+        return DEFAULT_TENANT
+    value = str(task_id).strip()
+    return value or DEFAULT_TENANT
+
+
+def derive_runtime_key(task_id: str | None = None, user_id: str | None = None) -> tuple[str, str, str]:
+    """Return a tenant-aware runtime cache key.
+
+    Returns (runtime_key, tenant, normalized_task_id).
+    """
+    tenant = get_current_tenant(user_id)
+    normalized_task = normalize_task_id(task_id)
+    return f"{tenant}{RUNTIME_KEY_DELIMITER}{normalized_task}", tenant, normalized_task
+
+
+def split_runtime_key(runtime_key: str) -> tuple[str, str]:
+    """Split a runtime cache key into (tenant, task_id).
+
+    Accepts legacy plain task_ids (no delimiter) and falls back to
+    ``DEFAULT_TENANT`` for missing/blank segments.
+    """
+    if not runtime_key:
+        return DEFAULT_TENANT, DEFAULT_TENANT
+    if RUNTIME_KEY_DELIMITER in runtime_key:
+        tenant, task = runtime_key.split(RUNTIME_KEY_DELIMITER, 1)
+    else:
+        tenant, task = DEFAULT_TENANT, runtime_key
+    return normalize_tenant(tenant), normalize_task_id(task)
+
+
+def resolve_runtime_key(task_id: str | None = None, user_id: str | None = None) -> tuple[str, str, str]:
+    """Coerce *task_id* into a tenant-aware runtime key.
+
+    If *task_id* already looks like a runtime key (contains the delimiter),
+    its tenant is preserved; otherwise the current tenant is applied.
+    Returns (runtime_key, tenant, normalized_task_id).
+    """
+    if isinstance(task_id, str) and RUNTIME_KEY_DELIMITER in task_id:
+        tenant, parsed_task = split_runtime_key(task_id)
+        return derive_runtime_key(parsed_task, tenant)
+    return derive_runtime_key(task_id, user_id)
+
+
+@contextmanager
+def tenant_context(user_id: str | None):
+    """Bind *user_id* for the lifetime of a tool call.
+
+    Restores the previous binding even if the caller raises.
+    """
+    resolved = get_current_tenant(user_id)
+    token = _CURRENT_TENANT.set(resolved)
+    try:
+        yield resolved
+    finally:
+        try:
+            _CURRENT_TENANT.reset(token)
+        except Exception:
+            _CURRENT_TENANT.set(None)
 
 
 def get_hermes_home() -> Path:
@@ -54,6 +157,37 @@ def get_default_hermes_root() -> Path:
 
     # Not a profile path — HERMES_HOME itself is the root
     return env_path
+
+
+def normalize_tenant(user_id: str | None) -> str:
+    """Normalize tenant/user identity for storage and filesystem paths.
+
+    - ``None`` or blank → ``"default"``
+    - Strips surrounding whitespace
+    - Replaces path separators and ``..`` segments with underscores to
+      prevent directory traversal while preserving caller intent.
+    """
+    if user_id is None:
+        return DEFAULT_TENANT
+    value = str(user_id).strip()
+    if not value:
+        return DEFAULT_TENANT
+    # Replace path separators and collapse traversal tokens
+    value = re.sub(r"[\\/]+", "_", value)
+    value = value.replace("..", "_")
+    if not value:
+        return DEFAULT_TENANT
+    return value
+
+
+def get_user_home(user_id: str | None) -> Path:
+    """Return the tenant-scoped home directory under ``<HERMES_HOME>/users``."""
+    return get_hermes_home() / "users" / normalize_tenant(user_id)
+
+
+def get_user_subpath(user_id: str | None, *subpaths: str) -> Path:
+    """Return a tenant-scoped subpath (e.g., sessions, processes files)."""
+    return get_user_home(user_id).joinpath(*subpaths)
 
 
 def get_optional_skills_dir(default: Path | None = None) -> Path:

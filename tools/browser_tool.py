@@ -66,7 +66,7 @@ import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from agent.auxiliary_client import call_llm
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, resolve_runtime_key, split_runtime_key
 
 try:
     from tools.website_policy import check_website_access
@@ -457,20 +457,21 @@ def _cleanup_inactive_browser_sessions():
     sessions_to_cleanup = []
     
     with _cleanup_lock:
-        for task_id, last_time in list(_session_last_activity.items()):
+        for runtime_key, last_time in list(_session_last_activity.items()):
             if current_time - last_time > BROWSER_SESSION_INACTIVITY_TIMEOUT:
-                sessions_to_cleanup.append(task_id)
+                sessions_to_cleanup.append(runtime_key)
     
-    for task_id in sessions_to_cleanup:
+    for runtime_key in sessions_to_cleanup:
+        tenant, task_label = split_runtime_key(runtime_key)
         try:
-            elapsed = int(current_time - _session_last_activity.get(task_id, current_time))
-            logger.info("Cleaning up inactive session for task: %s (inactive for %ss)", task_id, elapsed)
-            cleanup_browser(task_id)
+            elapsed = int(current_time - _session_last_activity.get(runtime_key, current_time))
+            logger.info("Cleaning up inactive session for tenant=%s task=%s (inactive for %ss)", tenant, task_label, elapsed)
+            cleanup_browser(runtime_key)
             with _cleanup_lock:
-                if task_id in _session_last_activity:
-                    del _session_last_activity[task_id]
+                if runtime_key in _session_last_activity:
+                    del _session_last_activity[runtime_key]
         except Exception as e:
-            logger.warning("Error cleaning up inactive session %s: %s", task_id, e)
+            logger.warning("Error cleaning up inactive session %s: %s", runtime_key, e)
 
 
 def _reap_orphaned_browser_sessions():
@@ -609,9 +610,10 @@ def _stop_browser_cleanup_thread():
 
 
 def _update_session_activity(task_id: str):
-    """Update the last activity timestamp for a session."""
+    """Update the last activity timestamp for a session (tenant-scoped)."""
+    runtime_key, _, _ = resolve_runtime_key(task_id)
     with _cleanup_lock:
-        _session_last_activity[task_id] = time.time()
+        _session_last_activity[runtime_key] = time.time()
 
 
 # Register cleanup thread stop on exit
@@ -806,57 +808,58 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     """
     Get or create session info for the given task.
-    
+
     In cloud mode, creates a Browserbase session with proxies enabled.
     In local mode, generates a session name for agent-browser --session.
     Also starts the inactivity cleanup thread and updates activity tracking.
     Thread-safe: multiple subagents can call this concurrently.
-    
+
     Args:
         task_id: Unique identifier for the task
-        
+
     Returns:
         Dict with session_name (always), bb_session_id + cdp_url (cloud only)
     """
-    if task_id is None:
-        task_id = "default"
-    
+    runtime_key, tenant, normalized_task = resolve_runtime_key(task_id)
+
     # Start the cleanup thread if not running (handles inactivity timeouts)
     _start_browser_cleanup_thread()
-    
+
     # Update activity timestamp for this session
-    _update_session_activity(task_id)
-    
+    _update_session_activity(runtime_key)
+
     with _cleanup_lock:
         # Check if we already have a session for this task
-        if task_id in _active_sessions:
-            return _active_sessions[task_id]
-    
+        if runtime_key in _active_sessions:
+            return _active_sessions[runtime_key]
+
     # Create session outside the lock (network call in cloud mode)
     cdp_override = _get_cdp_override()
     if cdp_override:
-        session_info = _create_cdp_session(task_id, cdp_override)
+        session_info = _create_cdp_session(runtime_key, cdp_override)
     else:
         provider = _get_cloud_provider()
         if provider is None:
-            session_info = _create_local_session(task_id)
+            session_info = _create_local_session(runtime_key)
         else:
-            session_info = provider.create_session(task_id)
+            session_info = provider.create_session(runtime_key)
             if session_info.get("cdp_url"):
                 # Some cloud providers (including Browser-Use v3) return an HTTP
                 # CDP discovery URL instead of a raw websocket endpoint.
                 session_info = dict(session_info)
                 session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
-    
+
     with _cleanup_lock:
         # Double-check: another thread may have created a session while we
         # were doing the network call. Use the existing one to avoid leaking
         # orphan cloud sessions.
-        if task_id in _active_sessions:
-            return _active_sessions[task_id]
-        _active_sessions[task_id] = session_info
-    
+        if runtime_key in _active_sessions:
+            return _active_sessions[runtime_key]
+        _active_sessions[runtime_key] = session_info
+
     return session_info
+
+
 
 
 
@@ -1778,8 +1781,9 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 def _maybe_start_recording(task_id: str):
     """Start recording if browser.record_sessions is enabled in config."""
+    runtime_key, tenant, normalized_task = resolve_runtime_key(task_id)
     with _cleanup_lock:
-        if task_id in _recording_sessions:
+        if runtime_key in _recording_sessions:
             return
     try:
         from hermes_cli.config import read_raw_config
@@ -1796,13 +1800,13 @@ def _maybe_start_recording(task_id: str):
         
         import time
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        recording_path = recordings_dir / f"session_{timestamp}_{task_id[:16]}.webm"
+        recording_path = recordings_dir / f"session_{timestamp}_{runtime_key[:24]}.webm"
         
-        result = _run_browser_command(task_id, "record", ["start", str(recording_path)])
+        result = _run_browser_command(runtime_key, "record", ["start", str(recording_path)])
         if result.get("success"):
             with _cleanup_lock:
-                _recording_sessions.add(task_id)
-            logger.info("Auto-recording browser session %s to %s", task_id, recording_path)
+                _recording_sessions.add(runtime_key)
+            logger.info("Auto-recording browser session tenant=%s task=%s to %s", tenant, normalized_task, recording_path)
         else:
             logger.debug("Could not start auto-recording: %s", result.get("error"))
     except Exception as e:
@@ -1811,19 +1815,20 @@ def _maybe_start_recording(task_id: str):
 
 def _maybe_stop_recording(task_id: str):
     """Stop recording if one is active for this session."""
+    runtime_key, tenant, normalized_task = resolve_runtime_key(task_id)
     with _cleanup_lock:
-        if task_id not in _recording_sessions:
+        if runtime_key not in _recording_sessions:
             return
     try:
-        result = _run_browser_command(task_id, "record", ["stop"])
+        result = _run_browser_command(runtime_key, "record", ["stop"])
         if result.get("success"):
             path = result.get("data", {}).get("path", "")
-            logger.info("Saved browser recording for session %s: %s", task_id, path)
+            logger.info("Saved browser recording for session tenant=%s task=%s: %s", tenant, normalized_task, path)
     except Exception as e:
-        logger.debug("Could not stop recording for %s: %s", task_id, e)
+        logger.debug("Could not stop recording for %s: %s", runtime_key, e)
     finally:
         with _cleanup_lock:
-            _recording_sessions.discard(task_id)
+            _recording_sessions.discard(runtime_key)
 
 
 def browser_get_images(task_id: Optional[str] = None) -> str:
@@ -2119,9 +2124,8 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     Args:
         task_id: Task identifier to clean up
     """
-    if task_id is None:
-        task_id = "default"
-    
+    runtime_key, tenant, task_label = resolve_runtime_key(task_id)
+
     # Also clean up Camofox session if running in Camofox mode.
     # Skip full close when managed persistence is enabled — the browser
     # profile (and its session cookies) must survive across agent tasks.
@@ -2129,37 +2133,45 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     if _is_camofox_mode():
         try:
             from tools.browser_camofox import camofox_close, camofox_soft_cleanup
-            if not camofox_soft_cleanup(task_id):
-                camofox_close(task_id)
+            if not camofox_soft_cleanup(runtime_key):
+                camofox_close(runtime_key)
         except Exception as e:
-            logger.debug("Camofox cleanup for task %s: %s", task_id, e)
+            logger.debug("Camofox cleanup for runtime %s: %s", runtime_key, e)
 
-    logger.debug("cleanup_browser called for task_id: %s", task_id)
+    logger.debug("cleanup_browser called for runtime_key: %s", runtime_key)
     logger.debug("Active sessions: %s", list(_active_sessions.keys()))
     
     # Check if session exists (under lock), but don't remove yet -
     # _run_browser_command needs it to build the close command.
     with _cleanup_lock:
-        session_info = _active_sessions.get(task_id)
+        session_info = _active_sessions.get(runtime_key)
+        session_key = runtime_key
+        if session_info is None and task_id is not None and task_id in _active_sessions:
+            session_info = _active_sessions.get(task_id)
+            session_key = task_id
     
     if session_info:
         bb_session_id = session_info.get("bb_session_id", "unknown")
-        logger.debug("Found session for task %s: bb_session_id=%s", task_id, bb_session_id)
+        logger.debug("Found session for runtime %s (tenant=%s task=%s): bb_session_id=%s", runtime_key, tenant, task_label, bb_session_id)
         
         # Stop auto-recording before closing (saves the file)
-        _maybe_stop_recording(task_id)
+        _maybe_stop_recording(session_key)
         
         # Try to close via agent-browser first (needs session in _active_sessions)
         try:
-            _run_browser_command(task_id, "close", [], timeout=10)
-            logger.debug("agent-browser close command completed for task %s", task_id)
+            _run_browser_command(session_key, "close", [], timeout=10)
+            logger.debug("agent-browser close command completed for runtime %s", runtime_key)
         except Exception as e:
-            logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+            logger.warning("agent-browser close failed for runtime %s: %s", runtime_key, e)
         
         # Now remove from tracking under lock
         with _cleanup_lock:
-            _active_sessions.pop(task_id, None)
-            _session_last_activity.pop(task_id, None)
+            _active_sessions.pop(runtime_key, None)
+            if task_id is not None:
+                _active_sessions.pop(task_id, None)
+            _session_last_activity.pop(runtime_key, None)
+            if task_id is not None:
+                _session_last_activity.pop(task_id, None)
         
         # Cloud mode: close the cloud browser session via provider API
         if bb_session_id:
@@ -2186,9 +2198,10 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
                         logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)
                 shutil.rmtree(socket_dir, ignore_errors=True)
         
-        logger.debug("Removed task %s from active sessions", task_id)
+        logger.debug("Removed runtime %s from active sessions", runtime_key)
     else:
-        logger.debug("No active session found for task_id: %s", task_id)
+        logger.debug("No active session found for runtime_key: %s", runtime_key)
+
 
 
 def cleanup_all_browsers() -> None:
@@ -2210,6 +2223,11 @@ def cleanup_all_browsers() -> None:
     _discover_homebrew_node_dirs.cache_clear()
     _cached_command_timeout = None
     _command_timeout_resolved = False
+
+
+
+
+
 
 
 # ============================================================================

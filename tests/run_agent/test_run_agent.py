@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hermes_constants import get_current_tenant, tenant_context
 import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
@@ -1438,12 +1439,28 @@ class TestConcurrentToolExecution:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
                 "web_search", {"q": "test"}, "task-1",
+                tenant_id=agent._tenant_id,
                 tool_call_id=None,
                 session_id=agent.session_id,
                 enabled_tools=list(agent.valid_tool_names),
 
             )
             assert result == "result"
+
+    def test_invoke_tool_binds_tenant_context(self, agent):
+        agent._tenant_id = "alice"
+        seen = []
+
+        def _fake_handle(function_name, function_args, task_id=None, **kwargs):
+            seen.append(get_current_tenant())
+            return "ok"
+
+        with tenant_context("outer"):
+            with patch("run_agent.handle_function_call", side_effect=_fake_handle):
+                agent._invoke_tool("web_search", {}, "task-1")
+            assert get_current_tenant() == "outer"
+
+        assert seen == ["alice"]
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
@@ -1488,6 +1505,53 @@ class TestConcurrentToolExecution:
             mock_todo.assert_called_once()
         assert "ok" in result
 
+
+
+class TestTenantHandleIsolation:
+    def _make_agent(self, tenant):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("terminal")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            return AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                user_id=tenant,
+            )
+
+    def test_same_task_id_calls_are_tenant_scoped(self):
+        call_counts = {}
+        results = []
+
+        def fake_handle(function_name, function_args, task_id=None, **kwargs):
+            key = (kwargs.get("tenant_id"), task_id)
+            call_counts[key] = call_counts.get(key, 0) + 1
+            return json.dumps({
+                "tenant": kwargs.get("tenant_id"),
+                "task_id": task_id,
+                "count": call_counts[key],
+                "tool": function_name,
+            })
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            alice = self._make_agent("alice")
+            bob = self._make_agent("bob")
+            task_id = "shared-task"
+
+            results.append(json.loads(alice._invoke_tool("terminal", {}, task_id)))
+            results.append(json.loads(bob._invoke_tool("terminal", {}, task_id)))
+            results.append(json.loads(alice._invoke_tool("terminal", {}, task_id)))
+
+        assert call_counts[("alice", task_id)] == 2
+        assert call_counts[("bob", task_id)] == 1
+        assert {r["tenant"] for r in results} == {"alice", "bob"}
+        assert all(r["task_id"] == task_id for r in results)
+        # Tool definitions remain global; isolation comes from tenant-tagged runtime keys.
+        assert {r["tool"] for r in results} == {"terminal"}
+        assert get_current_tenant() == "default"
 
 class TestPathsOverlap:
     """Unit tests for the _paths_overlap helper."""

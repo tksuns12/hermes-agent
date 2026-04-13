@@ -26,6 +26,7 @@ import logging
 import threading
 from typing import Dict, Any, List, Optional, Tuple
 
+from hermes_constants import get_current_tenant, tenant_context
 from tools.registry import registry
 from toolsets import resolve_toolset, validate_toolset
 
@@ -460,6 +461,7 @@ def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
     task_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
     tool_call_id: Optional[str] = None,
     session_id: Optional[str] = None,
     user_task: Optional[str] = None,
@@ -472,6 +474,7 @@ def handle_function_call(
         function_name: Name of the function to call.
         function_args: Arguments for the function.
         task_id: Unique identifier for terminal/browser session isolation.
+        tenant_id: Tenant/owner for isolation; falls back to bound context or env.
         user_task: The user's original task (for browser_snapshot context).
         enabled_tools: Tool names enabled for this session.  When provided,
                        execute_code uses this list to determine which sandbox
@@ -481,71 +484,74 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
-    # Coerce string arguments to their schema-declared types (e.g. "42"→42)
-    function_args = coerce_tool_args(function_name, function_args)
+    resolved_tenant = get_current_tenant(tenant_id)
 
-    # Notify the read-loop tracker when a non-read/search tool runs,
-    # so the *consecutive* counter resets (reads after other work are fine).
-    if function_name not in _READ_SEARCH_TOOLS:
-        try:
-            from tools.file_tools import notify_other_tool_call
-            notify_other_tool_call(task_id or "default")
-        except Exception:
-            pass  # file_tools may not be loaded yet
+    with tenant_context(resolved_tenant):
+        # Coerce string arguments to their schema-declared types (e.g. "42"→42)
+        function_args = coerce_tool_args(function_name, function_args)
 
-    try:
-        if function_name in _AGENT_LOOP_TOOLS:
-            return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
-
-        try:
-            from hermes_cli.plugins import invoke_hook
-            invoke_hook(
-                "pre_tool_call",
-                tool_name=function_name,
-                args=function_args,
-                task_id=task_id or "",
-                session_id=session_id or "",
-                tool_call_id=tool_call_id or "",
-            )
-        except Exception:
-            pass
-
-        if function_name == "execute_code":
-            # Prefer the caller-provided list so subagents can't overwrite
-            # the parent's tool set via the process-global.
-            sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
-            result = registry.dispatch(
-                function_name, function_args,
-                task_id=task_id,
-                enabled_tools=sandbox_enabled,
-            )
-        else:
-            result = registry.dispatch(
-                function_name, function_args,
-                task_id=task_id,
-                user_task=user_task,
-            )
+        # Notify the read-loop tracker when a non-read/search tool runs,
+        # so the *consecutive* counter resets (reads after other work are fine).
+        if function_name not in _READ_SEARCH_TOOLS:
+            try:
+                from tools.file_tools import notify_other_tool_call
+                notify_other_tool_call(task_id or "default")
+            except Exception:
+                pass  # file_tools may not be loaded yet
 
         try:
-            from hermes_cli.plugins import invoke_hook
-            invoke_hook(
-                "post_tool_call",
-                tool_name=function_name,
-                args=function_args,
-                result=result,
-                task_id=task_id or "",
-                session_id=session_id or "",
-                tool_call_id=tool_call_id or "",
-            )
-        except Exception:
-            pass
+            if function_name in _AGENT_LOOP_TOOLS:
+                return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
-        return result
+            try:
+                from hermes_cli.plugins import invoke_hook
+                invoke_hook(
+                    "pre_tool_call",
+                    tool_name=function_name,
+                    args=function_args,
+                    task_id=task_id or "",
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                )
+            except Exception:
+                pass
 
-    except Exception as e:
-        error_msg = f"Error executing {function_name}: {str(e)}"
-        logger.error(error_msg)
-        return json.dumps({"error": error_msg}, ensure_ascii=False)
+            if function_name == "execute_code":
+                # Prefer the caller-provided list so subagents can't overwrite
+                # the parent's tool set via the process-global.
+                sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+                result = registry.dispatch(
+                    function_name, function_args,
+                    task_id=task_id,
+                    enabled_tools=sandbox_enabled,
+                )
+            else:
+                result = registry.dispatch(
+                    function_name, function_args,
+                    task_id=task_id,
+                    user_task=user_task,
+                )
+
+            try:
+                from hermes_cli.plugins import invoke_hook
+                invoke_hook(
+                    "post_tool_call",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=result,
+                    task_id=task_id or "",
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                )
+            except Exception:
+                pass
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error executing {function_name}: {str(e)}"
+            logger.error(error_msg)
+            return json.dumps({"error": error_msg}, ensure_ascii=False)
 
 
 # =============================================================================

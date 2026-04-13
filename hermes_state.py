@@ -22,7 +22,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, normalize_tenant
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
-    user_id TEXT,
+    user_id TEXT NOT NULL DEFAULT 'default',
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_started ON sessions(user_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 """
 
@@ -119,6 +120,10 @@ class SessionDB:
     Thread-safe for the common gateway pattern (multiple reader threads,
     single writer via WAL mode). Each method opens its own cursor.
     """
+
+    @staticmethod
+    def _tenant(user_id: Optional[str]) -> str:
+        return normalize_tenant(user_id)
 
     # ── Write-contention tuning ──
     # With multiple hermes processes (gateway + CLI sessions + worktree agents)
@@ -329,6 +334,24 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: normalize legacy NULL/blank user_id rows to the default tenant
+                # and add a user_id index for efficient tenant-scoped lookups.
+                try:
+                    cursor.execute(
+                        "UPDATE sessions SET user_id = 'default' "
+                        "WHERE user_id IS NULL OR TRIM(user_id) = ''"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_sessions_user_started "
+                        "ON sessions(user_id, started_at DESC)"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -363,6 +386,8 @@ class SessionDB:
         parent_session_id: str = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
+        tenant = self._tenant(user_id)
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
@@ -371,7 +396,7 @@ class SessionDB:
                 (
                     session_id,
                     source,
-                    user_id,
+                    tenant,
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
@@ -504,6 +529,7 @@ class SessionDB:
         session_id: str,
         source: str = "unknown",
         model: str = None,
+        user_id: str = None,
     ) -> None:
         """Ensure a session row exists, creating it with minimal metadata if absent.
 
@@ -511,32 +537,98 @@ class SessionDB:
         create_session() call (e.g. transient SQLite lock at agent startup).
         INSERT OR IGNORE is safe to call even when the row already exists.
         """
+        tenant = self._tenant(user_id)
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions
-                   (id, source, model, started_at)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, source, model, time.time()),
+                   (id, source, model, started_at, user_id)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, source, model, time.time(), tenant),
             )
         self._execute_write(_do)
 
-    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get a session by ID."""
+    def set_token_counts(
+        self,
+        session_id: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        model: str = None,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        estimated_cost_usd: Optional[float] = None,
+        actual_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None,
+        cost_source: Optional[str] = None,
+        pricing_version: Optional[str] = None,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
+    ) -> None:
+        """Set token counters to absolute values (not increment).
+
+        Use this when the caller provides cumulative totals from a completed
+        conversation run (e.g. the gateway, where the cached agent's
+        session_prompt_tokens already reflects the running total).
+        """
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions SET
+                   input_tokens = ?,
+                   output_tokens = ?,
+                   cache_read_tokens = ?,
+                   cache_write_tokens = ?,
+                   reasoning_tokens = ?,
+                   estimated_cost_usd = ?,
+                   actual_cost_usd = CASE
+                       WHEN ? IS NULL THEN actual_cost_usd
+                       ELSE ?
+                   END,
+                   cost_status = COALESCE(?, cost_status),
+                   cost_source = COALESCE(?, cost_source),
+                   pricing_version = COALESCE(?, pricing_version),
+                   billing_provider = COALESCE(billing_provider, ?),
+                   billing_base_url = COALESCE(billing_base_url, ?),
+                   billing_mode = COALESCE(billing_mode, ?),
+                   model = COALESCE(model, ?)
+                   WHERE id = ?""",
+                (
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens,
+                    estimated_cost_usd,
+                    actual_cost_usd,
+                    actual_cost_usd,
+                    cost_status,
+                    cost_source,
+                    pricing_version,
+                    billing_provider,
+                    billing_base_url,
+                    billing_mode,
+                    model,
+                    session_id,
+                ),
+            )
+        self._execute_write(_do)
+
+    def get_session(self, session_id: str, user_id: str = None) -> Optional[Dict[str, Any]]:
+        """Get a session by ID, scoped to the provided tenant (default tenant when omitted)."""
+        tenant = self._tenant(user_id)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                "SELECT * FROM sessions WHERE id = ? AND user_id = ?",
+                (session_id, tenant),
             )
             row = cursor.fetchone()
         return dict(row) if row else None
 
-    def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
-        """Resolve an exact or uniquely prefixed session ID to the full ID.
-
-        Returns the exact ID when it exists. Otherwise treats the input as a
-        prefix and returns the single matching session ID if the prefix is
-        unambiguous. Returns None for no matches or ambiguous prefixes.
-        """
-        exact = self.get_session(session_id_or_prefix)
+    def resolve_session_id(self, session_id_or_prefix: str, user_id: str = None) -> Optional[str]:
+        """Resolve an exact or uniquely prefixed session ID to the full ID for a tenant."""
+        tenant = self._tenant(user_id)
+        exact = self.get_session(session_id_or_prefix, user_id=tenant)
         if exact:
             return exact["id"]
 
@@ -548,8 +640,9 @@ class SessionDB:
         )
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
-                (f"{escaped}%",),
+                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' AND user_id = ? "
+                "ORDER BY started_at DESC LIMIT 2",
+                (f"{escaped}%", tenant),
             )
             matches = [row["id"] for row in cursor.fetchall()]
         if len(matches) == 1:
@@ -721,6 +814,7 @@ class SessionDB:
         limit: int = 20,
         offset: int = 0,
         include_children: bool = False,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -733,8 +827,9 @@ class SessionDB:
         By default, child sessions (subagent runs, compression continuations)
         are excluded.  Pass ``include_children=True`` to include them.
         """
-        where_clauses = []
-        params = []
+        tenant = self._tenant(user_id)
+        where_clauses = ["s.user_id = ?"]
+        params = [tenant]
 
         if not include_children:
             where_clauses.append("s.parent_session_id IS NULL")
@@ -863,12 +958,14 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
-        """Load all messages for a session, ordered by timestamp."""
+    def get_messages(self, session_id: str, user_id: str = None) -> List[Dict[str, Any]]:
+        """Load all messages for a session, ordered by timestamp, scoped to a tenant."""
+        tenant = self._tenant(user_id)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
-                (session_id,),
+                "SELECT m.* FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.session_id = ? AND s.user_id = ? ORDER BY m.timestamp, m.id",
+                (session_id, tenant),
             )
             rows = cursor.fetchall()
         result = []
@@ -883,17 +980,19 @@ class SessionDB:
             result.append(msg)
         return result
 
-    def get_messages_as_conversation(self, session_id: str) -> List[Dict[str, Any]]:
+    def get_messages_as_conversation(self, session_id: str, user_id: str = None) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
         Used by the gateway to restore conversation history.
         """
+        tenant = self._tenant(user_id)
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
-                "reasoning, reasoning_details, codex_reasoning_items "
-                "FROM messages WHERE session_id = ? ORDER BY timestamp, id",
-                (session_id,),
+                "SELECT m.role, m.content, m.tool_call_id, m.tool_calls, m.tool_name, "
+                "m.reasoning, m.reasoning_details, m.codex_reasoning_items "
+                "FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.session_id = ? AND s.user_id = ? ORDER BY m.timestamp, m.id",
+                (session_id, tenant),
             )
             rows = cursor.fetchall()
         messages = []
@@ -995,6 +1094,7 @@ class SessionDB:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1015,9 +1115,11 @@ class SessionDB:
         if not query:
             return []
 
+        tenant = self._tenant(user_id)
+
         # Build WHERE clauses dynamically
-        where_clauses = ["messages_fts MATCH ?"]
-        params: list = [query]
+        where_clauses = ["s.user_id = ?", "messages_fts MATCH ?"]
+        params: list = [tenant, query]
 
         if source_filter is not None:
             source_placeholders = ",".join("?" for _ in source_filter)
@@ -1071,10 +1173,11 @@ class SessionDB:
             try:
                 with self._lock:
                     ctx_cursor = self._conn.execute(
-                        """SELECT role, content FROM messages
-                           WHERE session_id = ? AND id >= ? - 1 AND id <= ? + 1
-                           ORDER BY id""",
-                        (match["session_id"], match["id"], match["id"]),
+                        """SELECT m.role, m.content FROM messages m
+                           JOIN sessions s ON s.id = m.session_id
+                           WHERE m.session_id = ? AND s.user_id = ? AND m.id >= ? - 1 AND m.id <= ? + 1
+                           ORDER BY m.id""",
+                        (match["session_id"], tenant, match["id"], match["id"]),
                     )
                     context_msgs = [
                         {"role": r["role"], "content": (r["content"] or "")[:200]}
@@ -1095,18 +1198,21 @@ class SessionDB:
         source: str = None,
         limit: int = 20,
         offset: int = 0,
+        user_id: str = None,
     ) -> List[Dict[str, Any]]:
-        """List sessions, optionally filtered by source."""
+        """List sessions, optionally filtered by source and tenant."""
+        tenant = self._tenant(user_id)
         with self._lock:
             if source:
                 cursor = self._conn.execute(
-                    "SELECT * FROM sessions WHERE source = ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                    (source, limit, offset),
+                    "SELECT * FROM sessions WHERE source = ? AND user_id = ? "
+                    "ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                    (source, tenant, limit, offset),
                 )
             else:
                 cursor = self._conn.execute(
-                    "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
+                    "SELECT * FROM sessions WHERE user_id = ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                    (tenant, limit, offset),
                 )
             return [dict(row) for row in cursor.fetchall()]
 
@@ -1114,49 +1220,60 @@ class SessionDB:
     # Utility
     # =========================================================================
 
-    def session_count(self, source: str = None) -> int:
-        """Count sessions, optionally filtered by source."""
+    def session_count(self, source: str = None, user_id: str = None) -> int:
+        """Count sessions, optionally filtered by source and tenant."""
+        tenant = self._tenant(user_id)
         with self._lock:
             if source:
                 cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM sessions WHERE source = ?", (source,)
+                    "SELECT COUNT(*) FROM sessions WHERE source = ? AND user_id = ?",
+                    (source, tenant),
                 )
             else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
+                cursor = self._conn.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE user_id = ?", (tenant,)
+                )
             return cursor.fetchone()[0]
 
-    def message_count(self, session_id: str = None) -> int:
-        """Count messages, optionally for a specific session."""
+    def message_count(self, session_id: str = None, user_id: str = None) -> int:
+        """Count messages, optionally for a specific session and tenant."""
+        tenant = self._tenant(user_id)
         with self._lock:
             if session_id:
                 cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+                    "SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id = m.session_id "
+                    "WHERE m.session_id = ? AND s.user_id = ?",
+                    (session_id, tenant),
                 )
             else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
+                cursor = self._conn.execute(
+                    "SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id = m.session_id "
+                    "WHERE s.user_id = ?",
+                    (tenant,),
+                )
             return cursor.fetchone()[0]
 
     # =========================================================================
     # Export and cleanup
     # =========================================================================
 
-    def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Export a single session with all its messages as a dict."""
-        session = self.get_session(session_id)
+    def export_session(self, session_id: str, user_id: str = None) -> Optional[Dict[str, Any]]:
+        """Export a single session with all its messages as a dict (tenant-scoped)."""
+        session = self.get_session(session_id, user_id=user_id)
         if not session:
             return None
-        messages = self.get_messages(session_id)
+        messages = self.get_messages(session_id, user_id=user_id)
         return {**session, "messages": messages}
 
-    def export_all(self, source: str = None) -> List[Dict[str, Any]]:
+    def export_all(self, source: str = None, user_id: str = None) -> List[Dict[str, Any]]:
         """
         Export all sessions (with messages) as a list of dicts.
         Suitable for writing to a JSONL file for backup/analysis.
         """
-        sessions = self.search_sessions(source=source, limit=100000)
+        sessions = self.search_sessions(source=source, limit=100000, user_id=user_id)
         results = []
         for session in sessions:
-            messages = self.get_messages(session["id"])
+            messages = self.get_messages(session["id"], user_id=user_id)
             results.append({**session, "messages": messages})
         return results
 
@@ -1172,16 +1289,19 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    def delete_session(self, session_id: str) -> bool:
-        """Delete a session and all its messages.
+    def delete_session(self, session_id: str, user_id: str = None) -> bool:
+        """Delete a session and all its messages for a tenant.
 
         Child sessions are orphaned (parent_session_id set to NULL) rather
         than cascade-deleted, so they remain accessible independently.
         Returns True if the session was found and deleted.
         """
+        tenant = self._tenant(user_id)
+
         def _do(conn):
             cursor = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+                "SELECT COUNT(*) FROM sessions WHERE id = ? AND user_id = ?",
+                (session_id, tenant),
             )
             if cursor.fetchone()[0] == 0:
                 return False
@@ -1196,26 +1316,27 @@ class SessionDB:
             return True
         return self._execute_write(_do)
 
-    def prune_sessions(self, older_than_days: int = 90, source: str = None) -> int:
-        """Delete sessions older than N days. Returns count of deleted sessions.
+    def prune_sessions(self, older_than_days: int = 90, source: str = None, user_id: str = None) -> int:
+        """Delete sessions older than N days for a tenant. Returns count of deleted sessions.
 
         Only prunes ended sessions (not active ones).  Child sessions outside
         the prune window are orphaned (parent_session_id set to NULL) rather
         than cascade-deleted.
         """
         cutoff = time.time() - (older_than_days * 86400)
+        tenant = self._tenant(user_id)
 
         def _do(conn):
             if source:
                 cursor = conn.execute(
                     """SELECT id FROM sessions
-                       WHERE started_at < ? AND ended_at IS NOT NULL AND source = ?""",
-                    (cutoff, source),
+                       WHERE started_at < ? AND ended_at IS NOT NULL AND source = ? AND user_id = ?""",
+                    (cutoff, source, tenant),
                 )
             else:
                 cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
-                    (cutoff,),
+                    "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL AND user_id = ?",
+                    (cutoff, tenant),
                 )
             session_ids = set(row["id"] for row in cursor.fetchall())
 

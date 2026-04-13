@@ -18,7 +18,9 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
+
+from hermes_constants import DEFAULT_TENANT, normalize_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -505,6 +507,10 @@ class SessionStore:
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
+        self._entries_by_tenant: Dict[str, Dict[str, SessionEntry]] = {}
+        self._session_key_to_tenant: Dict[str, str] = {}
+        self._session_id_to_tenant: Dict[str, str] = {}
+        self._loaded_tenants: Set[str] = set()
         self._loaded = False
         self._lock = threading.Lock()
         self._has_active_processes_fn = has_active_processes_fn
@@ -517,43 +523,93 @@ class SessionStore:
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
     
-    def _ensure_loaded(self) -> None:
-        """Load sessions index from disk if not already loaded."""
-        with self._lock:
-            self._ensure_loaded_locked()
+    def _normalize_tenant(self, user_id: Optional[str]) -> str:
+        try:
+            return normalize_tenant(user_id)
+        except Exception:
+            return DEFAULT_TENANT
 
-    def _ensure_loaded_locked(self) -> None:
-        """Load sessions index from disk. Must be called with self._lock held."""
-        if self._loaded:
+    def _sessions_dir_for_tenant(self, tenant: str) -> Path:
+        tenant = self._normalize_tenant(tenant)
+        base = self.sessions_dir
+
+        parts = list(base.parts)
+        if "users" in parts:
+            users_root = Path(*parts[: parts.index("users") + 1])
+            return users_root / tenant / "sessions"
+
+        if tenant == DEFAULT_TENANT and (base / "sessions.json").exists():
+            return base
+
+        if base.name == tenant:
+            return base
+        if base.name == "sessions" and base.parent.name == tenant:
+            return base
+
+        return base / tenant
+
+    def _get_entries_for_tenant(self, tenant: str) -> Dict[str, SessionEntry]:
+        tenant = self._normalize_tenant(tenant)
+        if tenant in self._entries_by_tenant:
+            return self._entries_by_tenant[tenant]
+        derived = {
+            key: entry
+            for key, entry in self._entries.items()
+            if self._session_key_to_tenant.get(key, DEFAULT_TENANT) == tenant
+        }
+        self._entries_by_tenant[tenant] = derived
+        return derived
+
+    def _ensure_loaded(self, tenant: str = None) -> None:
+        """Load sessions index for a tenant if not already loaded."""
+        tenant = self._normalize_tenant(tenant)
+        with self._lock:
+            self._ensure_loaded_locked(tenant)
+
+    def _ensure_loaded_locked(self, tenant: str) -> None:
+        """Load sessions index for a tenant. Must be called with self._lock held."""
+        if tenant in self._loaded_tenants:
             return
 
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        sessions_file = self.sessions_dir / "sessions.json"
+        sessions_dir = self._sessions_dir_for_tenant(tenant)
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        sessions_file = sessions_dir / "sessions.json"
 
+        entries = {}
         if sessions_file.exists():
             try:
                 with open(sessions_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     for key, entry_data in data.items():
                         try:
-                            self._entries[key] = SessionEntry.from_dict(entry_data)
+                            entry = SessionEntry.from_dict(entry_data)
+                            entries[key] = entry
+                            self._session_key_to_tenant[key] = tenant
+                            self._session_id_to_tenant[entry.session_id] = tenant
                         except (ValueError, KeyError):
-                            # Skip entries with unknown/removed platform values
                             continue
             except Exception as e:
                 print(f"[gateway] Warning: Failed to load sessions: {e}")
 
-        self._loaded = True
+        self._entries_by_tenant[tenant] = entries
+        self._entries.update(entries)
+        self._loaded_tenants.add(tenant)
+        if tenant == DEFAULT_TENANT:
+            self._loaded = True
     
-    def _save(self) -> None:
+    def _save(self, tenant: str) -> None:
         """Save sessions index to disk (kept for session key -> ID mapping)."""
         import tempfile
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        sessions_file = self.sessions_dir / "sessions.json"
 
-        data = {key: entry.to_dict() for key, entry in self._entries.items()}
+        tenant = self._normalize_tenant(tenant)
+        sessions_dir = self._sessions_dir_for_tenant(tenant)
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        sessions_file = sessions_dir / "sessions.json"
+
+        entries = self._get_entries_for_tenant(tenant)
+        data = {key: entry.to_dict() for key, entry in entries.items()}
         fd, tmp_path = tempfile.mkstemp(
-            dir=str(self.sessions_dir), suffix=".tmp", prefix=".sessions_"
+            dir=str(sessions_dir), suffix=".tmp", prefix=".sessions_"
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -677,8 +733,11 @@ class SessionStore:
         # Fallback: check if sessions.json was loaded with existing data.
         # This covers the rare case where the DB is unavailable.
         with self._lock:
-            self._ensure_loaded_locked()
-            return len(self._entries) > 1
+            self._ensure_loaded_locked(DEFAULT_TENANT)
+            total = sum(len(entries) for entries in self._entries_by_tenant.values())
+            if total == 0:
+                total = len(self._entries)
+            return total > 1
 
     def get_or_create_session(
         self,
@@ -691,19 +750,19 @@ class SessionStore:
         Evaluates reset policy to determine if the existing session is stale.
         Creates a session record in SQLite when a new session starts.
         """
+        tenant = self._normalize_tenant(source.user_id)
         session_key = self._generate_session_key(source)
         now = _now()
 
-        # SQLite calls are made outside the lock to avoid holding it during I/O.
-        # All _entries / _loaded mutations are protected by self._lock.
         db_end_session_id = None
         db_create_kwargs = None
 
         with self._lock:
-            self._ensure_loaded_locked()
+            self._ensure_loaded_locked(tenant)
+            entries = self._get_entries_for_tenant(tenant)
 
-            if session_key in self._entries and not force_new:
-                entry = self._entries[session_key]
+            if session_key in entries and not force_new:
+                entry = entries[session_key]
 
                 # Auto-reset sessions marked as suspended (e.g. after /stop
                 # broke a stuck loop — #7536).
@@ -713,13 +772,11 @@ class SessionStore:
                     reset_reason = self._should_reset(entry, source)
                 if not reset_reason:
                     entry.updated_at = now
-                    self._save()
+                    self._save(tenant)
                     return entry
                 else:
-                    # Session is being auto-reset.
                     was_auto_reset = True
                     auto_reset_reason = reset_reason
-                    # Track whether the expired session had any real conversation
                     reset_had_activity = entry.total_tokens > 0
                     db_end_session_id = entry.session_id
             else:
@@ -727,7 +784,6 @@ class SessionStore:
                 auto_reset_reason = None
                 reset_had_activity = False
 
-            # Create new session
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
             entry = SessionEntry(
@@ -744,15 +800,17 @@ class SessionStore:
                 reset_had_activity=reset_had_activity,
             )
 
+            entries[session_key] = entry
             self._entries[session_key] = entry
-            self._save()
+            self._session_key_to_tenant[session_key] = tenant
+            self._session_id_to_tenant[session_id] = tenant
+            self._save(tenant)
             db_create_kwargs = {
                 "session_id": session_id,
                 "source": source.platform.value,
-                "user_id": source.user_id,
+                "user_id": tenant,
             }
 
-        # SQLite operations outside the lock
         if self._db and db_end_session_id:
             try:
                 self._db.end_session(db_end_session_id, "session_reset")
@@ -773,15 +831,16 @@ class SessionStore:
         last_prompt_tokens: int = None,
     ) -> None:
         """Update lightweight session metadata after an interaction."""
+        tenant = self._session_key_to_tenant.get(session_key, DEFAULT_TENANT)
         with self._lock:
-            self._ensure_loaded_locked()
+            self._ensure_loaded_locked(tenant)
 
             if session_key in self._entries:
                 entry = self._entries[session_key]
                 entry.updated_at = _now()
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
-                self._save()
+                self._save(tenant)
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.
@@ -827,8 +886,9 @@ class SessionStore:
         db_create_kwargs = None
         new_entry = None
 
+        tenant = self._session_key_to_tenant.get(session_key, DEFAULT_TENANT)
         with self._lock:
-            self._ensure_loaded_locked()
+            self._ensure_loaded_locked(tenant)
 
             if session_key not in self._entries:
                 return None
@@ -851,11 +911,13 @@ class SessionStore:
             )
 
             self._entries[session_key] = new_entry
-            self._save()
+            self._get_entries_for_tenant(tenant)[session_key] = new_entry
+            self._session_id_to_tenant[session_id] = tenant
+            self._save(tenant)
             db_create_kwargs = {
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
-                "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "user_id": tenant,
             }
 
         if self._db and db_end_session_id:
@@ -882,9 +944,10 @@ class SessionStore:
         """
         db_end_session_id = None
         new_entry = None
+        tenant = self._session_key_to_tenant.get(session_key, DEFAULT_TENANT)
 
         with self._lock:
-            self._ensure_loaded_locked()
+            self._ensure_loaded_locked(tenant)
 
             if session_key not in self._entries:
                 return None
@@ -910,7 +973,9 @@ class SessionStore:
             )
 
             self._entries[session_key] = new_entry
-            self._save()
+            self._get_entries_for_tenant(tenant)[session_key] = new_entry
+            self._session_id_to_tenant[target_session_id] = tenant
+            self._save(tenant)
 
         if self._db and db_end_session_id:
             try:
@@ -923,7 +988,7 @@ class SessionStore:
     def list_sessions(self, active_minutes: Optional[int] = None) -> List[SessionEntry]:
         """List all sessions, optionally filtered by activity."""
         with self._lock:
-            self._ensure_loaded_locked()
+            self._ensure_loaded_locked(DEFAULT_TENANT)
             entries = list(self._entries.values())
 
         if active_minutes is not None:
@@ -934,9 +999,11 @@ class SessionStore:
 
         return entries
     
-    def get_transcript_path(self, session_id: str) -> Path:
+    def get_transcript_path(self, session_id: str, tenant: str | None = None) -> Path:
         """Get the path to a session's legacy transcript file."""
-        return self.sessions_dir / f"{session_id}.jsonl"
+        resolved_tenant = tenant or self._session_id_to_tenant.get(session_id, DEFAULT_TENANT)
+        resolved_tenant = self._normalize_tenant(resolved_tenant)
+        return self._sessions_dir_for_tenant(resolved_tenant) / f"{session_id}.jsonl"
     
     def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
         """Append a message to a session's transcript (SQLite + legacy JSONL).
@@ -963,6 +1030,7 @@ class SessionStore:
         
         # Also write legacy JSONL (keeps existing tooling working during transition)
         transcript_path = self.get_transcript_path(session_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
         with open(transcript_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(message, ensure_ascii=False) + "\n")
     
@@ -994,6 +1062,7 @@ class SessionStore:
         
         # JSONL: overwrite the file
         transcript_path = self.get_transcript_path(session_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
         with open(transcript_path, "w", encoding="utf-8") as f:
             for msg in messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")

@@ -32,7 +32,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-from hermes_constants import get_hermes_home
+from hermes_constants import get_current_tenant, get_hermes_home, get_user_home, normalize_tenant
 from tools.binary_extensions import BINARY_EXTENSIONS
 
 
@@ -79,41 +79,90 @@ WRITE_DENIED_PREFIXES = [
 ]
 
 
-def _get_safe_write_root() -> Optional[str]:
+def _get_safe_write_root(user_id: str | None = None) -> Optional[str]:
     """Return the resolved HERMES_WRITE_SAFE_ROOT path, or None if unset.
 
     When set, all write_file/patch operations are constrained to this
     directory tree.  Writes outside it are denied even if the target is
     not on the static deny list.  Opt-in hardening for gateway/messaging
     deployments that should only touch a workspace checkout.
+
+    Relative safe roots are resolved against the tenant home to preserve
+    isolation across users.
     """
     root = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
     if not root:
         return None
     try:
-        return os.path.realpath(os.path.expanduser(root))
+        if os.path.isabs(root):
+            return os.path.realpath(os.path.expanduser(root))
+        tenant_home = get_user_home(normalize_tenant(user_id))
+        return os.path.realpath(os.path.expanduser(str(tenant_home / root)))
     except Exception:
         return None
 
 
-def _is_write_denied(path: str) -> bool:
+def _is_write_denied(path: str, user_id: str | None = None) -> bool:
     """Return True if path is on the write deny list."""
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
-    # 1) Static deny list
+    # 1) Static deny list captured at import time.
     if resolved in WRITE_DENIED_PATHS:
         return True
     for prefix in WRITE_DENIED_PREFIXES:
         if resolved.startswith(prefix):
             return True
 
-    # 2) Optional safe-root sandbox
-    safe_root = _get_safe_write_root()
+    # 2) Runtime deny list based on current HOME/HERMES_HOME.
+    # Tests and some runtime modes override HOME/HERMES_HOME after import, so
+    # we re-check these dynamic roots to preserve protection guarantees.
+    runtime_home = os.path.realpath(os.path.expanduser("~"))
+    runtime_exact = {
+        os.path.realpath(os.path.join(runtime_home, ".ssh", "authorized_keys")),
+        os.path.realpath(os.path.join(runtime_home, ".ssh", "id_rsa")),
+        os.path.realpath(os.path.join(runtime_home, ".ssh", "id_ed25519")),
+        os.path.realpath(os.path.join(runtime_home, ".ssh", "config")),
+        os.path.realpath(os.path.join(runtime_home, ".bashrc")),
+        os.path.realpath(os.path.join(runtime_home, ".zshrc")),
+        os.path.realpath(os.path.join(runtime_home, ".profile")),
+        os.path.realpath(os.path.join(runtime_home, ".bash_profile")),
+        os.path.realpath(os.path.join(runtime_home, ".zprofile")),
+        os.path.realpath(os.path.join(runtime_home, ".netrc")),
+        os.path.realpath(os.path.join(runtime_home, ".pgpass")),
+        os.path.realpath(os.path.join(runtime_home, ".npmrc")),
+        os.path.realpath(os.path.join(runtime_home, ".pypirc")),
+        os.path.realpath(str(get_hermes_home() / ".env")),
+        "/etc/sudoers",
+        "/etc/passwd",
+        "/etc/shadow",
+    }
+    if resolved in runtime_exact:
+        return True
+
+    runtime_prefixes = [
+        os.path.realpath(os.path.join(runtime_home, ".ssh")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".aws")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".gnupg")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".kube")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".docker")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".azure")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".config", "gh")) + os.sep,
+        "/etc/sudoers.d" + os.sep,
+        "/etc/systemd" + os.sep,
+    ]
+    for prefix in runtime_prefixes:
+        if resolved.startswith(prefix):
+            return True
+
+    # 3) Optional safe-root sandbox
+    safe_root = _get_safe_write_root(user_id)
     if safe_root:
         if not (resolved == safe_root or resolved.startswith(safe_root + os.sep)):
             return True
 
     return False
+
+
 
 
 # =============================================================================
@@ -337,6 +386,8 @@ class ShellFileOperations(FileOperations):
             cwd: Working directory (defaults to env's cwd or current directory)
         """
         self.env = terminal_env
+        self.user_id = get_current_tenant()
+        self._tenant_home = get_user_home(self.user_id)
         # Determine cwd from various possible sources.
         # IMPORTANT: do NOT fall back to os.getcwd() -- that's the HOST's local
         # path which doesn't exist inside container/cloud backends (modal, docker).
@@ -407,17 +458,16 @@ class ShellFileOperations(FileOperations):
                 line = line[:MAX_LINE_LENGTH] + "... [truncated]"
             numbered.append(f"{i:6d}|{line}")
         return '\n'.join(numbered)
-    
     def _expand_path(self, path: str) -> str:
         """
         Expand shell-style paths like ~ and ~user to absolute paths.
-        
+
         This must be done BEFORE shell escaping, since ~ doesn't expand
         inside single quotes.
         """
         if not path:
             return path
-        
+
         # Handle ~ and ~user
         if path.startswith('~'):
             # Get home directory via the terminal environment
@@ -442,8 +492,18 @@ class ShellFileOperations(FileOperations):
                         user_home = expand_result.stdout.strip()
                         suffix = path[1 + len(username):]  # e.g. "/rest/of/path"
                         return user_home + suffix
-        
+
+            # Fallback when env-side expansion is unavailable: preserve ~ semantics
+            # with local expansion instead of treating the path as tenant-relative.
+            return os.path.expanduser(path)
+
+        # Relative paths resolve into the tenant home for isolation
+        if not os.path.isabs(path):
+            return str(self._tenant_home / path)
         return path
+
+
+        
     
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands."""
@@ -654,7 +714,7 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
 
         # Block writes to sensitive paths
-        if _is_write_denied(path):
+        if _is_write_denied(path, self.user_id):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
         # Create parent directories
@@ -711,7 +771,7 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
 
         # Block writes to sensitive paths
-        if _is_write_denied(path):
+        if _is_write_denied(path, self.user_id):
             return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
         # Read current content

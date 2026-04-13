@@ -59,3 +59,27 @@ mini-swe-agent/
 .direnv/
 result
 website/static/api/skills-index.json
+
+# ── GSD baseline (auto-generated) ──
+.gsd
+.gsd-id
+.bg-shell/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+*.code-workspace
+.env.*
+!.env.example
+.next/
+dist/
+build/
+*.pyc
+venv/
+target/
+vendor/
+*.log
+coverage/
+.cache/

@@ -45,6 +45,8 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from hermes_constants import DEFAULT_TENANT, normalize_tenant
+
 
 logger = logging.getLogger(__name__)
 
@@ -123,13 +125,13 @@ def check_api_server_requirements() -> bool:
 
 class ResponseStore:
     """
-    SQLite-backed LRU store for Responses API state.
+    SQLite-backed LRU store for Responses API state with tenant scoping.
 
     Each stored response includes the full internal conversation history
     (with tool calls and results) so it can be reconstructed on subsequent
     requests via previous_response_id.
 
-    Persists across gateway restarts.  Falls back to in-memory SQLite
+    Persists across gateway restarts. Falls back to in-memory SQLite
     if the on-disk path is unavailable.
     """
 
@@ -145,74 +147,163 @@ class ResponseStore:
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
         except Exception:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    @staticmethod
+    def _tenant(user_id: Optional[str]) -> str:
+        return normalize_tenant(user_id)
+
+    def _table_info(self, name: str) -> list[sqlite3.Row]:
+        return self._conn.execute(f"PRAGMA table_info({name})").fetchall()
+
+    def _init_schema(self) -> None:
+        """Create or migrate tables to include tenant scoping."""
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # Create tables if missing
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS responses (
-                response_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                response_id TEXT NOT NULL,
                 data TEXT NOT NULL,
-                accessed_at REAL NOT NULL
+                accessed_at REAL NOT NULL,
+                PRIMARY KEY (user_id, response_id)
             )"""
         )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS conversations (
-                name TEXT PRIMARY KEY,
-                response_id TEXT NOT NULL
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                response_id TEXT NOT NULL,
+                PRIMARY KEY (user_id, name)
             )"""
         )
         self._conn.commit()
+        # Migrate legacy tables lacking user_id/composite PK
+        self._migrate_table(
+            table="responses",
+            create_sql="""CREATE TABLE responses (
+                user_id TEXT NOT NULL,
+                response_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                accessed_at REAL NOT NULL,
+                PRIMARY KEY (user_id, response_id)
+            )""",
+            copy_sql_with_user="INSERT INTO responses (user_id, response_id, data, accessed_at) SELECT COALESCE(user_id, 'default'), response_id, data, accessed_at FROM responses_old",
+            copy_sql_without_user="INSERT INTO responses (user_id, response_id, data, accessed_at) SELECT 'default', response_id, data, accessed_at FROM responses_old",
+            required_pk=["user_id", "response_id"],
+        )
+        self._migrate_table(
+            table="conversations",
+            create_sql="""CREATE TABLE conversations (
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                response_id TEXT NOT NULL,
+                PRIMARY KEY (user_id, name)
+            )""",
+            copy_sql_with_user="INSERT INTO conversations (user_id, name, response_id) SELECT COALESCE(user_id, 'default'), name, response_id FROM conversations_old",
+            copy_sql_without_user="INSERT INTO conversations (user_id, name, response_id) SELECT 'default', name, response_id FROM conversations_old",
+            required_pk=["user_id", "name"],
+        )
+        # Helpful index for eviction by tenant
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_responses_user_accessed ON responses(user_id, accessed_at)")
+        self._conn.commit()
 
-    def get(self, response_id: str) -> Optional[Dict[str, Any]]:
+    def _migrate_table(
+        self,
+        *,
+        table: str,
+        create_sql: str,
+        copy_sql_with_user: str,
+        copy_sql_without_user: str,
+        required_pk: list[str],
+    ) -> None:
+        info = self._table_info(table)
+        if not info:
+            # Table was just created above
+            return
+        columns = [row[1] for row in info]
+        pk_cols = [row[1] for row in info if row[5] > 0]
+        needs_user = "user_id" not in columns
+        needs_pk = pk_cols != required_pk
+        if not needs_user and not needs_pk:
+            return
+
+        self._conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
+        self._conn.execute(create_sql)
+        if not needs_user:
+            self._conn.execute(copy_sql_with_user)
+        else:
+            self._conn.execute(copy_sql_without_user)
+        self._conn.execute(f"DROP TABLE {table}_old")
+        self._conn.commit()
+
+    def get(self, response_id: str, user_id: str | None = None) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
+        tenant = self._tenant(user_id)
         row = self._conn.execute(
-            "SELECT data FROM responses WHERE response_id = ?", (response_id,)
+            "SELECT data FROM responses WHERE user_id = ? AND response_id = ?",
+            (tenant, response_id),
         ).fetchone()
         if row is None:
             return None
-        import time
         self._conn.execute(
-            "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (time.time(), response_id),
+            "UPDATE responses SET accessed_at = ? WHERE user_id = ? AND response_id = ?",
+            (time.time(), tenant, response_id),
         )
         self._conn.commit()
-        return json.loads(row[0])
+        return json.loads(row[0] if not isinstance(row, sqlite3.Row) else row["data"])
 
-    def put(self, response_id: str, data: Dict[str, Any]) -> None:
-        """Store a response, evicting the oldest if at capacity."""
-        import time
-        self._conn.execute(
-            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
-        )
-        # Evict oldest entries beyond max_size
-        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
+    def _evict_tenant(self, tenant: str) -> None:
+        count_row = self._conn.execute(
+            "SELECT COUNT(*) AS cnt FROM responses WHERE user_id = ?", (tenant,)
+        ).fetchone()
+        count = count_row[0] if not isinstance(count_row, sqlite3.Row) else count_row["cnt"]
         if count > self._max_size:
             self._conn.execute(
-                "DELETE FROM responses WHERE response_id IN "
-                "(SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?)",
-                (count - self._max_size,),
+                "DELETE FROM responses WHERE rowid IN ("
+                "SELECT rowid FROM responses WHERE user_id = ? ORDER BY accessed_at ASC LIMIT ?"
+                ")",
+                (tenant, count - self._max_size),
             )
+
+    def put(self, response_id: str, data: Dict[str, Any], user_id: str | None = None) -> None:
+        """Store a response, evicting the oldest within the tenant if at capacity."""
+        tenant = self._tenant(user_id)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO responses (user_id, response_id, data, accessed_at) VALUES (?, ?, ?, ?)",
+            (tenant, response_id, json.dumps(data, default=str), time.time()),
+        )
+        self._evict_tenant(tenant)
         self._conn.commit()
 
-    def delete(self, response_id: str) -> bool:
+    def delete(self, response_id: str, user_id: str | None = None) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
+        tenant = self._tenant(user_id)
         cursor = self._conn.execute(
-            "DELETE FROM responses WHERE response_id = ?", (response_id,)
+            "DELETE FROM responses WHERE user_id = ? AND response_id = ?",
+            (tenant, response_id),
         )
         self._conn.commit()
         return cursor.rowcount > 0
 
-    def get_conversation(self, name: str) -> Optional[str]:
-        """Get the latest response_id for a conversation name."""
+    def get_conversation(self, name: str, user_id: str | None = None) -> Optional[str]:
+        """Get the latest response_id for a conversation name scoped to a tenant."""
+        tenant = self._tenant(user_id)
         row = self._conn.execute(
-            "SELECT response_id FROM conversations WHERE name = ?", (name,)
+            "SELECT response_id FROM conversations WHERE user_id = ? AND name = ?",
+            (tenant, name),
         ).fetchone()
-        return row[0] if row else None
+        if row is None:
+            return None
+        return row[0] if not isinstance(row, sqlite3.Row) else row["response_id"]
 
-    def set_conversation(self, name: str, response_id: str) -> None:
-        """Map a conversation name to its latest response_id."""
+    def set_conversation(self, name: str, response_id: str, user_id: str | None = None) -> None:
+        """Map a conversation name to its latest response_id for a tenant."""
+        tenant = self._tenant(user_id)
         self._conn.execute(
-            "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
-            (name, response_id),
+            "INSERT OR REPLACE INTO conversations (user_id, name, response_id) VALUES (?, ?, ?)",
+            (tenant, name, response_id),
         )
         self._conn.commit()
 
@@ -273,6 +364,10 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+class _TenantValidationError(Exception):
+    """Raised when an invalid tenant/user identifier is supplied."""
 
 
 if AIOHTTP_AVAILABLE:
@@ -461,6 +556,33 @@ class APIServerAdapter(BasePlatformAdapter):
         return "*" in self._cors_origins or origin in self._cors_origins
 
     # ------------------------------------------------------------------
+    # Tenant helper
+    # ------------------------------------------------------------------
+
+    def _extract_tenant(self, request: "web.Request", body: Optional[Dict[str, Any]] = None) -> str:
+        """Extract and validate tenant/user identifier from the request."""
+        raw = None
+        if isinstance(body, dict):
+            raw = body.get("user_id")
+            if raw is None:
+                raw = body.get("user")
+        if raw is None and request is not None:
+            raw = request.headers.get("X-Hermes-User-Id") or request.headers.get("X-OpenAI-User")
+        if raw is None and request is not None:
+            raw = request.query.get("user_id") or request.query.get("user")
+        if raw is None:
+            return DEFAULT_TENANT
+
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            raw = str(raw)
+        if not isinstance(raw, str):
+            raise _TenantValidationError("Invalid user_id: must be a non-empty string.")
+        raw = raw.strip()
+        if not raw:
+            raise _TenantValidationError("Invalid user_id: must be a non-empty string.")
+        return normalize_tenant(raw)
+
+    # ------------------------------------------------------------------
     # Auth helper
     # ------------------------------------------------------------------
 
@@ -514,6 +636,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        user_id: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -554,6 +677,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
+            user_id=user_id,
         )
         return agent
 
@@ -636,6 +760,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        try:
+            tenant = self._extract_tenant(request, body)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
         #
@@ -668,7 +797,7 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                    history = db.get_messages_as_conversation(session_id, user_id=tenant)
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
@@ -746,6 +875,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 agent_ref=agent_ref,
+                user_id=tenant,
             ))
 
             return await self._write_sse_chat_completion(
@@ -760,6 +890,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                user_id=tenant,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -967,13 +1098,18 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation = body.get("conversation")
         store = body.get("store", True)
 
+        try:
+            tenant = self._extract_tenant(request, body)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
 
         # Resolve conversation name to latest response_id
         if conversation:
-            previous_response_id = self._response_store.get_conversation(conversation)
+            previous_response_id = self._response_store.get_conversation(conversation, user_id=tenant)
             # No error if conversation doesn't exist yet — it's a new conversation
 
         # Normalize input to message list
@@ -1014,7 +1150,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = self._response_store.get(previous_response_id, user_id=tenant)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
             conversation_history = list(stored.get("conversation_history", []))
@@ -1044,6 +1180,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                user_id=tenant,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1111,11 +1248,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "response": response_data,
                 "conversation_history": full_history,
                 "instructions": instructions,
-            })
+            }, user_id=tenant)
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
             if conversation:
-                self._response_store.set_conversation(conversation, response_id)
+                self._response_store.set_conversation(conversation, response_id, user_id=tenant)
 
         return web.json_response(response_data)
 
@@ -1129,8 +1266,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        try:
+            tenant = self._extract_tenant(request)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
         response_id = request.match_info["response_id"]
-        stored = self._response_store.get(response_id)
+        stored = self._response_store.get(response_id, user_id=tenant)
         if stored is None:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
@@ -1142,8 +1284,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        try:
+            tenant = self._extract_tenant(request)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
         response_id = request.match_info["response_id"]
-        deleted = self._response_store.delete(response_id)
+        deleted = self._response_store.delete(response_id, user_id=tenant)
         if not deleted:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
@@ -1462,6 +1609,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         agent_ref: Optional[list] = None,
@@ -1485,6 +1633,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
+                user_id=user_id,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent

@@ -10,6 +10,7 @@ from pathlib import Path
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import ShellFileOperations
 from agent.redact import redact_sensitive_text
+from hermes_constants import resolve_runtime_key
 
 logger = logging.getLogger(__name__)
 
@@ -162,45 +163,47 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks,
         _creation_locks_lock,
+        _task_env_overrides,
     )
     import time
+
+    runtime_key, tenant, normalized_task = resolve_runtime_key(task_id)
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
     with _file_ops_lock:
-        cached = _file_ops_cache.get(task_id)
+        cached = _file_ops_cache.get(runtime_key)
     if cached is not None:
         with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
+            if runtime_key in _active_environments:
+                _last_activity[runtime_key] = time.time()
                 return cached
             else:
                 # Environment was cleaned up -- invalidate stale cache entry
                 with _file_ops_lock:
-                    _file_ops_cache.pop(task_id, None)
+                    _file_ops_cache.pop(runtime_key, None)
 
     # Need to ensure the environment exists before building file_ops.
     # Acquire per-task lock so only one thread creates the sandbox.
     with _creation_locks_lock:
-        if task_id not in _creation_locks:
-            _creation_locks[task_id] = threading.Lock()
-        task_lock = _creation_locks[task_id]
+        if runtime_key not in _creation_locks:
+            _creation_locks[runtime_key] = threading.Lock()
+        task_lock = _creation_locks[runtime_key]
 
     with task_lock:
         # Double-check: another thread may have created it while we waited
         with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
-                terminal_env = _active_environments[task_id]
+            if runtime_key in _active_environments:
+                _last_activity[runtime_key] = time.time()
+                terminal_env = _active_environments[runtime_key]
             else:
                 terminal_env = None
 
         if terminal_env is None:
-            from tools.terminal_tool import _task_env_overrides
+            overrides = _task_env_overrides.get(runtime_key, {})
 
             config = _get_env_config()
             env_type = config["env_type"]
-            overrides = _task_env_overrides.get(task_id, {})
 
             if env_type == "docker":
                 image = overrides.get("docker_image") or config["docker_image"]
@@ -214,7 +217,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 image = ""
 
             cwd = overrides.get("cwd") or config["cwd"]
-            logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
+            logger.info("Creating new %s environment for tenant %s task %s...", env_type, tenant, normalized_task[:8])
 
             container_config = None
             if env_type in ("docker", "singularity", "modal", "daytona"):
@@ -250,21 +253,21 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 ssh_config=ssh_config,
                 container_config=container_config,
                 local_config=local_config,
-                task_id=task_id,
+                task_id=runtime_key,
                 host_cwd=config.get("host_cwd"),
             )
 
             with _env_lock:
-                _active_environments[task_id] = terminal_env
-                _last_activity[task_id] = time.time()
+                _active_environments[runtime_key] = terminal_env
+                _last_activity[runtime_key] = time.time()
 
             _start_cleanup_thread()
-            logger.info("%s environment ready for task %s", env_type, task_id[:8])
+            logger.info("%s environment ready for tenant %s task %s", env_type, tenant, normalized_task[:8])
 
     # Build file_ops from the (guaranteed live) environment and cache it
     file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
-        _file_ops_cache[task_id] = file_ops
+        _file_ops_cache[runtime_key] = file_ops
     return file_ops
 
 
@@ -272,14 +275,18 @@ def clear_file_ops_cache(task_id: str = None):
     """Clear the file operations cache."""
     with _file_ops_lock:
         if task_id:
-            _file_ops_cache.pop(task_id, None)
+            runtime_key, _, _ = resolve_runtime_key(task_id)
+            _file_ops_cache.pop(runtime_key, None)
         else:
             _file_ops_cache.clear()
+
+
 
 
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
+        runtime_key, _, _ = resolve_runtime_key(task_id)
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
         # blocking on input).  Pure path check — no I/O.
@@ -332,7 +339,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         resolved_str = str(_resolved)
         dedup_key = (resolved_str, offset, limit)
         with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
+            task_data = _read_tracker.setdefault(runtime_key, {
                 "last_key": None, "consecutive": 0,
                 "read_history": set(), "dedup": {},
             })
@@ -355,7 +362,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
-        file_ops = _get_file_ops(task_id)
+        file_ops = _get_file_ops(runtime_key)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
@@ -453,8 +460,9 @@ def get_read_files_summary(task_id: str = "default") -> list:
     Used by context compression to preserve file-read history across
     compression boundaries.
     """
+    runtime_key, _, _ = resolve_runtime_key(task_id)
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id, {})
+        task_data = _read_tracker.get(runtime_key, {})
         read_history = task_data.get("read_history", set())
         seen_paths: dict = {}
         for (path, offset, limit) in read_history:
@@ -474,9 +482,10 @@ def clear_read_tracker(task_id: str = None):
     Should be called when a session is destroyed to prevent memory leaks
     in long-running gateway processes.
     """
+    runtime_key, _, _ = resolve_runtime_key(task_id) if task_id else (None, None, None)
     with _read_tracker_lock:
         if task_id:
-            _read_tracker.pop(task_id, None)
+            _read_tracker.pop(runtime_key, None)
         else:
             _read_tracker.clear()
 
@@ -492,9 +501,10 @@ def reset_file_dedup(task_id: str = None):
 
     Call with a task_id to clear just that task, or without to clear all.
     """
+    runtime_key, _, _ = resolve_runtime_key(task_id) if task_id else (None, None, None)
     with _read_tracker_lock:
         if task_id:
-            task_data = _read_tracker.get(task_id)
+            task_data = _read_tracker.get(runtime_key)
             if task_data and "dedup" in task_data:
                 task_data["dedup"].clear()
         else:
@@ -512,8 +522,9 @@ def notify_other_tool_call(task_id: str = "default"):
     anything else in between (write, patch, terminal, etc.) the counter
     resets and the next read is treated as fresh.
     """
+    runtime_key, _, _ = resolve_runtime_key(task_id)
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(runtime_key)
         if task_data:
             task_data["last_key"] = None
             task_data["consecutive"] = 0
@@ -526,13 +537,14 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
     same task don't trigger false staleness warnings — each write
     refreshes the stored timestamp to match the file's new state.
     """
+    runtime_key, _, _ = resolve_runtime_key(task_id)
     try:
         resolved = str(Path(filepath).expanduser().resolve())
         current_mtime = os.path.getmtime(resolved)
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(runtime_key)
         if task_data is not None:
             task_data.setdefault("read_timestamps", {})[resolved] = current_mtime
 
@@ -544,12 +556,13 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     the last read_file call for this task), or None if the file is fresh
     or was never read.  Does not block — the write still proceeds.
     """
+    runtime_key, _, _ = resolve_runtime_key(task_id)
     try:
         resolved = str(Path(filepath).expanduser().resolve())
     except (OSError, ValueError):
         return None
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(runtime_key)
         if not task_data:
             return None
         read_mtime = task_data.get("read_timestamps", {}).get(resolved)
@@ -570,12 +583,13 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
 
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
+    runtime_key, _, _ = resolve_runtime_key(task_id)
     sensitive_err = _check_sensitive_path(path)
     if sensitive_err:
         return tool_error(sensitive_err)
     try:
         stale_warning = _check_file_staleness(path, task_id)
-        file_ops = _get_file_ops(task_id)
+        file_ops = _get_file_ops(runtime_key)
         result = file_ops.write_file(path, content)
         result_dict = result.to_dict()
         if stale_warning:
@@ -596,6 +610,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default") -> str:
     """Patch a file using replace mode or V4A patch format."""
+    runtime_key, _, _ = resolve_runtime_key(task_id)
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     if path:
@@ -616,7 +631,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             if _sw:
                 stale_warnings.append(_sw)
 
-        file_ops = _get_file_ops(task_id)
+        file_ops = _get_file_ops(runtime_key)
         
         if mode == "replace":
             if not path:
@@ -654,6 +669,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 output_mode: str = "content", context: int = 0,
                 task_id: str = "default") -> str:
     """Search for content or files."""
+    runtime_key, _, _ = resolve_runtime_key(task_id)
     try:
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated
@@ -668,7 +684,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             offset,
         )
         with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
+            task_data = _read_tracker.setdefault(runtime_key, {
                 "last_key": None, "consecutive": 0, "read_history": set(),
             })
             if task_data["last_key"] == search_key:
@@ -689,7 +705,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "already_searched": count,
             }, ensure_ascii=False)
 
-        file_ops = _get_file_ops(task_id)
+        file_ops = _get_file_ops(runtime_key)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
