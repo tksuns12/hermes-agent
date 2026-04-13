@@ -24,7 +24,10 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
+from pathlib import Path
+import shutil
 import socket as _socket
 import re
 import sqlite3
@@ -45,7 +48,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
-from hermes_constants import DEFAULT_TENANT, normalize_tenant
+from hermes_constants import DEFAULT_TENANT, get_user_subpath, normalize_tenant
 
 
 logger = logging.getLogger(__name__)
@@ -55,6 +58,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+MAX_OUTPUT_FILE_BYTES = 50 * 1024 * 1024  # 50 MB cap for copied response artifacts
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -319,6 +323,118 @@ class ResponseStore:
         return row[0] if row else 0
 
 
+class OutputFileStore:
+    """Tenant-scoped copied artifact store for API response files."""
+
+    def __init__(self, db_path: str = None):
+        if db_path is None:
+            try:
+                from hermes_cli.config import get_hermes_home
+                db_path = str(get_hermes_home() / "response_store.db")
+            except Exception:
+                db_path = ":memory:"
+        try:
+            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        except Exception:
+            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    @staticmethod
+    def _tenant(user_id: Optional[str]) -> str:
+        return normalize_tenant(user_id)
+
+    @staticmethod
+    def _sanitize_filename(name: str, *, fallback: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "").strip("._")
+        return cleaned or fallback
+
+    def _init_schema(self) -> None:
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS output_files (
+                user_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                storage_name TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (user_id, file_id)
+            )"""
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_output_files_user_created "
+            "ON output_files(user_id, created_at)"
+        )
+        self._conn.commit()
+
+    def put_from_path(self, file_path: str, user_id: str | None = None) -> Dict[str, Any]:
+        tenant = self._tenant(user_id)
+        source = Path(os.path.expanduser(file_path)).resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"Output file not found: {source}")
+
+        size_bytes = source.stat().st_size
+        if size_bytes > MAX_OUTPUT_FILE_BYTES:
+            raise ValueError(
+                f"Output file exceeds {MAX_OUTPUT_FILE_BYTES} bytes: {source}"
+            )
+
+        file_id = f"file_{uuid.uuid4().hex[:24]}"
+        filename = self._sanitize_filename(source.name, fallback=f"{file_id}.bin")
+        storage_name = f"{file_id}_{filename}"
+        target_dir = get_user_subpath(tenant, "api_server", "files")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = target_dir / storage_name
+        shutil.copy2(source, stored_path)
+
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        created_at = time.time()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO output_files "
+            "(user_id, file_id, storage_name, filename, mime_type, size_bytes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tenant, file_id, storage_name, filename, mime_type, size_bytes, created_at),
+        )
+        self._conn.commit()
+        return {
+            "file_id": file_id,
+            "filename": filename,
+            "mime_type": mime_type,
+            "size_bytes": size_bytes,
+            "created_at": int(created_at),
+            "path": str(stored_path),
+        }
+
+    def get(self, file_id: str, user_id: str | None = None) -> Optional[Dict[str, Any]]:
+        tenant = self._tenant(user_id)
+        row = self._conn.execute(
+            "SELECT storage_name, filename, mime_type, size_bytes, created_at "
+            "FROM output_files WHERE user_id = ? AND file_id = ?",
+            (tenant, file_id),
+        ).fetchone()
+        if row is None:
+            return None
+        stored_path = get_user_subpath(tenant, "api_server", "files", row["storage_name"])
+        if not stored_path.is_file():
+            return None
+        return {
+            "file_id": file_id,
+            "filename": row["filename"],
+            "mime_type": row["mime_type"],
+            "size_bytes": row["size_bytes"],
+            "created_at": int(row["created_at"]),
+            "path": str(stored_path),
+        }
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # CORS middleware
 # ---------------------------------------------------------------------------
@@ -484,6 +600,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._output_file_store = OutputFileStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1214,6 +1331,10 @@ class APIServerAdapter(BasePlatformAdapter):
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
 
+        # Build output items first so the stored history can use the same
+        # cleaned assistant text returned to the client.
+        output_items, cleaned_final_response = self._extract_output_items(result, user_id=tenant)
+
         # Build the full conversation history for storage
         # (includes tool calls from the agent run)
         full_history = list(conversation_history)
@@ -1221,12 +1342,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # Add agent's internal messages if available
         agent_messages = result.get("messages", [])
         if agent_messages:
-            full_history.extend(agent_messages)
+            full_history.extend(
+                self._sanitize_messages_for_storage(
+                    agent_messages,
+                    original_final=final_response,
+                    cleaned_final=cleaned_final_response,
+                )
+            )
         else:
-            full_history.append({"role": "assistant", "content": final_response})
-
-        # Build output items (includes tool calls + final message)
-        output_items = self._extract_output_items(result)
+            full_history.append({"role": "assistant", "content": cleaned_final_response})
 
         response_data = {
             "id": response_id,
@@ -1299,6 +1423,29 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "response",
             "deleted": True,
         })
+
+    async def _handle_get_file(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /v1/files/{file_id} — download a tenant-scoped response artifact."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            tenant = self._extract_tenant(request)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
+        file_id = request.match_info["file_id"]
+        stored = self._output_file_store.get(file_id, user_id=tenant)
+        if stored is None:
+            return web.json_response(_openai_error(f"File not found: {file_id}", code="file_not_found"), status=404)
+
+        return web.FileResponse(
+            path=stored["path"],
+            headers={
+                "Content-Type": stored["mime_type"],
+            },
+        )
 
     # ------------------------------------------------------------------
     # Cron jobs API
@@ -1551,14 +1698,108 @@ class APIServerAdapter(BasePlatformAdapter):
     # Output extraction helper
     # ------------------------------------------------------------------
 
+    _EXPLICIT_OUTPUT_FILE_RE = re.compile(
+        r'(?m)^[ \t]*(?P<label>MEDIA:|FILE:|📎 File:|🖼️ Image:|🎬 Video:|🔊 Audio:)[ \t]*(?P<path>`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\'|(?:~/|/).+?)[ \t]*$'
+    )
+
     @staticmethod
-    def _extract_output_items(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _normalize_output_path(path: str) -> str:
+        candidate = (path or "").strip()
+        if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "`\"'":
+            candidate = candidate[1:-1].strip()
+        return candidate.lstrip("`\"'").rstrip("`\"',.;:)}]")
+
+    def _store_output_artifacts(
+        self,
+        final_text: str,
+        *,
+        user_id: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Extract downloadable files from assistant text and copy them into tenant storage."""
+        text = final_text or ""
+        output_files: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+
+        def _append_file(path_text: str) -> None:
+            candidate = self._normalize_output_path(path_text)
+            if not candidate:
+                return
+            expanded = os.path.expanduser(candidate)
+            if expanded in seen_paths:
+                return
+            try:
+                meta = self._output_file_store.put_from_path(candidate, user_id=user_id)
+            except Exception as exc:
+                logger.warning("[api_server] failed to stage output artifact %s: %s", candidate, exc)
+                return
+            seen_paths.add(expanded)
+            output_files.append({
+                "type": "output_file",
+                "file_id": meta["file_id"],
+                "filename": meta["filename"],
+                "mime_type": meta["mime_type"],
+                "size_bytes": meta["size_bytes"],
+                "download_url": f"/v1/files/{meta['file_id']}",
+            })
+
+        successful_spans: list[tuple[int, int]] = []
+        for match in self._EXPLICIT_OUTPUT_FILE_RE.finditer(text):
+            before = len(output_files)
+            _append_file(match.group("path"))
+            if len(output_files) > before:
+                successful_spans.append(match.span())
+
+        if successful_spans:
+            rebuilt: list[str] = []
+            cursor = 0
+            for start, end in successful_spans:
+                rebuilt.append(text[cursor:start])
+                cursor = end
+            rebuilt.append(text[cursor:])
+            text = "".join(rebuilt)
+
+        local_paths, cleaned_text = BasePlatformAdapter.extract_local_files(text)
+        for local_path in local_paths:
+            _append_file(local_path)
+        if local_paths:
+            text = cleaned_text
+
+        text = text.replace("[[audio_as_voice]]", "")
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return output_files, text
+
+    @staticmethod
+    def _sanitize_messages_for_storage(
+        messages: List[Dict[str, Any]],
+        *,
+        original_final: str,
+        cleaned_final: str,
+    ) -> List[Dict[str, Any]]:
+        if not messages:
+            return []
+        sanitized = [dict(msg) for msg in messages]
+        for idx in range(len(sanitized) - 1, -1, -1):
+            msg = sanitized[idx]
+            if msg.get("role") != "assistant":
+                continue
+            if idx == len(sanitized) - 1 or msg.get("content") == original_final:
+                msg["content"] = cleaned_final
+                break
+        return sanitized
+
+    def _extract_output_items(
+        self,
+        result: Dict[str, Any],
+        *,
+        user_id: str | None = None,
+    ) -> tuple[List[Dict[str, Any]], str]:
         """
         Build the full output item array from the agent's messages.
 
         Walks *result["messages"]* and emits:
         - ``function_call`` items for each tool_call on assistant messages
         - ``function_call_output`` items for each tool-role message
+        - any extracted ``output_file`` items backed by tenant-scoped copies
         - a final ``message`` item with the assistant's text reply
         """
         items: List[Dict[str, Any]] = []
@@ -1582,22 +1823,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output": msg.get("content", ""),
                 })
 
-        # Final assistant message
         final = result.get("final_response", "")
         if not final:
             final = result.get("error", "(No response generated)")
 
+        output_files, cleaned_final = self._store_output_artifacts(final, user_id=user_id)
+        items.extend(output_files)
         items.append({
             "type": "message",
             "role": "assistant",
             "content": [
                 {
                     "type": "output_text",
-                    "text": final,
+                    "text": cleaned_final,
                 }
             ],
         })
-        return items
+        return items, cleaned_final
 
     # ------------------------------------------------------------------
     # Agent execution
@@ -1717,6 +1959,11 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        try:
+            tenant = self._extract_tenant(request, body)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
         raw_input = body.get("input")
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
@@ -1771,7 +2018,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = self._response_store.get(previous_response_id, user_id=tenant)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
                 if instructions is None:
@@ -1802,6 +2049,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    user_id=tenant,
                 )
                 def _run_sync():
                     r = agent.run_conversation(
@@ -1818,11 +2066,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                output_files, cleaned_final_response = self._store_output_artifacts(final_response, user_id=tenant)
                 q.put_nowait({
                     "event": "run.completed",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                    "output": final_response,
+                    "output": cleaned_final_response,
+                    "files": output_files,
                     "usage": usage,
                 })
             except Exception as exc:
@@ -1938,6 +2188,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            self._app.router.add_get("/v1/files/{file_id}", self._handle_get_file)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
@@ -2028,6 +2279,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        self._response_store.close()
+        self._output_file_store.close()
         self._app = None
         logger.info("[%s] API server stopped", self.name)
 

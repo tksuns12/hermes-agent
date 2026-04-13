@@ -15,6 +15,7 @@ Tests cover:
 import json
 import time
 import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,6 +25,7 @@ from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    OutputFileStore,
     ResponseStore,
     _CORS_HEADERS,
     _derive_chat_session_id,
@@ -104,6 +106,21 @@ class TestResponseStore:
         assert store.delete("resp_missing") is False
 
 
+class TestOutputFileStore:
+    def test_put_and_get_are_tenant_scoped(self, tmp_path):
+        source = tmp_path / "report.txt"
+        source.write_text("hello file")
+        db_path = str(tmp_path / "response_store.db")
+        store = OutputFileStore(db_path=db_path)
+
+        stored = store.put_from_path(str(source), user_id="alice")
+        fetched = store.get(stored["file_id"], user_id="alice")
+        assert fetched is not None
+        assert fetched["filename"] == "report.txt"
+        assert Path(fetched["path"]).read_text() == "hello file"
+        assert store.get(stored["file_id"], user_id="bob") is None
+
+
 # ---------------------------------------------------------------------------
 # Adapter initialization
 # ---------------------------------------------------------------------------
@@ -111,7 +128,7 @@ class TestResponseStore:
 
 class TestAdapterInit:
     def test_default_config(self):
-        config = PlatformConfig(enabled=True)
+        config = PlatformConfig(enabled=True, extra={"key": ""})
         adapter = APIServerAdapter(config)
         assert adapter._host == "127.0.0.1"
         assert adapter._port == 8642
@@ -157,7 +174,7 @@ class TestAdapterInit:
 
 class TestAuth:
     def test_no_key_configured_allows_all(self):
-        config = PlatformConfig(enabled=True)
+        config = PlatformConfig(enabled=True, extra={"key": ""})
         adapter = APIServerAdapter(config)
         mock_request = MagicMock()
         mock_request.headers = {}
@@ -205,9 +222,7 @@ class TestAuth:
 
 def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
     """Create an adapter with optional API key."""
-    extra = {}
-    if api_key:
-        extra["key"] = api_key
+    extra = {"key": api_key}
     if cors_origins is not None:
         extra["cors_origins"] = cors_origins
     config = PlatformConfig(enabled=True, extra=extra)
@@ -226,6 +241,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_get("/v1/files/{file_id}", adapter._handle_get_file)
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     return app
 
 
@@ -1390,6 +1408,85 @@ class TestToolCallsInOutput:
             assert data["output"][0]["type"] == "message"
 
 
+class TestOutputFiles:
+    @pytest.mark.asyncio
+    async def test_responses_stage_explicit_output_files_and_download(self, adapter, tmp_path):
+        artifact = tmp_path / "report.txt"
+        artifact.write_text("report body")
+        mock_result = {
+            "final_response": f"Here is the report.\n📎 File: {artifact}",
+            "messages": [{"role": "assistant", "content": f"Here is the report.\n📎 File: {artifact}"}],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "alice"},
+                    json={"model": "hermes-agent", "input": "make report"},
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            output = data["output"]
+            assert output[0]["type"] == "output_file"
+            assert output[0]["filename"] == "report.txt"
+            assert output[0]["download_url"] == f"/v1/files/{output[0]['file_id']}"
+            assert output[1]["type"] == "message"
+            assert output[1]["content"][0]["text"] == "Here is the report."
+
+            stored = adapter._response_store.get(data["id"], user_id="alice")
+            history = stored["conversation_history"]
+            assert history[-1]["content"] == "Here is the report."
+
+            download = await cli.get(
+                output[0]["download_url"],
+                headers={"X-Hermes-User-Id": "alice"},
+            )
+            assert download.status == 200
+            assert await download.text() == "report body"
+            assert download.headers["Content-Type"].startswith("text/plain")
+
+    @pytest.mark.asyncio
+    async def test_output_file_download_is_tenant_isolated(self, adapter, tmp_path):
+        artifact = tmp_path / "private.txt"
+        artifact.write_text("tenant secret")
+        mock_result = {
+            "final_response": f"FILE: {artifact}",
+            "messages": [{"role": "assistant", "content": f"FILE: {artifact}"}],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "alice"},
+                    json={"input": "make private file"},
+                )
+
+            data = await resp.json()
+            file_id = data["output"][0]["file_id"]
+
+            denied = await cli.get(
+                f"/v1/files/{file_id}",
+                headers={"X-Hermes-User-Id": "bob"},
+            )
+            assert denied.status == 404
+
+            allowed = await cli.get(
+                f"/v1/files/{file_id}",
+                headers={"X-Hermes-User-Id": "alice"},
+            )
+            assert allowed.status == 200
+            assert await allowed.text() == "tenant secret"
+
+
 # ---------------------------------------------------------------------------
 # Usage / token counting
 # ---------------------------------------------------------------------------
@@ -1762,6 +1859,39 @@ class TestConversationParameter:
                 assert resp.status == 200
                 # Conversation mapping should NOT be set since store=false
                 assert adapter._response_store.get_conversation("ephemeral-chat") is None
+
+
+class TestRunsEndpoint:
+    @pytest.mark.asyncio
+    async def test_runs_previous_response_id_is_tenant_scoped(self, adapter):
+        adapter._response_store.put(
+            "resp_alice",
+            {
+                "response": {"id": "resp_alice", "object": "response"},
+                "conversation_history": [{"role": "assistant", "content": "alice-only"}],
+                "instructions": "stay scoped",
+            },
+            user_id="alice",
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create_agent:
+                fake_agent = MagicMock()
+                fake_agent.run_conversation.return_value = {"final_response": "done"}
+                fake_agent.session_prompt_tokens = 0
+                fake_agent.session_completion_tokens = 0
+                fake_agent.session_total_tokens = 0
+                mock_create_agent.return_value = fake_agent
+
+                missing = await cli.post(
+                    "/v1/runs",
+                    headers={"X-Hermes-User-Id": "bob"},
+                    json={"input": "follow up", "previous_response_id": "resp_alice"},
+                )
+                assert missing.status == 202
+                assert fake_agent.run_conversation.call_args.kwargs["conversation_history"] == []
+                assert mock_create_agent.call_args.kwargs["user_id"] == "bob"
 
 
 # ---------------------------------------------------------------------------
