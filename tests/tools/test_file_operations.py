@@ -353,6 +353,29 @@ class TestTenantPathResolution:
         assert denied.error is not None
         assert "denied" in denied.error.lower()
 
+    def test_safe_root_blocks_cross_tenant_absolute_paths(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "workspace")
+        from hermes_constants import get_user_home
+
+        alice_workspace_file = get_user_home("alice") / "workspace" / "ok.txt"
+        bob_workspace_file = get_user_home("bob") / "workspace" / "blocked.txt"
+
+        assert _is_write_denied(str(alice_workspace_file), user_id="alice") is False
+        assert _is_write_denied(str(bob_workspace_file), user_id="alice") is True
+
+    def test_default_tenant_cannot_write_named_tenant_root(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.delenv("HERMES_USER_ID", raising=False)
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "workspace")
+        from hermes_constants import get_user_home
+
+        default_workspace_file = get_user_home("default") / "workspace" / "ok.txt"
+        alice_workspace_file = get_user_home("alice") / "workspace" / "blocked.txt"
+
+        assert _is_write_denied(str(default_workspace_file), user_id="default") is False
+        assert _is_write_denied(str(alice_workspace_file), user_id="default") is True
+
     def test_absolute_path_preserved(self, mock_env):
         ops = ShellFileOperations(mock_env)
         assert ops._expand_path("/tmp/file.txt") == "/tmp/file.txt"

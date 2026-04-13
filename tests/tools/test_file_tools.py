@@ -8,6 +8,8 @@ import json
 import logging
 from unittest.mock import MagicMock, patch
 
+from tools.file_operations import ShellFileOperations
+
 from tools.file_tools import (
     FILE_TOOLS,
     READ_FILE_SCHEMA,
@@ -310,5 +312,51 @@ class TestSearchHints:
         assert "[Hint:" in raw
         assert "offset=100" in raw
 
+
+class TestTenantScopedWriteRoots:
+    class _CaptureEnv:
+        def __init__(self):
+            self.cwd = "/tmp"
+            self.commands = []
+
+        def execute(self, command, **kwargs):
+            self.commands.append(command)
+            if "wc -c <" in command:
+                return {"output": "4", "returncode": 0}
+            if "echo $HOME" in command:
+                return {"output": "/home/tester", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+    def test_same_relative_filename_resolves_to_tenant_specific_roots(self, monkeypatch, tmp_path):
+        from tools.file_tools import write_file_tool
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+        alice_env = self._CaptureEnv()
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        alice_ops = ShellFileOperations(alice_env)
+        with patch("tools.file_tools._get_file_ops", return_value=alice_ops):
+            write_file_tool("shared.txt", "data")
+
+        bob_env = self._CaptureEnv()
+        monkeypatch.setenv("HERMES_USER_ID", "bob")
+        bob_ops = ShellFileOperations(bob_env)
+        with patch("tools.file_tools._get_file_ops", return_value=bob_ops):
+            write_file_tool("shared.txt", "data")
+
+        default_env = self._CaptureEnv()
+        monkeypatch.delenv("HERMES_USER_ID", raising=False)
+        default_ops = ShellFileOperations(default_env)
+        with patch("tools.file_tools._get_file_ops", return_value=default_ops):
+            write_file_tool("shared.txt", "data")
+
+        alice_cmd = next(cmd for cmd in alice_env.commands if "cat >" in cmd)
+        bob_cmd = next(cmd for cmd in bob_env.commands if "cat >" in cmd)
+        default_cmd = next(cmd for cmd in default_env.commands if "cat >" in cmd)
+
+        assert "/users/alice/" in alice_cmd
+        assert "/users/bob/" in bob_cmd
+        assert "/users/default/" in default_cmd
+        assert alice_cmd != bob_cmd != default_cmd
 
 

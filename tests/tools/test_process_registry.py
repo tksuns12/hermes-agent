@@ -417,3 +417,43 @@ class TestTenantIsolation:
         checkpoint = get_user_subpath("alice", "processes.json")
         data = json.loads(checkpoint.read_text())
         assert data and data[0]["session_id"] == "proc_tenant"
+
+    def test_recover_sets_recovered_session_tenant(self, registry, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        from hermes_constants import get_user_subpath
+
+        checkpoint = get_user_subpath("alice", "processes.json")
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_alive",
+            "command": "sleep 1",
+            "pid": os.getpid(),
+            "task_id": "t1",
+            "user_id": "alice",
+        }]))
+
+        recovered = registry.recover_from_checkpoint()
+        assert recovered == 1
+        session = registry.get("proc_alive")
+        assert session is not None
+        assert session.user_id == "alice"
+
+    def test_recover_falls_back_to_legacy_checkpoint_file(self, registry, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        from hermes_cli.config import get_hermes_home
+
+        legacy_checkpoint = get_hermes_home() / "processes.json"
+        legacy_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        legacy_checkpoint.write_text(json.dumps([{
+            "session_id": "proc_legacy",
+            "command": "sleep 1",
+            "pid": os.getpid(),
+            "task_id": "t1",
+            "user_id": "alice",
+        }]))
+
+        recovered = registry.recover_from_checkpoint()
+        assert recovered == 1
+        assert registry.get("proc_legacy") is not None

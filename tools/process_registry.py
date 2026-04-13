@@ -51,29 +51,31 @@ from hermes_cli.config import get_hermes_home
 logger = logging.getLogger(__name__)
 
 
-# Checkpoint file for crash recovery (gateway only)
-CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+# Optional override for crash-recovery checkpoint path.
+#
+# None (default): use tenant-scoped checkpoints under
+# <HERMES_HOME>/users/<tenant>/processes.json.
+#
+# Path value: force a single legacy checkpoint file. This is used by tests
+# that patch CHECKPOINT_PATH and by any legacy runtime that explicitly opts in.
+CHECKPOINT_PATH = None
+
+
+def _legacy_checkpoint_path() -> "os.PathLike[str]":
+    """Return the legacy root-level checkpoint path."""
+    return get_hermes_home() / "processes.json"
 
 
 def _checkpoint_path_for(user_id: str | None) -> "os.PathLike[str]":
-    """Return the checkpoint path for *user_id*, falling back to legacy path.
-
-    Uses per-tenant storage under ``<HERMES_HOME>/users/<tenant>/processes.json``.
-    Falls back to the legacy root-level path when tenant resolution fails
-    (backward compatibility for older installations and tests that patch
-    ``CHECKPOINT_PATH``).
-    """
-
-    tenant = normalize_tenant(user_id)
-    _default_path = get_hermes_home() / "processes.json"
-    # Honor patched CHECKPOINT_PATH (tests/legacy)
-    if CHECKPOINT_PATH != _default_path:
+    """Return checkpoint path for *user_id* with optional legacy override."""
+    if CHECKPOINT_PATH is not None:
         path = CHECKPOINT_PATH
     else:
+        tenant = normalize_tenant(user_id)
         try:
             path = get_user_subpath(tenant, "processes.json")
         except Exception:
-            path = CHECKPOINT_PATH
+            path = _legacy_checkpoint_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -783,8 +785,7 @@ class ProcessRegistry:
                     })
 
             from utils import atomic_json_write
-            _default_path = get_hermes_home() / "processes.json"
-            if CHECKPOINT_PATH != _default_path:
+            if CHECKPOINT_PATH is not None:
                 entries = [item for lst in by_tenant.values() for item in lst]
                 atomic_json_write(CHECKPOINT_PATH, entries)
             else:
@@ -799,7 +800,13 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        path = _checkpoint_path_for(self._current_tenant())
+        current_tenant = self._current_tenant()
+        path = _checkpoint_path_for(current_tenant)
+        if not path.exists() and CHECKPOINT_PATH is None:
+            # Backward compatibility: older versions used a single root-level
+            # checkpoint file. If tenant-scoped file is missing, fall back.
+            legacy_path = _legacy_checkpoint_path()
+            path = legacy_path if legacy_path.exists() else path
         if not path.exists():
             return 0
 
@@ -828,6 +835,7 @@ class ProcessRegistry:
                     command=entry.get("command", "unknown"),
                     task_id=entry.get("task_id", ""),
                     session_key=entry.get("session_key", ""),
+                    user_id=normalize_tenant(entry.get("user_id") or current_tenant),
                     pid=pid,
                     cwd=entry.get("cwd"),
                     started_at=entry.get("started_at", time.time()),
@@ -854,10 +862,10 @@ class ProcessRegistry:
                         "thread_id": session.watcher_thread_id,
                     })
 
-        # Clear the checkpoint (will be rewritten as processes finish)
+        # Clear the checkpoint we recovered from (will be rewritten as processes finish)
         try:
             from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, [])
+            atomic_json_write(path, [])
         except Exception as e:
             logger.debug("Could not clear checkpoint file: %s", e, exc_info=True)
 

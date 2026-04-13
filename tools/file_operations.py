@@ -105,14 +105,55 @@ def _is_write_denied(path: str, user_id: str | None = None) -> bool:
     """Return True if path is on the write deny list."""
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
-    # 1) Static deny list
+    # 1) Static deny list captured at import time.
     if resolved in WRITE_DENIED_PATHS:
         return True
     for prefix in WRITE_DENIED_PREFIXES:
         if resolved.startswith(prefix):
             return True
 
-    # 2) Optional safe-root sandbox
+    # 2) Runtime deny list based on current HOME/HERMES_HOME.
+    # Tests and some runtime modes override HOME/HERMES_HOME after import, so
+    # we re-check these dynamic roots to preserve protection guarantees.
+    runtime_home = os.path.realpath(os.path.expanduser("~"))
+    runtime_exact = {
+        os.path.realpath(os.path.join(runtime_home, ".ssh", "authorized_keys")),
+        os.path.realpath(os.path.join(runtime_home, ".ssh", "id_rsa")),
+        os.path.realpath(os.path.join(runtime_home, ".ssh", "id_ed25519")),
+        os.path.realpath(os.path.join(runtime_home, ".ssh", "config")),
+        os.path.realpath(os.path.join(runtime_home, ".bashrc")),
+        os.path.realpath(os.path.join(runtime_home, ".zshrc")),
+        os.path.realpath(os.path.join(runtime_home, ".profile")),
+        os.path.realpath(os.path.join(runtime_home, ".bash_profile")),
+        os.path.realpath(os.path.join(runtime_home, ".zprofile")),
+        os.path.realpath(os.path.join(runtime_home, ".netrc")),
+        os.path.realpath(os.path.join(runtime_home, ".pgpass")),
+        os.path.realpath(os.path.join(runtime_home, ".npmrc")),
+        os.path.realpath(os.path.join(runtime_home, ".pypirc")),
+        os.path.realpath(str(get_hermes_home() / ".env")),
+        "/etc/sudoers",
+        "/etc/passwd",
+        "/etc/shadow",
+    }
+    if resolved in runtime_exact:
+        return True
+
+    runtime_prefixes = [
+        os.path.realpath(os.path.join(runtime_home, ".ssh")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".aws")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".gnupg")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".kube")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".docker")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".azure")) + os.sep,
+        os.path.realpath(os.path.join(runtime_home, ".config", "gh")) + os.sep,
+        "/etc/sudoers.d" + os.sep,
+        "/etc/systemd" + os.sep,
+    ]
+    for prefix in runtime_prefixes:
+        if resolved.startswith(prefix):
+            return True
+
+    # 3) Optional safe-root sandbox
     safe_root = _get_safe_write_root(user_id)
     if safe_root:
         if not (resolved == safe_root or resolved.startswith(safe_root + os.sep)):
@@ -452,6 +493,10 @@ class ShellFileOperations(FileOperations):
                         user_home = expand_result.stdout.strip()
                         suffix = path[1 + len(username):]  # e.g. "/rest/of/path"
                         return user_home + suffix
+
+            # Fallback when env-side expansion is unavailable: preserve ~ semantics
+            # with local expansion instead of treating the path as tenant-relative.
+            return os.path.expanduser(path)
 
         # Relative paths resolve into the tenant home for isolation
         if not os.path.isabs(path):
