@@ -43,7 +43,7 @@ import fire
 from datetime import datetime
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_user_subpath, normalize_tenant
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -592,6 +592,7 @@ class AIAgent:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
+        self._tenant_id = normalize_tenant(user_id)
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -963,7 +964,7 @@ class AIAgent:
         
         # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
         hermes_home = get_hermes_home()
-        self.logs_dir = hermes_home / "sessions"
+        self.logs_dir = get_user_subpath(self._tenant_id, "sessions")
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
         
@@ -995,7 +996,7 @@ class AIAgent:
                         "reasoning_config": reasoning_config,
                         "max_tokens": max_tokens,
                     },
-                    user_id=None,
+                    user_id=self._tenant_id,
                     parent_session_id=self._parent_session_id,
                 )
             except Exception as e:
@@ -1093,10 +1094,8 @@ class AIAgent:
                             "platform": platform or "cli",
                             "hermes_home": str(_ghh()),
                             "agent_context": "primary",
+                            "user_id": self._tenant_id,
                         }
-                        # Thread gateway user identity for per-user memory scoping
-                        if self._user_id:
-                            _init_kwargs["user_id"] = self._user_id
                         # Profile identity for per-profile provider scoping
                         try:
                             from hermes_cli.profiles import get_active_profile_name
@@ -1897,6 +1896,7 @@ class AIAgent:
                 self.session_id,
                 source=self.platform or "cli",
                 model=self.model,
+                user_id=self._tenant_id,
             )
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
@@ -5896,6 +5896,7 @@ class AIAgent:
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
                     parent_session_id=old_session_id,
+                    user_id=self._tenant_id,
                 )
                 # Auto-number the title for the continuation session
                 if old_title:
@@ -6954,7 +6955,7 @@ class AIAgent:
             stored_prompt = None
             if conversation_history and self._session_db:
                 try:
-                    session_row = self._session_db.get_session(self.session_id)
+                    session_row = self._session_db.get_session(self.session_id, user_id=self._tenant_id)
                     if session_row:
                         stored_prompt = session_row.get("system_prompt") or None
                 except Exception:

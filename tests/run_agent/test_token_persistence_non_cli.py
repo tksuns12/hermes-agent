@@ -14,7 +14,7 @@ def _mock_response(*, usage: dict, content: str = "done"):
     )
 
 
-def _make_agent(session_db, *, platform: str):
+def _make_agent(session_db, *, platform: str, user_id=None):
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -28,6 +28,7 @@ def _make_agent(session_db, *, platform: str):
             session_db=session_db,
             session_id=f"{platform}-session",
             platform=platform,
+            user_id=user_id,
         )
     agent.client = MagicMock()
     agent.client.chat.completions.create.return_value = _mock_response(
@@ -60,3 +61,16 @@ def test_run_conversation_persists_tokens_for_cron_sessions():
     assert result["final_response"] == "done"
     session_db.update_token_counts.assert_called_once()
     assert session_db.update_token_counts.call_args.args[0] == "cron-session"
+
+
+def test_default_user_id_normalized_for_db_calls():
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="telegram")
+
+    # Initial session creation should use the normalized default tenant
+    session_db.create_session.assert_called_once()
+    assert session_db.create_session.call_args.kwargs.get("user_id") == "default"
+
+    agent.run_conversation("hello")
+    # ensure_session should also carry the normalized tenant
+    assert session_db.ensure_session.call_args.kwargs.get("user_id") == "default"
