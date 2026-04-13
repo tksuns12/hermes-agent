@@ -337,6 +337,27 @@ class TestShellFileOpsWriteDenied:
 
 
 class TestTenantPathResolution:
+
+
+    def test_same_relative_filename_isolated_per_tenant_home(self, monkeypatch, tmp_path, mock_env):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+        with tenant_context("alice"):
+            alice_ops = ShellFileOperations(mock_env)
+            alice_path = alice_ops._expand_path("shared.txt")
+
+        with tenant_context("bob"):
+            bob_ops = ShellFileOperations(mock_env)
+            bob_path = bob_ops._expand_path("shared.txt")
+
+        with tenant_context(None):
+            default_ops = ShellFileOperations(mock_env)
+            default_path = default_ops._expand_path("shared.txt")
+
+        assert alice_path.endswith("/users/alice/shared.txt")
+        assert bob_path.endswith("/users/bob/shared.txt")
+        assert default_path.endswith("/users/default/shared.txt")
+        assert alice_path != bob_path != default_path
     def test_relative_paths_resolve_to_tenant_home(self, monkeypatch, tmp_path, mock_env):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
         monkeypatch.setenv("HERMES_USER_ID", "alice")

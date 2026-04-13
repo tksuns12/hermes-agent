@@ -528,3 +528,33 @@ class TestTenantIsolation:
 
         remaining = json.loads(shared_checkpoint.read_text())
         assert any(entry["session_id"] == "proc_bob" for entry in remaining)
+
+    def test_default_and_named_tenants_isolate_same_task(self, registry, monkeypatch):
+        shared = "shared-task"
+        s_default = _make_session(sid="proc_default", task_id=shared, user_id="default", output="def")
+        s_alice = _make_session(sid="proc_alice", task_id=shared, user_id="alice", output="alice")
+        s_bob = _make_session(sid="proc_bob", task_id=shared, user_id="bob", output="bob")
+
+        registry._running[s_default.id] = s_default
+        registry._running[s_alice.id] = s_alice
+        registry._finished[s_bob.id] = s_bob
+
+        monkeypatch.setenv("HERMES_USER_ID", "alice")
+        alice_list = registry.list_sessions(task_id=shared)
+        assert [p["session_id"] for p in alice_list] == ["proc_alice"]
+        assert registry.poll("proc_bob")["status"] == "not_found"
+        assert registry.read_log("proc_default")["status"] == "not_found"
+        assert registry.kill_process("proc_bob")["status"] == "not_found"
+
+        monkeypatch.setenv("HERMES_USER_ID", "bob")
+        bob_list = registry.list_sessions(task_id=shared)
+        assert [p["session_id"] for p in bob_list] == ["proc_bob"]
+        assert registry.poll("proc_alice")["status"] == "not_found"
+        assert registry.read_log("proc_default")["status"] == "not_found"
+
+        monkeypatch.delenv("HERMES_USER_ID", raising=False)
+        default_list = registry.list_sessions(task_id=shared)
+        assert [p["session_id"] for p in default_list] == ["proc_default"]
+        assert registry.poll("proc_alice")["status"] == "not_found"
+        assert registry.kill_process("proc_bob")["status"] == "not_found"
+

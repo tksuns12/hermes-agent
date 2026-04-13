@@ -315,6 +315,41 @@ class TestSearchHints:
 
 
 class TestTenantScopedWriteRoots:
+
+
+    def test_read_tracker_separates_default_tenant(self, monkeypatch):
+        from tools import file_tools as ft
+
+        ft.clear_read_tracker()
+        task_id = "shared-task"
+
+        with tenant_context("alice"):
+            runtime_key_alice, _, _ = resolve_runtime_key(task_id)
+        with tenant_context(None):
+            runtime_key_default, _, _ = resolve_runtime_key(task_id)
+
+        with ft._read_tracker_lock:
+            ft._read_tracker[runtime_key_alice] = {
+                "read_history": {("alice.txt", 1, 5)},
+                "last_key": None,
+                "consecutive": 0,
+                "dedup": {},
+            }
+            ft._read_tracker[runtime_key_default] = {
+                "read_history": {("default.txt", 1, 5)},
+                "last_key": None,
+                "consecutive": 0,
+                "dedup": {},
+            }
+
+        with tenant_context("alice"):
+            summary_alice = ft.get_read_files_summary(task_id)
+        with tenant_context(None):
+            summary_default = ft.get_read_files_summary(task_id)
+
+        assert summary_alice == [{"path": "alice.txt", "regions": ["lines 1-5"]}]
+        assert summary_default == [{"path": "default.txt", "regions": ["lines 1-5"]}]
+        ft.clear_read_tracker()
     class _CaptureEnv:
         def __init__(self):
             self.cwd = "/tmp"
