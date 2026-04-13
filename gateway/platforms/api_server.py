@@ -914,13 +914,18 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation = body.get("conversation")
         store = body.get("store", True)
 
+        try:
+            tenant = self._extract_tenant(request, body)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
 
         # Resolve conversation name to latest response_id
         if conversation:
-            previous_response_id = self._response_store.get_conversation(conversation)
+            previous_response_id = self._response_store.get_conversation(conversation, user_id=tenant)
             # No error if conversation doesn't exist yet — it's a new conversation
 
         # Normalize input to message list
@@ -972,7 +977,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = self._response_store.get(previous_response_id, user_id=tenant)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
             conversation_history = list(stored.get("conversation_history", []))
@@ -1002,6 +1007,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                user_id=tenant,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1069,11 +1075,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "response": response_data,
                 "conversation_history": full_history,
                 "instructions": instructions,
-            })
+            }, user_id=tenant)
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
             if conversation:
-                self._response_store.set_conversation(conversation, response_id)
+                self._response_store.set_conversation(conversation, response_id, user_id=tenant)
 
         return web.json_response(response_data)
 
@@ -1087,8 +1093,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        try:
+            tenant = self._extract_tenant(request)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
         response_id = request.match_info["response_id"]
-        stored = self._response_store.get(response_id)
+        stored = self._response_store.get(response_id, user_id=tenant)
         if stored is None:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
@@ -1100,8 +1111,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        try:
+            tenant = self._extract_tenant(request)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
         response_id = request.match_info["response_id"]
-        deleted = self._response_store.delete(response_id)
+        deleted = self._response_store.delete(response_id, user_id=tenant)
         if not deleted:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
 
@@ -1420,6 +1436,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         agent_ref: Optional[list] = None,
@@ -1443,6 +1460,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
+                user_id=user_id,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
