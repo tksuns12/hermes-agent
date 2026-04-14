@@ -61,6 +61,7 @@ MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 MAX_OUTPUT_FILE_BYTES = 50 * 1024 * 1024  # 50 MB cap for copied response artifacts
 MAX_FILE_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB cap for direct uploads
+MAX_INPUT_FILES_PER_REQUEST = 20  # Cap number of input_file references per request
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -620,6 +621,27 @@ class OutputFileStore:
             source=row["source"],
         )
 
+    def delete(self, file_id: str, user_id: str | None = None) -> bool:
+        tenant = self._tenant(user_id)
+        row = self._conn.execute(
+            "SELECT storage_name FROM output_files WHERE user_id = ? AND file_id = ?",
+            (tenant, file_id),
+        ).fetchone()
+        if row is None:
+            return False
+        stored_path = get_user_subpath(tenant, "api_server", "files", row["storage_name"])
+        try:
+            if stored_path.exists():
+                stored_path.unlink()
+        except Exception:
+            logger.debug("[api_server] failed to remove stored file %s", stored_path, exc_info=True)
+        self._conn.execute(
+            "DELETE FROM output_files WHERE user_id = ? AND file_id = ?",
+            (tenant, file_id),
+        )
+        self._conn.commit()
+        return True
+
     def close(self) -> None:
         try:
             self._conn.close()
@@ -694,6 +716,16 @@ class _UploadTooLarge(Exception):
 
 class _MultipartParseError(Exception):
     """Raised when a multipart payload is malformed or missing required parts."""
+
+
+class _OutputArtifactError(Exception):
+    """Raised when assistant output artifacts cannot be staged safely."""
+
+    def __init__(self, message: str, *, status: int = 400, code: str | None = None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.code = code or "invalid_request_error"
 
 
 if AIOHTTP_AVAILABLE:
@@ -1068,6 +1100,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
+        file_counter = [0]
 
         for msg in messages:
             role = msg.get("role", "")
@@ -1082,7 +1115,7 @@ class APIServerAdapter(BasePlatformAdapter):
             elif role in ("user", "assistant"):
                 if role == "user" and isinstance(raw_content, list):
                     try:
-                        content = await self._normalize_chat_user_content(raw_content, tenant)
+                        content = await self._normalize_chat_user_content(raw_content, tenant, file_counter=file_counter)
                     except _InputFileNormalizationError as exc:
                         return web.json_response(
                             _openai_error(exc.message, code=exc.code),
@@ -1525,12 +1558,15 @@ class APIServerAdapter(BasePlatformAdapter):
         *,
         _depth: int = 0,
         _max_depth: int = 10,
+        _file_counter: list[int] | None = None,
     ) -> tuple[str, str]:
         if _depth > _max_depth:
             return "", ""
         agent_parts: list[str] = []
         storage_parts: list[str] = []
         items = parts[:MAX_CONTENT_LIST_SIZE] if len(parts) > MAX_CONTENT_LIST_SIZE else parts
+        if _file_counter is None:
+            _file_counter = [0]
         for part in items:
             if isinstance(part, str):
                 if part:
@@ -1547,6 +1583,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         agent_parts.append(normalized)
                         storage_parts.append(normalized)
                 elif part_type == "input_file":
+                    _file_counter[0] += 1
+                    if _file_counter[0] > MAX_INPUT_FILES_PER_REQUEST:
+                        raise _InputFileNormalizationError(
+                            f"Too many input files (max {MAX_INPUT_FILES_PER_REQUEST})",
+                            status=400,
+                            code="file_limit_exceeded",
+                        )
                     file_id = str(part.get("file_id") or "").strip()
                     if not file_id:
                         raise _InputFileNormalizationError("Missing file_id for input_file part")
@@ -1566,7 +1609,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     continue
             elif isinstance(part, list):
                 nested_agent, nested_storage = await self._normalize_response_content_parts(
-                    part, tenant, _depth=_depth + 1, _max_depth=_max_depth
+                    part, tenant, _depth=_depth + 1, _max_depth=_max_depth, _file_counter=_file_counter
                 )
                 if nested_agent:
                     agent_parts.append(nested_agent)
@@ -1582,10 +1625,11 @@ class APIServerAdapter(BasePlatformAdapter):
             combined_storage = combined_storage[:MAX_NORMALIZED_TEXT_LENGTH]
         return combined_agent, combined_storage
 
-    async def _normalize_chat_user_content(self, content: Any, tenant: str) -> str:
+    async def _normalize_chat_user_content(self, content: Any, tenant: str, *, file_counter: list[int] | None = None) -> str:
         """Normalize chat user content, resolving retained file references."""
         if isinstance(content, list):
-            agent_content, _ = await self._normalize_response_content_parts(content, tenant)
+            counter = file_counter if file_counter is not None else [0]
+            agent_content, _ = await self._normalize_response_content_parts(content, tenant, _file_counter=counter)
             return agent_content
         return _normalize_chat_content(content)
 
@@ -1618,6 +1662,8 @@ class APIServerAdapter(BasePlatformAdapter):
         except _TenantValidationError as exc:
             return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
 
+        file_counter = [0]
+
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
@@ -1643,7 +1689,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     raw_content = item.get("content", "")
                     if isinstance(raw_content, list):
                         try:
-                            agent_content, stored_content = await self._normalize_response_content_parts(raw_content, tenant)
+                            agent_content, stored_content = await self._normalize_response_content_parts(
+                                raw_content, tenant, _file_counter=file_counter
+                            )
                         except _InputFileNormalizationError as exc:
                             return web.json_response(
                                 _openai_error(exc.message, code=exc.code),
@@ -1758,7 +1806,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Build output items first so the stored history can use the same
         # cleaned assistant text returned to the client.
-        output_items, cleaned_final_response = self._extract_output_items(result, user_id=tenant)
+        try:
+            output_items, cleaned_final_response = self._extract_output_items(result, user_id=tenant)
+        except _OutputArtifactError as exc:
+            logger.warning("[api_server] output artifact failure: %s", exc.message)
+            return web.json_response(_openai_error(exc.message, code=exc.code), status=exc.status)
 
         # Build the full conversation history for storage
         # (includes tool calls from the agent run)
@@ -2028,7 +2080,8 @@ class APIServerAdapter(BasePlatformAdapter):
         except ValueError as exc:
             message = str(exc)
             status = 413 if "exceeds" in message.lower() else 400
-            return web.json_response(_openai_error(message, code="invalid_request_error"), status=status)
+            code = "file_too_large" if status == 413 else "invalid_request_error"
+            return web.json_response(_openai_error(message, code=code), status=status)
         except Exception as exc:
             logger.error("Failed to store file: %s", exc, exc_info=True)
             return web.json_response(_openai_error("Failed to store file", err_type="server_error"), status=500)
@@ -2360,47 +2413,51 @@ class APIServerAdapter(BasePlatformAdapter):
         text = final_text or ""
         output_files: list[dict[str, Any]] = []
         seen_paths: set[str] = set()
+        spans: list[tuple[int, int]] = []
+        candidates: list[str] = []
 
-        def _append_file(path_text: str) -> None:
+        def _register_path(path_text: str, span: tuple[int, int] | None = None) -> None:
             candidate = self._normalize_output_path(path_text)
             if not candidate:
                 return
             expanded = os.path.expanduser(candidate)
             if expanded in seen_paths:
+                if span:
+                    spans.append(span)
                 return
-            try:
-                meta = self._output_file_store.put_from_path(
-                    candidate,
-                    user_id=user_id,
-                    purpose="output",
-                    source="assistant_output",
+            path_obj = Path(expanded).expanduser()
+            if not path_obj.is_file():
+                raise _OutputArtifactError(
+                    f"Output file not found: {candidate}",
+                    status=400,
+                    code="file_not_found",
                 )
+            try:
+                size_bytes = path_obj.stat().st_size
             except Exception as exc:
-                logger.warning("[api_server] failed to stage output artifact %s: %s", candidate, exc)
-                return
+                raise _OutputArtifactError(
+                    f"Failed to read output file: {candidate}",
+                    status=400,
+                    code="invalid_request_error",
+                ) from exc
+            if size_bytes > MAX_OUTPUT_FILE_BYTES:
+                raise _OutputArtifactError(
+                    f"Output file too large (max {MAX_OUTPUT_FILE_BYTES} bytes)",
+                    status=413,
+                    code="output_file_too_large",
+                )
             seen_paths.add(expanded)
-            file_obj = self._serialize_file(meta)
-            output_files.append({
-                "type": "output_file",
-                "file_id": meta["file_id"],
-                "filename": meta["filename"],
-                "mime_type": meta["mime_type"],
-                "size_bytes": meta["size_bytes"],
-                "download_url": file_obj["download_url"],
-                "file": file_obj,
-            })
+            candidates.append(candidate)
+            if span:
+                spans.append(span)
 
-        successful_spans: list[tuple[int, int]] = []
         for match in self._EXPLICIT_OUTPUT_FILE_RE.finditer(text):
-            before = len(output_files)
-            _append_file(match.group("path"))
-            if len(output_files) > before:
-                successful_spans.append(match.span())
+            _register_path(match.group("path"), span=match.span())
 
-        if successful_spans:
+        if spans:
             rebuilt: list[str] = []
             cursor = 0
-            for start, end in successful_spans:
+            for start, end in spans:
                 rebuilt.append(text[cursor:start])
                 cursor = end
             rebuilt.append(text[cursor:])
@@ -2408,9 +2465,42 @@ class APIServerAdapter(BasePlatformAdapter):
 
         local_paths, cleaned_text = BasePlatformAdapter.extract_local_files(text)
         for local_path in local_paths:
-            _append_file(local_path)
+            _register_path(local_path)
         if local_paths:
             text = cleaned_text
+
+        staged_ids: list[str] = []
+        last_candidate: str | None = None
+        try:
+            for candidate in candidates:
+                last_candidate = candidate
+                meta = self._output_file_store.put_from_path(
+                    candidate,
+                    user_id=user_id,
+                    purpose="output",
+                    source="assistant_output",
+                )
+                staged_ids.append(meta["file_id"])
+                file_obj = self._serialize_file(meta)
+                output_files.append({
+                    "type": "output_file",
+                    "file_id": meta["file_id"],
+                    "filename": meta["filename"],
+                    "mime_type": meta["mime_type"],
+                    "size_bytes": meta["size_bytes"],
+                    "download_url": file_obj["download_url"],
+                    "file": file_obj,
+                })
+        except Exception as exc:
+            for fid in staged_ids:
+                try:
+                    self._output_file_store.delete(fid, user_id=user_id)
+                except Exception:
+                    pass
+            if isinstance(exc, _OutputArtifactError):
+                raise
+            logger.warning("[api_server] failed to stage output artifact %s: %s", last_candidate, exc)
+            raise _OutputArtifactError("Failed to store output file", status=500, code="server_error") from exc
 
         text = text.replace("[[audio_as_voice]]", "")
         text = re.sub(r"\n{3,}", "\n\n", text).strip()

@@ -1899,6 +1899,99 @@ class TestMultipartUploads:
             assert list_data["data"] == []
 
 
+class TestFileLimitsAndDiagnostics:
+    @pytest.mark.asyncio
+    async def test_input_file_reference_limit_returns_openai_error(self, adapter, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.api_server.MAX_INPUT_FILES_PER_REQUEST", 2)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            file_ids = []
+            for idx in range(3):
+                create = await cli.post(
+                    "/v1/files",
+                    json={
+                        "filename": f"f{idx}.txt",
+                        "content": f"payload {idx}",
+                        "purpose": "user_upload",
+                    },
+                    headers={"X-Hermes-User-Id": "limit-tenant"},
+                )
+                assert create.status == 201
+                file_ids.append((await create.json())["id"])
+
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "limit-tenant"},
+                    json={
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "process"},
+                                    {"type": "input_file", "file_id": file_ids[0]},
+                                    {"type": "input_file", "file_id": file_ids[1]},
+                                    {"type": "input_file", "file_id": file_ids[2]},
+                                ],
+                            }
+                        ]
+                    },
+                )
+
+            assert resp.status == 400
+            error = await resp.json()
+            assert error["error"]["code"] == "file_limit_exceeded"
+            assert mock_run.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_invalid_input_file_reference_returns_file_not_found(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "tenant-missing"},
+                    json={
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_file", "file_id": "file_missing"},
+                                ],
+                            }
+                        ]
+                    },
+                )
+
+            assert resp.status == 404
+            data = await resp.json()
+            assert data["error"]["code"] == "file_not_found"
+            assert mock_run.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_output_file_size_limit_returns_error(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.api_server.MAX_OUTPUT_FILE_BYTES", 1024)
+        artifact = tmp_path / "big.bin"
+        artifact.write_bytes(b"a" * 2048)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": f"FILE: {artifact}", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"input": "make file"},
+                )
+
+            assert resp.status == 413
+            body = await resp.json()
+            assert body["error"]["code"] == "output_file_too_large"
+            assert adapter._output_file_store.list() == []
+
+
 class TestFileNotFoundErrors:
     @pytest.mark.asyncio
     async def test_file_not_found_returns_openai_error(self, adapter):
