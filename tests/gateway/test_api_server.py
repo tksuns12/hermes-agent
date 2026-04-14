@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiohttp import web
+from aiohttp import FormData, web
 from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -1411,6 +1411,7 @@ class TestToolCallsInOutput:
             assert data["output"][0]["type"] == "message"
 
 
+
 class TestFilesTenantRoutes:
     @pytest.mark.asyncio
     async def test_files_upload_and_tenant_isolation(self, adapter):
@@ -1460,6 +1461,114 @@ class TestFilesTenantRoutes:
                 headers={"X-Hermes-User-Id": "beta"},
             )
             assert content_other.status == 404
+
+
+class TestMultipartUploads:
+    @pytest.mark.asyncio
+    async def test_multipart_upload_accepts_supported_file(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            form = FormData()
+            form.add_field(
+                "file",
+                b"\x89PNG\r\n",
+                filename="photo.png",
+                content_type="image/png",
+            )
+            form.add_field("purpose", "user_uploads")
+            form.add_field("source", "user_provided")
+
+            resp = await cli.post(
+                "/v1/files",
+                data=form,
+                headers={"X-Hermes-User-Id": "tenant-multipart"},
+            )
+            assert resp.status == 201
+            body = await resp.json()
+            file_id = body["id"]
+            assert body["filename"] == "photo.png"
+            assert body["purpose"] == "user_uploads"
+            assert body["mime_type"].startswith("image/png")
+            assert "path" not in body
+
+            download = await cli.get(
+                f"/v1/files/{file_id}/content",
+                headers={"X-Hermes-User-Id": "tenant-multipart"},
+            )
+            assert download.status == 200
+            assert await download.read() == b"\x89PNG\r\n"
+
+    @pytest.mark.asyncio
+    async def test_invalid_request_rejects_unsupported_upload_type(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            form = FormData()
+            form.add_field(
+                "file",
+                b"evil",
+                filename="malware.exe",
+                content_type="application/octet-stream",
+            )
+
+            resp = await cli.post(
+                "/v1/files",
+                data=form,
+                headers={"X-Hermes-User-Id": "tenant-unsupported"},
+            )
+            assert resp.status == 400
+            error = await resp.json()
+            assert error["error"]["code"] == "unsupported_file_type"
+
+            listing = await cli.get(
+                "/v1/files",
+                headers={"X-Hermes-User-Id": "tenant-unsupported"},
+            )
+            list_data = await listing.json()
+            assert list_data["data"] == []
+
+    @pytest.mark.asyncio
+    async def test_multipart_rejects_oversize_upload_and_leaves_no_artifacts(self, adapter, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.api_server.MAX_FILE_UPLOAD_BYTES", 1024)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            form = FormData()
+            form.add_field(
+                "file",
+                b"a" * 2048,
+                filename="too-big.txt",
+                content_type="text/plain",
+            )
+
+            resp = await cli.post(
+                "/v1/files",
+                data=form,
+                headers={"X-Hermes-User-Id": "tenant-oversize"},
+            )
+            assert resp.status == 413
+            error = await resp.json()
+            assert error["error"]["code"] == "file_too_large"
+
+            listing = await cli.get(
+                "/v1/files",
+                headers={"X-Hermes-User-Id": "tenant-oversize"},
+            )
+            list_data = await listing.json()
+            assert list_data["data"] == []
+
+
+class TestFileNotFoundErrors:
+    @pytest.mark.asyncio
+    async def test_file_not_found_returns_openai_error(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/files/file_missing/content",
+                headers={"X-Hermes-User-Id": "tenant-missing"},
+            )
+            assert resp.status == 404
+            data = await resp.json()
+            assert data["error"]["code"] == "file_not_found"
+            assert "File not found" in data["error"]["message"]
 
 
 class TestOutputFiles:
@@ -1539,7 +1648,6 @@ class TestOutputFiles:
             )
             assert allowed.status == 200
             assert await allowed.text() == "tenant secret"
-
 
 # ---------------------------------------------------------------------------
 # Usage / token counting

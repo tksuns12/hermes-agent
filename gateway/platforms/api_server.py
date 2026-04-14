@@ -60,9 +60,27 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 MAX_OUTPUT_FILE_BYTES = 50 * 1024 * 1024  # 50 MB cap for copied response artifacts
+MAX_FILE_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB cap for direct uploads
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+SUPPORTED_UPLOAD_MIME_PREFIXES = ("image/", "text/")
+SUPPORTED_UPLOAD_MIME_TYPES = {"application/pdf"}
+SUPPORTED_UPLOAD_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".rtf",
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".heic",
+}
 
 
 def _normalize_chat_content(
@@ -660,6 +678,14 @@ class _TenantValidationError(Exception):
     """Raised when an invalid tenant/user identifier is supplied."""
 
 
+class _UploadTooLarge(Exception):
+    """Raised when an upload exceeds configured limits."""
+
+
+class _MultipartParseError(Exception):
+    """Raised when a multipart payload is malformed or missing required parts."""
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
@@ -668,8 +694,10 @@ if AIOHTTP_AVAILABLE:
             cl = request.headers.get("Content-Length")
             if cl is not None:
                 try:
-                    if int(cl) > MAX_REQUEST_BYTES:
-                        return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
+                    limit = MAX_FILE_UPLOAD_BYTES if request.path.startswith("/v1/files") else MAX_REQUEST_BYTES
+                    if int(cl) > limit:
+                        code = "file_too_large" if request.path.startswith("/v1/files") else "body_too_large"
+                        return web.json_response(_openai_error("Request body too large.", code=code), status=413)
                 except ValueError:
                     return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
         return await handler(request)
@@ -1598,6 +1626,74 @@ class APIServerAdapter(BasePlatformAdapter):
             "deleted": True,
         })
 
+    @staticmethod
+    def _resolve_upload_mime_type(filename: str | None, provided: str | None) -> str:
+        candidate = provided or ""
+        if not candidate or candidate == "application/octet-stream":
+            guessed = mimetypes.guess_type(filename or "")[0]
+            candidate = guessed or candidate or "application/octet-stream"
+        return candidate
+
+    @staticmethod
+    def _upload_type_allowed(filename: str | None, mime_type: str | None) -> bool:
+        ext = (Path(filename).suffix.lower() if filename else "")
+        if mime_type:
+            if mime_type in SUPPORTED_UPLOAD_MIME_TYPES:
+                return True
+            if any(mime_type.startswith(prefix) for prefix in SUPPORTED_UPLOAD_MIME_PREFIXES):
+                return True
+        if ext in SUPPORTED_UPLOAD_EXTENSIONS:
+            return True
+        return False
+
+    async def _parse_multipart_file_upload(self, request: "web.Request") -> tuple[str | None, str | None, str, str, bytes]:
+        try:
+            reader = await request.multipart()
+        except Exception as exc:  # malformed payload
+            raise _MultipartParseError("Invalid multipart payload") from exc
+
+        filename: str | None = None
+        purpose = "uploads"
+        source_kind = "upload"
+        mime_type: str | None = None
+        data: bytes | None = None
+        file_seen = False
+
+        async for part in reader:
+            if part.name == "file":
+                file_seen = True
+                if part.filename:
+                    filename = part.filename
+                if not mime_type:
+                    mime_type = part.headers.get("Content-Type")
+                chunks: list[bytes] = []
+                size = 0
+                while True:
+                    chunk = await part.read_chunk()
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_FILE_UPLOAD_BYTES:
+                        raise _UploadTooLarge("Upload exceeds limit")
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+            elif part.name == "purpose":
+                purpose = (await part.text()) or purpose
+            elif part.name == "source":
+                source_kind = (await part.text()) or source_kind
+            elif part.name == "filename" and not filename:
+                candidate = (await part.text()).strip()
+                if candidate:
+                    filename = candidate
+            # Ignore other fields to remain compatible with OpenAI clients
+
+        if not file_seen:
+            raise _MultipartParseError("Missing file field")
+        if data is None:
+            raise _MultipartParseError("Missing file content")
+
+        return filename, mime_type, purpose, source_kind, data
+
     def _serialize_file(self, meta: Dict[str, Any]) -> Dict[str, Any]:
         """Shape file metadata for API responses."""
         return {
@@ -1624,13 +1720,27 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
 
         content_type = request.headers.get("Content-Type", "")
+        ct_lower = content_type.lower()
         filename: str | None = None
         purpose = "uploads"
         mime_type: str | None = None
         source_kind = "upload"
         data: bytes | None = None
 
-        if content_type.startswith("application/json"):
+        if ct_lower.startswith("multipart/"):
+            try:
+                filename, mime_type, purpose, source_kind, data = await self._parse_multipart_file_upload(request)
+            except _UploadTooLarge:
+                return web.json_response(
+                    _openai_error(f"File too large (max {MAX_FILE_UPLOAD_BYTES} bytes)", code="file_too_large"),
+                    status=413,
+                )
+            except _MultipartParseError as exc:
+                return web.json_response(
+                    _openai_error(str(exc) or "Invalid multipart payload", code="invalid_request_error"),
+                    status=400,
+                )
+        elif ct_lower.startswith("application/json"):
             try:
                 body = await request.json()
             except (json.JSONDecodeError, Exception):
@@ -1662,9 +1772,24 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(
                 _openai_error("Missing file content", code="invalid_request_error"), status=400,
             )
+        if len(data) > MAX_FILE_UPLOAD_BYTES:
+            return web.json_response(
+                _openai_error(f"File too large (max {MAX_FILE_UPLOAD_BYTES} bytes)", code="file_too_large"),
+                status=413,
+            )
         if not filename:
             return web.json_response(
                 _openai_error("Missing filename", param="filename", code="invalid_request_error"), status=400,
+            )
+
+        resolved_mime = self._resolve_upload_mime_type(filename, mime_type)
+        if not self._upload_type_allowed(filename, resolved_mime):
+            return web.json_response(
+                _openai_error(
+                    "Unsupported file type. Only images and documents are allowed.",
+                    code="unsupported_file_type",
+                ),
+                status=400,
             )
 
         try:
@@ -1673,7 +1798,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 data,
                 user_id=tenant,
                 purpose=purpose,
-                mime_type=mime_type,
+                mime_type=resolved_mime,
                 source=source_kind,
             )
         except ValueError as exc:
