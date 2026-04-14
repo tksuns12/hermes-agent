@@ -1293,6 +1293,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final_response:
             final_response = result.get("error", "(No response generated)")
 
+        try:
+            output_files, cleaned_final_response = self._store_output_artifacts(final_response, user_id=tenant)
+        except _OutputArtifactError as exc:
+            logger.warning("[api_server] output artifact failure (chat): %s", exc.message)
+            return web.json_response(_openai_error(exc.message, code=exc.code), status=exc.status)
+
         response_data = {
             "id": completion_id,
             "object": "chat.completion",
@@ -1303,7 +1309,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": final_response,
+                        "content": cleaned_final_response,
                     },
                     "finish_reason": "stop",
                 }
@@ -1314,6 +1320,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        if output_files:
+            response_data["output"] = output_files
+            response_data["files"] = [item.get("file") for item in output_files if item.get("file")]
 
         return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
 

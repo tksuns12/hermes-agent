@@ -2100,6 +2100,124 @@ class TestOutputFiles:
             assert allowed.status == 200
             assert await allowed.text() == "tenant secret"
 
+
+class TestIntegratedFileWorkflows:
+    @pytest.mark.asyncio
+    async def test_responses_upload_to_download_flow(self, adapter, tmp_path):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            upload = await cli.post(
+                "/v1/files",
+                headers={"X-Hermes-User-Id": "alpha"},
+                json={"filename": "input.txt", "content": "hello upload", "purpose": "user_upload"},
+            )
+            assert upload.status == 201
+            file_id = (await upload.json())["id"]
+
+            artifact = tmp_path / "analysis.txt"
+            artifact.write_text("analysis result")
+            mock_result = {
+                "final_response": f"Analysis complete.\n📎 File: {artifact}",
+                "messages": [{"role": "assistant", "content": f"Analysis complete.\n📎 File: {artifact}"}],
+                "api_calls": 1,
+            }
+
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "alpha"},
+                    json={
+                        "model": "hermes-agent",
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "analyze"},
+                                    {"type": "input_file", "file_id": file_id},
+                                ],
+                            }
+                        ],
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            output = data["output"]
+            assert output[0]["type"] == "output_file"
+            assert output[0]["file"]["id"] == output[0]["file_id"]
+            assert output[0]["file"]["download_url"] == output[0]["download_url"]
+            assert "Analysis complete" in output[1]["content"][0]["text"]
+            assert "File:" not in output[1]["content"][0]["text"]
+
+            user_msg = mock_run.call_args.kwargs["user_message"]
+            assert "input.txt" in user_msg
+            assert "hello upload" in user_msg
+
+            download = await cli.get(output[0]["download_url"], headers={"X-Hermes-User-Id": "alpha"})
+            assert download.status == 200
+            assert await download.text() == "analysis result"
+
+            denied = await cli.get(output[0]["download_url"], headers={"X-Hermes-User-Id": "intruder"})
+            assert denied.status == 404
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_upload_to_download_flow(self, adapter, tmp_path):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            upload = await cli.post(
+                "/v1/files",
+                headers={"X-Hermes-User-Id": "tenant-chat"},
+                json={"filename": "chat.txt", "content": "chat input", "purpose": "user_upload"},
+            )
+            assert upload.status == 201
+            file_id = (await upload.json())["id"]
+
+            artifact = tmp_path / "chat-output.txt"
+            artifact.write_text("chat analysis")
+            mock_result = {
+                "final_response": f"Done.\n📎 File: {artifact}",
+                "messages": [{"role": "assistant", "content": f"Done.\n📎 File: {artifact}"}],
+                "api_calls": 1,
+            }
+
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-User-Id": "tenant-chat"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "summarize"},
+                                    {"type": "input_file", "file_id": file_id},
+                                ],
+                            }
+                        ],
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["output"][0]["type"] == "output_file"
+            assert data["output"][0]["file"]["id"] == data["output"][0]["file_id"]
+            assert data["output"][0]["file"]["download_url"] == data["output"][0]["download_url"]
+            assert "File:" not in data["choices"][0]["message"]["content"]
+
+            user_msg = mock_run.call_args.kwargs["user_message"]
+            assert "chat.txt" in user_msg
+            assert "chat input" in user_msg
+
+            download = await cli.get(data["output"][0]["download_url"], headers={"X-Hermes-User-Id": "tenant-chat"})
+            assert download.status == 200
+            assert await download.text() == "chat analysis"
+
+            denied = await cli.get(data["output"][0]["download_url"], headers={"X-Hermes-User-Id": "other"})
+            assert denied.status == 404
+
 # ---------------------------------------------------------------------------
 # Responses input_file context + sanitization
 # ---------------------------------------------------------------------------
