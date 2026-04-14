@@ -1436,29 +1436,103 @@ class APIServerAdapter(BasePlatformAdapter):
             return f"{header}\n{preview}"
         return header
 
-    def _normalize_response_content_parts(
+    @staticmethod
+    def _strip_local_paths(text: Any) -> Any:
+        if not isinstance(text, str):
+            return text
+        cleaned = re.sub(r"\[local_path:[^\]\n]+\]", "", text)
+        cleaned = re.sub(r"Local path:\s+\S+", "", cleaned)
+        _paths, cleaned = BasePlatformAdapter.extract_local_files(cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned
+
+    def _sanitize_history_local_paths(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        sanitized: List[Dict[str, Any]] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            new_msg = dict(msg)
+            new_msg["content"] = self._strip_local_paths(msg.get("content"))
+            sanitized.append(new_msg)
+        return sanitized
+
+    async def _vision_summary_for_input_file(self, meta: Dict[str, Any]) -> str:
+        mime = (meta.get("mime_type") or "").lower()
+        if not mime.startswith("image/"):
+            return ""
+        path = meta.get("path")
+        if not path:
+            return ""
+        try:
+            from tools.vision_tools import vision_analyze_tool
+            result_json = await vision_analyze_tool(
+                image_url=path,
+                user_prompt=(
+                    "Describe this image concisely so a text-only model can understand "
+                    "objects, text, and layout. Include any visible text content."
+                ),
+            )
+            parsed = json.loads(result_json or "{}")
+            if parsed.get("success") and parsed.get("analysis"):
+                return str(parsed.get("analysis")).strip()
+        except Exception as exc:
+            logger.debug("[api_server] vision enrichment failed for %s: %s", path, exc)
+        return ""
+
+    async def _build_input_file_context(
+        self,
+        meta: Dict[str, Any],
+        *,
+        include_path: bool = True,
+    ) -> tuple[str, str]:
+        base = self._render_input_file(meta)
+        path_hint = f"[local_path:{meta['path']}]" if include_path and meta.get("path") else ""
+        vision_summary = await self._vision_summary_for_input_file(meta)
+
+        agent_parts = [part for part in (base, path_hint) if part]
+        storage_parts = [base]
+        if vision_summary:
+            vision_line = f"[vision_summary] {vision_summary}"
+            agent_parts.append(vision_line)
+            storage_parts.append(vision_line)
+
+        agent_text = "\n".join(agent_parts)
+        storage_text = "\n".join(storage_parts)
+
+        if len(agent_text) > MAX_NORMALIZED_TEXT_LENGTH:
+            agent_text = agent_text[:MAX_NORMALIZED_TEXT_LENGTH]
+        if len(storage_text) > MAX_NORMALIZED_TEXT_LENGTH:
+            storage_text = storage_text[:MAX_NORMALIZED_TEXT_LENGTH]
+        return agent_text, storage_text
+
+    async def _normalize_response_content_parts(
         self,
         parts: list[Any],
         tenant: str,
         *,
         _depth: int = 0,
         _max_depth: int = 10,
-    ) -> str:
+    ) -> tuple[str, str]:
         if _depth > _max_depth:
-            return ""
-        normalized_parts: list[str] = []
+            return "", ""
+        agent_parts: list[str] = []
+        storage_parts: list[str] = []
         items = parts[:MAX_CONTENT_LIST_SIZE] if len(parts) > MAX_CONTENT_LIST_SIZE else parts
         for part in items:
             if isinstance(part, str):
                 if part:
-                    normalized_parts.append(part[:MAX_NORMALIZED_TEXT_LENGTH])
+                    text_val = part[:MAX_NORMALIZED_TEXT_LENGTH]
+                    agent_parts.append(text_val)
+                    storage_parts.append(text_val)
                 continue
             if isinstance(part, dict):
                 part_type = str(part.get("type") or "").strip().lower()
                 if part_type in {"text", "input_text", "output_text"}:
                     text_val = part.get("text", "")
                     if text_val:
-                        normalized_parts.append(str(text_val)[:MAX_NORMALIZED_TEXT_LENGTH])
+                        normalized = str(text_val)[:MAX_NORMALIZED_TEXT_LENGTH]
+                        agent_parts.append(normalized)
+                        storage_parts.append(normalized)
                 elif part_type == "input_file":
                     file_id = str(part.get("file_id") or "").strip()
                     if not file_id:
@@ -1470,19 +1544,30 @@ class APIServerAdapter(BasePlatformAdapter):
                             status=404,
                             code="file_not_found",
                         )
-                    normalized_parts.append(self._render_input_file(meta))
+                    agent_ctx, storage_ctx = await self._build_input_file_context(meta)
+                    if agent_ctx:
+                        agent_parts.append(agent_ctx)
+                    if storage_ctx:
+                        storage_parts.append(storage_ctx)
                 else:
                     continue
             elif isinstance(part, list):
-                nested = self._normalize_response_content_parts(part, tenant, _depth=_depth + 1, _max_depth=_max_depth)
-                if nested:
-                    normalized_parts.append(nested)
-            if sum(len(p) for p in normalized_parts) >= MAX_NORMALIZED_TEXT_LENGTH:
+                nested_agent, nested_storage = await self._normalize_response_content_parts(
+                    part, tenant, _depth=_depth + 1, _max_depth=_max_depth
+                )
+                if nested_agent:
+                    agent_parts.append(nested_agent)
+                if nested_storage:
+                    storage_parts.append(nested_storage)
+            if sum(len(p) for p in agent_parts) >= MAX_NORMALIZED_TEXT_LENGTH:
                 break
-        combined = "\n".join([p for p in normalized_parts if p])
-        if len(combined) > MAX_NORMALIZED_TEXT_LENGTH:
-            combined = combined[:MAX_NORMALIZED_TEXT_LENGTH]
-        return combined
+        combined_agent = "\n".join([p for p in agent_parts if p])
+        combined_storage = "\n".join([p for p in storage_parts if p])
+        if len(combined_agent) > MAX_NORMALIZED_TEXT_LENGTH:
+            combined_agent = combined_agent[:MAX_NORMALIZED_TEXT_LENGTH]
+        if len(combined_storage) > MAX_NORMALIZED_TEXT_LENGTH:
+            combined_storage = combined_storage[:MAX_NORMALIZED_TEXT_LENGTH]
+        return combined_agent, combined_storage
 
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
@@ -1522,28 +1607,33 @@ class APIServerAdapter(BasePlatformAdapter):
             previous_response_id = self._response_store.get_conversation(conversation, user_id=tenant)
             # No error if conversation doesn't exist yet — it's a new conversation
 
-        # Normalize input to message list
+        # Normalize input to message list (agent and stored variants)
         input_messages: List[Dict[str, str]] = []
+        storage_messages: List[Dict[str, str]] = []
         if isinstance(raw_input, str):
             input_messages = [{"role": "user", "content": raw_input}]
+            storage_messages = [{"role": "user", "content": raw_input}]
         elif isinstance(raw_input, list):
             for item in raw_input:
                 if isinstance(item, str):
                     input_messages.append({"role": "user", "content": item})
+                    storage_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
                     role = item.get("role", "user")
                     raw_content = item.get("content", "")
                     if isinstance(raw_content, list):
                         try:
-                            content = self._normalize_response_content_parts(raw_content, tenant)
+                            agent_content, stored_content = await self._normalize_response_content_parts(raw_content, tenant)
                         except _InputFileNormalizationError as exc:
                             return web.json_response(
                                 _openai_error(exc.message, code=exc.code),
                                 status=exc.status,
                             )
                     else:
-                        content = _normalize_chat_content(raw_content)
-                    input_messages.append({"role": role, "content": content})
+                        agent_content = _normalize_chat_content(raw_content)
+                        stored_content = agent_content
+                    input_messages.append({"role": role, "content": agent_content})
+                    storage_messages.append({"role": role, "content": stored_content})
                 else:
                     return web.json_response(_openai_error("'input' array items must be strings or objects"), status=400)
         else:
@@ -1553,7 +1643,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # This lets stateless clients supply their own history instead of
         # relying on server-side response chaining via previous_response_id.
         # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
+        agent_history: List[Dict[str, str]] = []
+        storage_history: List[Dict[str, str]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
@@ -1567,31 +1658,40 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                content_val = str(entry["content"])
+                agent_history.append({"role": str(entry["role"]), "content": content_val})
+                storage_history.append({"role": str(entry["role"]), "content": self._strip_local_paths(content_val)})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
-        if not conversation_history and previous_response_id:
+        if not agent_history and previous_response_id:
             stored = self._response_store.get(previous_response_id, user_id=tenant)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
-            conversation_history = list(stored.get("conversation_history", []))
+            base_history = list(stored.get("conversation_history", []))
+            agent_history = list(base_history)
+            storage_history = list(base_history)
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
 
         # Append new input messages to history (all but the last become history)
-        for msg in input_messages[:-1]:
-            conversation_history.append(msg)
+        for idx, msg in enumerate(input_messages[:-1]):
+            agent_history.append(msg)
+            storage_history.append(storage_messages[idx])
 
         # Last input message is the user_message
         user_message = input_messages[-1].get("content", "") if input_messages else ""
+        stored_user_message = storage_messages[-1].get("content", "") if storage_messages else ""
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         # Truncation support
-        if body.get("truncation") == "auto" and len(conversation_history) > 100:
-            conversation_history = conversation_history[-100:]
+        if body.get("truncation") == "auto":
+            if len(agent_history) > 100:
+                agent_history = agent_history[-100:]
+            if len(storage_history) > 100:
+                storage_history = storage_history[-100:]
 
         # Run the agent (with Idempotency-Key support)
         session_id = str(uuid.uuid4())
@@ -1599,7 +1699,7 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _compute_response():
             return await self._run_agent(
                 user_message=user_message,
-                conversation_history=conversation_history,
+                conversation_history=agent_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 user_id=tenant,
@@ -1642,20 +1742,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Build the full conversation history for storage
         # (includes tool calls from the agent run)
-        full_history = list(conversation_history)
-        full_history.append({"role": "user", "content": user_message})
+        full_history = list(storage_history)
+        full_history.append({"role": "user", "content": stored_user_message})
         # Add agent's internal messages if available
         agent_messages = result.get("messages", [])
         if agent_messages:
-            full_history.extend(
-                self._sanitize_messages_for_storage(
-                    agent_messages,
-                    original_final=final_response,
-                    cleaned_final=cleaned_final_response,
-                )
+            sanitized_agent = self._sanitize_messages_for_storage(
+                agent_messages,
+                original_final=final_response,
+                cleaned_final=cleaned_final_response,
             )
+            sanitized_agent = self._sanitize_history_local_paths(sanitized_agent)
+            full_history.extend(sanitized_agent)
         else:
             full_history.append({"role": "assistant", "content": cleaned_final_response})
+        full_history = self._sanitize_history_local_paths(full_history)
 
         response_data = {
             "id": response_id,

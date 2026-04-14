@@ -12,6 +12,7 @@ Tests cover:
 - Error handling (invalid JSON, missing fields)
 """
 
+import base64
 import json
 import time
 import uuid
@@ -1767,6 +1768,107 @@ class TestOutputFiles:
             )
             assert allowed.status == 200
             assert await allowed.text() == "tenant secret"
+
+# ---------------------------------------------------------------------------
+# Responses input_file context + sanitization
+# ---------------------------------------------------------------------------
+
+
+class TestResponsesFileSanitization:
+    @pytest.mark.asyncio
+    async def test_responses_text_file_enriches_and_sanitizes_history(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/v1/files",
+                json={"filename": "note.txt", "content": "secret text", "purpose": "user_upload"},
+                headers={"X-Hermes-User-Id": "tenant-text"},
+            )
+            assert create.status == 201
+            file_id = (await create.json())["id"]
+            meta = adapter._output_file_store.get(file_id, user_id="tenant-text")
+
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "done", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "tenant-text"},
+                    json={
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "summarize"},
+                                    {"type": "input_file", "file_id": file_id},
+                                ],
+                            }
+                        ]
+                    },
+                )
+
+            assert resp.status == 200
+            user_msg = mock_run.call_args.kwargs["user_message"]
+            assert meta["path"] in user_msg
+            assert "secret text" in user_msg
+
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"], user_id="tenant-text")
+            history_contents = [
+                msg.get("content", "") for msg in stored["conversation_history"] if isinstance(msg.get("content"), str)
+            ]
+            assert any("secret text" in c for c in history_contents)
+            assert all(meta["path"] not in c for c in history_contents)
+
+    @pytest.mark.asyncio
+    async def test_responses_image_file_adds_vision_and_sanitizes_path(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            image_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x00"
+            create = await cli.post(
+                "/v1/files",
+                json={
+                    "filename": "photo.png",
+                    "content_base64": base64.b64encode(image_bytes).decode(),
+                    "mime_type": "image/png",
+                    "purpose": "user_upload",
+                },
+                headers={"X-Hermes-User-Id": "tenant-image"},
+            )
+            assert create.status == 201
+            file_id = (await create.json())["id"]
+            meta = adapter._output_file_store.get(file_id, user_id="tenant-image")
+
+            fake_vision = AsyncMock(return_value=json.dumps({"success": True, "analysis": "a red square"}))
+            with patch("tools.vision_tools.vision_analyze_tool", fake_vision):
+                with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                    mock_run.return_value = (
+                        {"final_response": "done", "messages": [], "api_calls": 1},
+                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    )
+                    resp = await cli.post(
+                        "/v1/responses",
+                        headers={"X-Hermes-User-Id": "tenant-image"},
+                        json={"input": [
+                            {"role": "user", "content": [{"type": "input_file", "file_id": file_id}]}
+                        ]},
+                    )
+
+            assert resp.status == 200
+            user_msg = mock_run.call_args.kwargs["user_message"]
+            assert meta["path"] in user_msg
+            assert "red square" in user_msg
+
+            data = await resp.json()
+            stored = adapter._response_store.get(data["id"], user_id="tenant-image")
+            history_contents = [
+                msg.get("content", "") for msg in stored["conversation_history"] if isinstance(msg.get("content"), str)
+            ]
+            assert any("red square" in c for c in history_contents)
+            assert all(meta["path"] not in c for c in history_contents)
+
 
 # ---------------------------------------------------------------------------
 # Usage / token counting
