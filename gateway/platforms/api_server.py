@@ -1134,10 +1134,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
+            history = []
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id, user_id=tenant)
+                    history = db.get_messages_as_conversation(session_id, user_id=tenant) or []
+                    history = self._sanitize_history_local_paths(history)
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []

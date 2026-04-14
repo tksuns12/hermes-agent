@@ -2613,3 +2613,85 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+    @pytest.mark.asyncio
+    async def test_chat_session_history_sanitizes_file_paths(self, auth_adapter):
+        """Session replay should strip local file paths but keep file context for chat."""
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        raw_history = [
+            {
+                "role": "user",
+                "content": (
+                    "[input_file:report.txt (text/plain, 12 bytes)]\n"
+                    "[local_path:/home/alice/.hermes/profiles/dev/output/report.txt]\n"
+                    "hello report file"
+                ),
+            },
+            {"role": "assistant", "content": "Acknowledged"},
+        ]
+        sanitized = auth_adapter._sanitize_history_local_paths(raw_history)
+
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = raw_history
+        auth_adapter._session_db = mock_db
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Id": "sess-files",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "next turn"}]},
+                )
+
+        assert resp.status == 200
+        call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["conversation_history"] == sanitized
+        history_text = "\n".join(str(msg.get("content", "")) for msg in call_kwargs["conversation_history"])
+        assert "report.txt" in history_text
+        assert "hello report file" in history_text
+        assert "[local_path:" not in history_text
+        assert ".hermes" not in history_text
+
+    @pytest.mark.asyncio
+    async def test_chat_session_history_is_tenant_scoped_for_files(self, auth_adapter):
+        """Foreign tenants must not replay another tenant's file-backed session history."""
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+
+        def _history_for(user_id: str | None):
+            return [
+                {
+                    "role": "user",
+                    "content": "[input_file:secret.pdf]\n[local_path:/profiles/owner/.hermes/file.pdf]",
+                }
+            ] if (user_id or "").strip() == "owner" else []
+
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.side_effect = (
+            lambda session_id, user_id=None: _history_for(user_id)
+        )
+        auth_adapter._session_db = mock_db
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Id": "shared-session",
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-User-Id": "intruder",
+                    },
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "let me in"}]},
+                )
+
+        assert resp.status == 200
+        assert mock_db.get_messages_as_conversation.call_args.kwargs["user_id"] == "intruder"
+        call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["conversation_history"] == []
+        assert call_kwargs["session_id"] == "shared-session"
