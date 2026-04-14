@@ -241,7 +241,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
-    app.router.add_get("/v1/files/{file_id}", adapter._handle_get_file)
+    app.router.add_post("/v1/files", adapter._handle_create_file)
+    app.router.add_get("/v1/files", adapter._handle_list_files)
+    app.router.add_get("/v1/files/{file_id}", adapter._handle_get_file_metadata)
+    app.router.add_get("/v1/files/{file_id}/content", adapter._handle_get_file_content)
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     return app
@@ -1408,6 +1411,57 @@ class TestToolCallsInOutput:
             assert data["output"][0]["type"] == "message"
 
 
+class TestFilesTenantRoutes:
+    @pytest.mark.asyncio
+    async def test_files_upload_and_tenant_isolation(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/v1/files",
+                json={"filename": "note.txt", "content": "hello tenant", "purpose": "user_upload"},
+                headers={"X-Hermes-User-Id": "alpha"},
+            )
+            assert create.status == 201
+            created = await create.json()
+            file_id = created["id"]
+            assert created["filename"] == "note.txt"
+            assert created["purpose"] == "user_upload"
+
+            listing = await cli.get("/v1/files", headers={"X-Hermes-User-Id": "alpha"})
+            assert listing.status == 200
+            list_data = await listing.json()
+            assert any(item["id"] == file_id for item in list_data["data"])
+
+            meta = await cli.get(f"/v1/files/{file_id}", headers={"X-Hermes-User-Id": "alpha"})
+            assert meta.status == 200
+            meta_body = await meta.json()
+            assert meta_body["filename"] == "note.txt"
+            assert meta_body["bytes"] == len("hello tenant".encode())
+
+            content = await cli.get(
+                f"/v1/files/{file_id}/content",
+                headers={"X-Hermes-User-Id": "alpha"},
+            )
+            assert content.status == 200
+            assert await content.text() == "hello tenant"
+
+            listing_other = await cli.get("/v1/files", headers={"X-Hermes-User-Id": "beta"})
+            assert listing_other.status == 200
+            other_body = await listing_other.json()
+            assert all(item["id"] != file_id for item in other_body["data"])
+
+            meta_other = await cli.get(
+                f"/v1/files/{file_id}", headers={"X-Hermes-User-Id": "beta"},
+            )
+            assert meta_other.status == 404
+
+            content_other = await cli.get(
+                f"/v1/files/{file_id}/content",
+                headers={"X-Hermes-User-Id": "beta"},
+            )
+            assert content_other.status == 404
+
+
 class TestOutputFiles:
     @pytest.mark.asyncio
     async def test_responses_stage_explicit_output_files_and_download(self, adapter, tmp_path):
@@ -1434,7 +1488,7 @@ class TestOutputFiles:
             output = data["output"]
             assert output[0]["type"] == "output_file"
             assert output[0]["filename"] == "report.txt"
-            assert output[0]["download_url"] == f"/v1/files/{output[0]['file_id']}"
+            assert output[0]["download_url"] == f"/v1/files/{output[0]['file_id']}/content"
             assert output[1]["type"] == "message"
             assert output[1]["content"][0]["text"] == "Here is the report."
 
@@ -1474,13 +1528,13 @@ class TestOutputFiles:
             file_id = data["output"][0]["file_id"]
 
             denied = await cli.get(
-                f"/v1/files/{file_id}",
+                f"/v1/files/{file_id}/content",
                 headers={"X-Hermes-User-Id": "bob"},
             )
             assert denied.status == 404
 
             allowed = await cli.get(
-                f"/v1/files/{file_id}",
+                f"/v1/files/{file_id}/content",
                 headers={"X-Hermes-User-Id": "alice"},
             )
             assert allowed.status == 200

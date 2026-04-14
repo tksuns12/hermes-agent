@@ -20,6 +20,7 @@ Requires:
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -324,7 +325,7 @@ class ResponseStore:
 
 
 class OutputFileStore:
-    """Tenant-scoped copied artifact store for API response files."""
+    """Tenant-scoped file registry for uploads and response artifacts."""
 
     def __init__(self, db_path: str = None):
         if db_path is None:
@@ -360,6 +361,8 @@ class OutputFileStore:
                 mime_type TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL,
                 created_at REAL NOT NULL,
+                purpose TEXT NOT NULL,
+                source TEXT NOT NULL,
                 PRIMARY KEY (user_id, file_id)
             )"""
         )
@@ -367,37 +370,56 @@ class OutputFileStore:
             "CREATE INDEX IF NOT EXISTS idx_output_files_user_created "
             "ON output_files(user_id, created_at)"
         )
+        self._ensure_columns()
         self._conn.commit()
 
-    def put_from_path(self, file_path: str, user_id: str | None = None) -> Dict[str, Any]:
-        tenant = self._tenant(user_id)
-        source = Path(os.path.expanduser(file_path)).resolve()
-        if not source.is_file():
-            raise FileNotFoundError(f"Output file not found: {source}")
-
-        size_bytes = source.stat().st_size
-        if size_bytes > MAX_OUTPUT_FILE_BYTES:
-            raise ValueError(
-                f"Output file exceeds {MAX_OUTPUT_FILE_BYTES} bytes: {source}"
+    def _ensure_columns(self) -> None:
+        info = self._conn.execute("PRAGMA table_info(output_files)").fetchall()
+        cols = {row[1] for row in info}
+        if "purpose" not in cols:
+            self._conn.execute(
+                "ALTER TABLE output_files ADD COLUMN purpose TEXT NOT NULL DEFAULT 'uploads'"
             )
-
-        file_id = f"file_{uuid.uuid4().hex[:24]}"
-        filename = self._sanitize_filename(source.name, fallback=f"{file_id}.bin")
-        storage_name = f"{file_id}_{filename}"
-        target_dir = get_user_subpath(tenant, "api_server", "files")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        stored_path = target_dir / storage_name
-        shutil.copy2(source, stored_path)
-
-        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        created_at = time.time()
-        self._conn.execute(
-            "INSERT OR REPLACE INTO output_files "
-            "(user_id, file_id, storage_name, filename, mime_type, size_bytes, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (tenant, file_id, storage_name, filename, mime_type, size_bytes, created_at),
-        )
+        if "source" not in cols:
+            self._conn.execute(
+                "ALTER TABLE output_files ADD COLUMN source TEXT NOT NULL DEFAULT 'upload'"
+            )
         self._conn.commit()
+
+    def _write_metadata_file(self, meta: Dict[str, Any], tenant: str, *, target_dir: Path | None = None) -> None:
+        try:
+            target = target_dir or get_user_subpath(tenant, "api_server", "files")
+            target.mkdir(parents=True, exist_ok=True)
+            metadata_path = target / f"{meta['file_id']}.json"
+            metadata = {
+                "file_id": meta["file_id"],
+                "user_id": tenant,
+                "filename": meta["filename"],
+                "mime_type": meta["mime_type"],
+                "size_bytes": meta["size_bytes"],
+                "purpose": meta.get("purpose"),
+                "created_at": meta["created_at"],
+                "path": meta["path"],
+                "source": meta.get("source"),
+            }
+            metadata_path.write_text(json.dumps(metadata, default=str))
+        except Exception:
+            logger.debug("Failed to write file metadata for %s", meta.get("file_id"), exc_info=True)
+
+    def _build_meta(
+        self,
+        *,
+        file_id: str,
+        tenant: str,
+        storage_name: str,
+        filename: str,
+        mime_type: str,
+        size_bytes: int,
+        created_at: float,
+        purpose: str,
+        source: str,
+    ) -> Dict[str, Any]:
+        stored_path = get_user_subpath(tenant, "api_server", "files", storage_name)
         return {
             "file_id": file_id,
             "filename": filename,
@@ -405,12 +427,161 @@ class OutputFileStore:
             "size_bytes": size_bytes,
             "created_at": int(created_at),
             "path": str(stored_path),
+            "purpose": purpose,
+            "source": source,
         }
+
+    def store_bytes(
+        self,
+        filename: str,
+        data: bytes,
+        *,
+        user_id: str | None = None,
+        purpose: str = "uploads",
+        mime_type: str | None = None,
+        source: str = "upload",
+    ) -> Dict[str, Any]:
+        tenant = self._tenant(user_id)
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValueError("File content must be bytes")
+        size_bytes = len(data)
+        if size_bytes > MAX_OUTPUT_FILE_BYTES:
+            raise ValueError(
+                f"Output file exceeds {MAX_OUTPUT_FILE_BYTES} bytes"
+            )
+
+        file_id = f"file_{uuid.uuid4().hex[:24]}"
+        safe_name = self._sanitize_filename(filename, fallback=f"{file_id}.bin")
+        storage_name = f"{file_id}_{safe_name}"
+        target_dir = get_user_subpath(tenant, "api_server", "files")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = target_dir / storage_name
+        stored_path.write_bytes(bytes(data))
+
+        resolved_mime = mime_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+        created_at = time.time()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO output_files "
+            "(user_id, file_id, storage_name, filename, mime_type, size_bytes, created_at, purpose, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                tenant,
+                file_id,
+                storage_name,
+                safe_name,
+                resolved_mime,
+                size_bytes,
+                created_at,
+                purpose or "uploads",
+                source or "upload",
+            ),
+        )
+        self._conn.commit()
+        meta = self._build_meta(
+            file_id=file_id,
+            tenant=tenant,
+            storage_name=storage_name,
+            filename=safe_name,
+            mime_type=resolved_mime,
+            size_bytes=size_bytes,
+            created_at=created_at,
+            purpose=purpose or "uploads",
+            source=source or "upload",
+        )
+        self._write_metadata_file(meta, tenant, target_dir=target_dir)
+        return meta
+
+    def put_from_path(
+        self,
+        file_path: str,
+        *,
+        user_id: str | None = None,
+        purpose: str = "output",
+        source: str = "output_file",
+    ) -> Dict[str, Any]:
+        tenant = self._tenant(user_id)
+        source_path = Path(os.path.expanduser(file_path)).resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Output file not found: {source_path}")
+
+        size_bytes = source_path.stat().st_size
+        if size_bytes > MAX_OUTPUT_FILE_BYTES:
+            raise ValueError(
+                f"Output file exceeds {MAX_OUTPUT_FILE_BYTES} bytes: {source_path}"
+            )
+
+        file_id = f"file_{uuid.uuid4().hex[:24]}"
+        filename = self._sanitize_filename(source_path.name, fallback=f"{file_id}.bin")
+        storage_name = f"{file_id}_{filename}"
+        target_dir = get_user_subpath(tenant, "api_server", "files")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = target_dir / storage_name
+        shutil.copy2(source_path, stored_path)
+
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        created_at = time.time()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO output_files "
+            "(user_id, file_id, storage_name, filename, mime_type, size_bytes, created_at, purpose, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                tenant,
+                file_id,
+                storage_name,
+                filename,
+                mime_type,
+                size_bytes,
+                created_at,
+                purpose or "output",
+                source or "output_file",
+            ),
+        )
+        self._conn.commit()
+        meta = self._build_meta(
+            file_id=file_id,
+            tenant=tenant,
+            storage_name=storage_name,
+            filename=filename,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            created_at=created_at,
+            purpose=purpose or "output",
+            source=source or "output_file",
+        )
+        self._write_metadata_file(meta, tenant, target_dir=target_dir)
+        return meta
+
+    def list(self, user_id: str | None = None) -> List[Dict[str, Any]]:
+        tenant = self._tenant(user_id)
+        rows = self._conn.execute(
+            "SELECT file_id, storage_name, filename, mime_type, size_bytes, created_at, purpose, source "
+            "FROM output_files WHERE user_id = ? ORDER BY created_at DESC",
+            (tenant,),
+        ).fetchall()
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            stored_path = get_user_subpath(tenant, "api_server", "files", row["storage_name"])
+            if not stored_path.is_file():
+                continue
+            results.append(
+                self._build_meta(
+                    file_id=row["file_id"],
+                    tenant=tenant,
+                    storage_name=row["storage_name"],
+                    filename=row["filename"],
+                    mime_type=row["mime_type"],
+                    size_bytes=row["size_bytes"],
+                    created_at=row["created_at"],
+                    purpose=row["purpose"],
+                    source=row["source"],
+                )
+            )
+        return results
 
     def get(self, file_id: str, user_id: str | None = None) -> Optional[Dict[str, Any]]:
         tenant = self._tenant(user_id)
         row = self._conn.execute(
-            "SELECT storage_name, filename, mime_type, size_bytes, created_at "
+            "SELECT storage_name, filename, mime_type, size_bytes, created_at, purpose, source "
             "FROM output_files WHERE user_id = ? AND file_id = ?",
             (tenant, file_id),
         ).fetchone()
@@ -419,14 +590,17 @@ class OutputFileStore:
         stored_path = get_user_subpath(tenant, "api_server", "files", row["storage_name"])
         if not stored_path.is_file():
             return None
-        return {
-            "file_id": file_id,
-            "filename": row["filename"],
-            "mime_type": row["mime_type"],
-            "size_bytes": row["size_bytes"],
-            "created_at": int(row["created_at"]),
-            "path": str(stored_path),
-        }
+        return self._build_meta(
+            file_id=file_id,
+            tenant=tenant,
+            storage_name=row["storage_name"],
+            filename=row["filename"],
+            mime_type=row["mime_type"],
+            size_bytes=row["size_bytes"],
+            created_at=row["created_at"],
+            purpose=row["purpose"],
+            source=row["source"],
+        )
 
     def close(self) -> None:
         try:
@@ -1424,8 +1598,128 @@ class APIServerAdapter(BasePlatformAdapter):
             "deleted": True,
         })
 
-    async def _handle_get_file(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/files/{file_id} — download a tenant-scoped response artifact."""
+    def _serialize_file(self, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """Shape file metadata for API responses."""
+        return {
+            "id": meta["file_id"],
+            "object": "file",
+            "bytes": meta["size_bytes"],
+            "created_at": meta["created_at"],
+            "filename": meta["filename"],
+            "purpose": meta.get("purpose", "uploads"),
+            "mime_type": meta.get("mime_type"),
+            "source": meta.get("source"),
+            "download_url": f"/v1/files/{meta['file_id']}/content",
+        }
+
+    async def _handle_create_file(self, request: "web.Request") -> "web.Response":
+        """POST /v1/files — create a tenant-scoped file record and store content."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            tenant = self._extract_tenant(request)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
+        content_type = request.headers.get("Content-Type", "")
+        filename: str | None = None
+        purpose = "uploads"
+        mime_type: str | None = None
+        source_kind = "upload"
+        data: bytes | None = None
+
+        if content_type.startswith("application/json"):
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, Exception):
+                return web.json_response(
+                    _openai_error("Invalid JSON in request body", code="invalid_request_error"), status=400,
+                )
+            filename = body.get("filename")
+            purpose = body.get("purpose") or purpose
+            mime_type = body.get("mime_type")
+            source_kind = body.get("source") or source_kind
+            if "content_base64" in body:
+                try:
+                    data = base64.b64decode(body.get("content_base64") or "")
+                except Exception:
+                    return web.json_response(
+                        _openai_error("Invalid base64 content", code="invalid_request_error"), status=400,
+                    )
+            elif "content" in body:
+                data = str(body.get("content") or "").encode()
+            else:
+                data = None
+        else:
+            data = await request.read()
+            filename = request.query.get("filename") or request.headers.get("X-Filename")
+            purpose = request.query.get("purpose") or purpose
+            mime_type = request.headers.get("Content-Type")
+
+        if not data:
+            return web.json_response(
+                _openai_error("Missing file content", code="invalid_request_error"), status=400,
+            )
+        if not filename:
+            return web.json_response(
+                _openai_error("Missing filename", param="filename", code="invalid_request_error"), status=400,
+            )
+
+        try:
+            meta = self._output_file_store.store_bytes(
+                filename,
+                data,
+                user_id=tenant,
+                purpose=purpose,
+                mime_type=mime_type,
+                source=source_kind,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status = 413 if "exceeds" in message.lower() else 400
+            return web.json_response(_openai_error(message, code="invalid_request_error"), status=status)
+        except Exception as exc:
+            logger.error("Failed to store file: %s", exc, exc_info=True)
+            return web.json_response(_openai_error("Failed to store file", err_type="server_error"), status=500)
+
+        return web.json_response(self._serialize_file(meta), status=201)
+
+    async def _handle_list_files(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files — list files for the tenant."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            tenant = self._extract_tenant(request)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
+        files = self._output_file_store.list(user_id=tenant)
+        return web.json_response({"object": "list", "data": [self._serialize_file(f) for f in files]})
+
+    async def _handle_get_file_metadata(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files/{file_id} — retrieve file metadata for the tenant."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            tenant = self._extract_tenant(request)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
+        file_id = request.match_info["file_id"]
+        stored = self._output_file_store.get(file_id, user_id=tenant)
+        if stored is None:
+            return web.json_response(_openai_error(f"File not found: {file_id}", code="file_not_found"), status=404)
+
+        return web.json_response(self._serialize_file(stored))
+
+    async def _handle_get_file_content(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /v1/files/{file_id}/content — download file content for the tenant."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -1442,9 +1736,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.FileResponse(
             path=stored["path"],
-            headers={
-                "Content-Type": stored["mime_type"],
-            },
+            headers={"Content-Type": stored["mime_type"]},
         )
 
     # ------------------------------------------------------------------
@@ -1728,7 +2020,12 @@ class APIServerAdapter(BasePlatformAdapter):
             if expanded in seen_paths:
                 return
             try:
-                meta = self._output_file_store.put_from_path(candidate, user_id=user_id)
+                meta = self._output_file_store.put_from_path(
+                    candidate,
+                    user_id=user_id,
+                    purpose="output",
+                    source="assistant_output",
+                )
             except Exception as exc:
                 logger.warning("[api_server] failed to stage output artifact %s: %s", candidate, exc)
                 return
@@ -1739,7 +2036,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "filename": meta["filename"],
                 "mime_type": meta["mime_type"],
                 "size_bytes": meta["size_bytes"],
-                "download_url": f"/v1/files/{meta['file_id']}",
+                "download_url": f"/v1/files/{meta['file_id']}/content",
             })
 
         successful_spans: list[tuple[int, int]] = []
@@ -2188,7 +2485,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
-            self._app.router.add_get("/v1/files/{file_id}", self._handle_get_file)
+            self._app.router.add_post("/v1/files", self._handle_create_file)
+            self._app.router.add_get("/v1/files", self._handle_list_files)
+            self._app.router.add_get("/v1/files/{file_id}", self._handle_get_file_metadata)
+            self._app.router.add_get("/v1/files/{file_id}/content", self._handle_get_file_content)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)

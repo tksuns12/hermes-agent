@@ -560,14 +560,35 @@ class SessionStore:
         self._entries_by_tenant[tenant] = derived
         return derived
 
+    def _known_tenants_locked(self) -> list[str]:
+        """Return loaded or on-disk tenants visible from this sessions root."""
+        tenants = set(self._loaded_tenants)
+        tenants.add(DEFAULT_TENANT)
+
+        base = self.sessions_dir
+        parts = list(base.parts)
+        if "users" in parts:
+            users_root = Path(*parts[: parts.index("users") + 1])
+            if users_root.exists():
+                for child in users_root.iterdir():
+                    if child.is_dir():
+                        tenants.add(self._normalize_tenant(child.name))
+        elif base.exists():
+            for child in base.iterdir():
+                if child.is_dir():
+                    tenants.add(self._normalize_tenant(child.name))
+
+        return sorted(tenants)
+
     def _ensure_loaded(self, tenant: str = None) -> None:
         """Load sessions index for a tenant if not already loaded."""
         tenant = self._normalize_tenant(tenant)
         with self._lock:
             self._ensure_loaded_locked(tenant)
 
-    def _ensure_loaded_locked(self, tenant: str) -> None:
+    def _ensure_loaded_locked(self, tenant: str | None = None) -> None:
         """Load sessions index for a tenant. Must be called with self._lock held."""
+        tenant = self._normalize_tenant(tenant)
         if tenant in self._loaded_tenants:
             return
 
@@ -597,7 +618,7 @@ class SessionStore:
         if tenant == DEFAULT_TENANT:
             self._loaded = True
     
-    def _save(self, tenant: str) -> None:
+    def _save(self, tenant: str | None = None) -> None:
         """Save sessions index to disk (kept for session key -> ID mapping)."""
         import tempfile
 
@@ -849,11 +870,14 @@ class SessionStore:
         after a gateway restart (#7536).  Returns True if the session
         existed and was marked.
         """
+        tenant = self._session_key_to_tenant.get(session_key, DEFAULT_TENANT)
         with self._lock:
-            self._ensure_loaded_locked()
-            if session_key in self._entries:
-                self._entries[session_key].suspended = True
-                self._save()
+            self._ensure_loaded_locked(tenant)
+            entries = self._get_entries_for_tenant(tenant)
+            if session_key in entries:
+                entries[session_key].suspended = True
+                self._entries[session_key] = entries[session_key]
+                self._save(tenant)
                 return True
         return False
 
@@ -871,13 +895,17 @@ class SessionStore:
         cutoff = _now() - timedelta(seconds=max_age_seconds)
         count = 0
         with self._lock:
-            self._ensure_loaded_locked()
-            for entry in self._entries.values():
-                if not entry.suspended and entry.updated_at >= cutoff:
-                    entry.suspended = True
-                    count += 1
-            if count:
-                self._save()
+            for tenant in self._known_tenants_locked():
+                self._ensure_loaded_locked(tenant)
+                entries = self._get_entries_for_tenant(tenant)
+                tenant_dirty = False
+                for entry in entries.values():
+                    if not entry.suspended and entry.updated_at >= cutoff:
+                        entry.suspended = True
+                        count += 1
+                        tenant_dirty = True
+                if tenant_dirty:
+                    self._save(tenant)
         return count
 
     def reset_session(self, session_key: str) -> Optional[SessionEntry]:
