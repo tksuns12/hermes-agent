@@ -1941,12 +1941,27 @@ class TestOutputFiles:
             assert output[0]["type"] == "output_file"
             assert output[0]["filename"] == "report.txt"
             assert output[0]["download_url"] == f"/v1/files/{output[0]['file_id']}/content"
+            file_obj = output[0]["file"]
+            assert file_obj["id"] == output[0]["file_id"]
+            assert file_obj["object"] == "file"
+            assert file_obj["purpose"] == "output"
+            assert file_obj["source"] == "assistant_output"
+            assert file_obj["download_url"] == output[0]["download_url"]
             assert output[1]["type"] == "message"
             assert output[1]["content"][0]["text"] == "Here is the report."
 
             stored = adapter._response_store.get(data["id"], user_id="alice")
             history = stored["conversation_history"]
             assert history[-1]["content"] == "Here is the report."
+
+            meta_resp = await cli.get(
+                f"/v1/files/{output[0]['file_id']}",
+                headers={"X-Hermes-User-Id": "alice"},
+            )
+            assert meta_resp.status == 200
+            meta_body = await meta_resp.json()
+            assert meta_body["purpose"] == "output"
+            assert meta_body["source"] == "assistant_output"
 
             download = await cli.get(
                 output[0]["download_url"],

@@ -2379,13 +2379,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.warning("[api_server] failed to stage output artifact %s: %s", candidate, exc)
                 return
             seen_paths.add(expanded)
+            file_obj = self._serialize_file(meta)
             output_files.append({
                 "type": "output_file",
                 "file_id": meta["file_id"],
                 "filename": meta["filename"],
                 "mime_type": meta["mime_type"],
                 "size_bytes": meta["size_bytes"],
-                "download_url": f"/v1/files/{meta['file_id']}/content",
+                "download_url": file_obj["download_url"],
+                "file": file_obj,
             })
 
         successful_spans: list[tuple[int, int]] = []
