@@ -1870,6 +1870,150 @@ class TestResponsesFileSanitization:
             assert all(meta["path"] not in c for c in history_contents)
 
 
+class TestResponsesFileChaining:
+    @pytest.mark.asyncio
+    async def test_file_backed_previous_response_chains_with_sanitized_history(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/v1/files",
+                json={"filename": "chain.txt", "content": "chainable text", "purpose": "user_upload"},
+                headers={"X-Hermes-User-Id": "tenant-chain"},
+            )
+            assert create.status == 201
+            file_id = (await create.json())["id"]
+            meta = adapter._output_file_store.get(file_id, user_id="tenant-chain")
+
+            first_result = {"final_response": "stored", "messages": [], "api_calls": 1}
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (first_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp1 = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "tenant-chain"},
+                    json={
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "process file"},
+                                    {"type": "input_file", "file_id": file_id},
+                                ],
+                            }
+                        ]
+                    },
+                )
+
+            assert resp1.status == 200
+            user_msg = mock_run.call_args.kwargs["user_message"]
+            assert meta["path"] in user_msg
+            assert "chainable text" in user_msg
+            resp1_id = (await resp1.json())["id"]
+
+            follow_result = {"final_response": "follow up", "messages": [], "api_calls": 1}
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run2:
+                mock_run2.return_value = (follow_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp2 = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "tenant-chain"},
+                    json={"input": "next step", "previous_response_id": resp1_id},
+                )
+
+            assert resp2.status == 200
+            history = mock_run2.call_args.kwargs["conversation_history"]
+            history_text = "\n".join(msg.get("content", "") for msg in history if isinstance(msg, dict))
+            assert "chain.txt" in history_text
+            assert "chainable text" in history_text
+            assert meta["path"] not in history_text
+
+            fetched = await cli.get(
+                f"/v1/responses/{resp1_id}", headers={"X-Hermes-User-Id": "tenant-chain"}
+            )
+            assert fetched.status == 200
+            fetched_body = await fetched.json()
+            assert fetched_body["id"] == resp1_id
+
+    @pytest.mark.asyncio
+    async def test_file_backed_conversation_chains_and_updates_mapping(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/v1/files",
+                json={"filename": "thread.txt", "content": "thread text", "purpose": "user_upload"},
+                headers={"X-Hermes-User-Id": "tenant-conv"},
+            )
+            assert create.status == 201
+            file_id = (await create.json())["id"]
+            meta = adapter._output_file_store.get(file_id, user_id="tenant-conv")
+
+            first_result = {"final_response": "first", "messages": [], "api_calls": 1}
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (first_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp1 = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "tenant-conv"},
+                    json={
+                        "input": [
+                            {"role": "user", "content": [{"type": "input_file", "file_id": file_id}]}
+                        ],
+                        "conversation": "files-thread",
+                    },
+                )
+            assert resp1.status == 200
+            resp1_id = (await resp1.json())["id"]
+            assert adapter._response_store.get_conversation("files-thread", user_id="tenant-conv") == resp1_id
+
+            follow_result = {"final_response": "second", "messages": [], "api_calls": 1}
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run2:
+                mock_run2.return_value = (follow_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp2 = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "tenant-conv"},
+                    json={"input": "continue", "conversation": "files-thread"},
+                )
+
+            assert resp2.status == 200
+            resp2_id = (await resp2.json())["id"]
+            history = mock_run2.call_args.kwargs["conversation_history"]
+            assert len(history) > 0
+            history_text = "\n".join(msg.get("content", "") for msg in history if isinstance(msg, dict))
+            assert "thread.txt" in history_text
+            assert meta["path"] not in history_text
+            assert adapter._response_store.get_conversation("files-thread", user_id="tenant-conv") == resp2_id
+
+    @pytest.mark.asyncio
+    async def test_previous_response_with_file_is_tenant_scoped(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/v1/files",
+                json={"filename": "owned.txt", "content": "tenant only", "purpose": "user_upload"},
+                headers={"X-Hermes-User-Id": "owner"},
+            )
+            assert create.status == 201
+            file_id = (await create.json())["id"]
+
+            first_result = {"final_response": "owner", "messages": [], "api_calls": 1}
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (first_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp1 = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "owner"},
+                    json={"input": [{"role": "user", "content": [{"type": "input_file", "file_id": file_id}]}]},
+                )
+            assert resp1.status == 200
+            resp1_id = (await resp1.json())["id"]
+
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp2 = await cli.post(
+                    "/v1/responses",
+                    headers={"X-Hermes-User-Id": "intruder"},
+                    json={"input": "reuse", "previous_response_id": resp1_id},
+                )
+
+            assert resp2.status == 404
+            assert mock_run.await_count == 0
+
+
 # ---------------------------------------------------------------------------
 # Usage / token counting
 # ---------------------------------------------------------------------------
