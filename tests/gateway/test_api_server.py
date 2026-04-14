@@ -722,6 +722,93 @@ class TestChatCompletionsEndpoint:
             assert call_kwargs["conversation_history"][1] == {"role": "assistant", "content": "2"}
 
     @pytest.mark.asyncio
+    async def test_chat_normalizes_input_file_parts(self, adapter):
+        mock_result = {"final_response": "done", "messages": [], "api_calls": 1}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/v1/files",
+                json={"filename": "note.txt", "content": "hello file"},
+            )
+            assert create.status == 201
+            file_id = (await create.json())["id"]
+
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "Summarize the file"},
+                                    {"type": "input_file", "file_id": file_id},
+                                ],
+                            }
+                        ],
+                    },
+                )
+
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            user_message = call_kwargs["user_message"]
+            assert "Summarize the file" in user_message
+            assert "note.txt" in user_message
+            assert "hello file" in user_message
+
+    @pytest.mark.asyncio
+    async def test_chat_rejects_missing_input_file(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {"role": "user", "content": [{"type": "input_file", "file_id": "file_missing"}]}
+                        ],
+                    },
+                )
+
+            assert resp.status == 404
+            data = await resp.json()
+            assert data["error"]["code"] == "file_not_found"
+            assert mock_run.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_chat_rejects_foreign_tenant_input_file(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            owned = await cli.post(
+                "/v1/files",
+                json={"filename": "owner.txt", "content": "owned by alpha"},
+                headers={"X-Hermes-User-Id": "alpha"},
+            )
+            assert owned.status == 201
+            owned_id = (await owned.json())["id"]
+
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {"role": "user", "content": [{"type": "input_file", "file_id": owned_id}]}
+                        ],
+                    },
+                    headers={"X-Hermes-User-Id": "beta"},
+                )
+
+            assert resp.status == 404
+            body = await resp.json()
+            assert body["error"]["code"] == "file_not_found"
+            assert mock_run.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_agent_error_returns_500(self, adapter):
         """Agent exception returns 500."""
         app = _create_app(adapter)

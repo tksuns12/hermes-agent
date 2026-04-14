@@ -1060,20 +1060,36 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = body.get("stream", False)
 
+        try:
+            tenant = self._extract_tenant(request, body)
+        except _TenantValidationError as exc:
+            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
 
         for msg in messages:
             role = msg.get("role", "")
-            content = _normalize_chat_content(msg.get("content", ""))
+            raw_content = msg.get("content", "")
             if role == "system":
                 # Accumulate system messages
+                content = _normalize_chat_content(raw_content)
                 if system_prompt is None:
                     system_prompt = content
                 else:
                     system_prompt = system_prompt + "\n" + content
             elif role in ("user", "assistant"):
+                if role == "user" and isinstance(raw_content, list):
+                    try:
+                        content = await self._normalize_chat_user_content(raw_content, tenant)
+                    except _InputFileNormalizationError as exc:
+                        return web.json_response(
+                            _openai_error(exc.message, code=exc.code),
+                            status=exc.status,
+                        )
+                else:
+                    content = _normalize_chat_content(raw_content)
                 conversation_messages.append({"role": role, "content": content})
 
         # Extract the last user message as the primary input
@@ -1088,11 +1104,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
                 status=400,
             )
-
-        try:
-            tenant = self._extract_tenant(request, body)
-        except _TenantValidationError as exc:
-            return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -1568,6 +1579,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(combined_storage) > MAX_NORMALIZED_TEXT_LENGTH:
             combined_storage = combined_storage[:MAX_NORMALIZED_TEXT_LENGTH]
         return combined_agent, combined_storage
+
+    async def _normalize_chat_user_content(self, content: Any, tenant: str) -> str:
+        """Normalize chat user content, resolving retained file references."""
+        if isinstance(content, list):
+            agent_content, _ = await self._normalize_response_content_parts(content, tenant)
+            return agent_content
+        return _normalize_chat_content(content)
 
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
