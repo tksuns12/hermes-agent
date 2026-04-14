@@ -678,6 +678,16 @@ class _TenantValidationError(Exception):
     """Raised when an invalid tenant/user identifier is supplied."""
 
 
+class _InputFileNormalizationError(Exception):
+    """Raised when an input_file part cannot be resolved."""
+
+    def __init__(self, message: str, *, status: int = 400, code: str | None = None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.code = code or "invalid_request_error"
+
+
 class _UploadTooLarge(Exception):
     """Raised when an upload exceeds configured limits."""
 
@@ -1393,6 +1403,87 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    def _render_input_file(self, meta: Dict[str, Any]) -> str:
+        header = (
+            f"[input_file:{meta.get('filename', 'file')} ("
+            f"{meta.get('mime_type', 'unknown')}, {meta.get('size_bytes', 0)} bytes)]"
+        )
+        try:
+            data = Path(meta["path"]).read_bytes()
+        except Exception as exc:
+            logger.warning("[api_server] failed to read input_file %s: %s", meta.get("file_id"), exc)
+            return header
+
+        if not data:
+            return header
+
+        preview = ""
+        mime = (meta.get("mime_type") or "").lower()
+        suffix = Path(meta.get("filename", "")).suffix.lower()
+        text_like_suffixes = {".txt", ".md", ".markdown", ".rtf", ".json", ".csv", ".tsv", ".py", ".js", ".html", ".mdx"}
+        is_text_like = mime.startswith("text/") or mime in {"application/json"} or suffix in text_like_suffixes
+        if is_text_like:
+            try:
+                preview = data.decode("utf-8", errors="replace")
+            except Exception:
+                try:
+                    preview = data.decode(errors="replace")
+                except Exception:
+                    preview = ""
+
+        if preview:
+            preview = preview[:MAX_NORMALIZED_TEXT_LENGTH]
+            return f"{header}\n{preview}"
+        return header
+
+    def _normalize_response_content_parts(
+        self,
+        parts: list[Any],
+        tenant: str,
+        *,
+        _depth: int = 0,
+        _max_depth: int = 10,
+    ) -> str:
+        if _depth > _max_depth:
+            return ""
+        normalized_parts: list[str] = []
+        items = parts[:MAX_CONTENT_LIST_SIZE] if len(parts) > MAX_CONTENT_LIST_SIZE else parts
+        for part in items:
+            if isinstance(part, str):
+                if part:
+                    normalized_parts.append(part[:MAX_NORMALIZED_TEXT_LENGTH])
+                continue
+            if isinstance(part, dict):
+                part_type = str(part.get("type") or "").strip().lower()
+                if part_type in {"text", "input_text", "output_text"}:
+                    text_val = part.get("text", "")
+                    if text_val:
+                        normalized_parts.append(str(text_val)[:MAX_NORMALIZED_TEXT_LENGTH])
+                elif part_type == "input_file":
+                    file_id = str(part.get("file_id") or "").strip()
+                    if not file_id:
+                        raise _InputFileNormalizationError("Missing file_id for input_file part")
+                    meta = self._output_file_store.get(file_id, user_id=tenant)
+                    if meta is None:
+                        raise _InputFileNormalizationError(
+                            f"File not found: {file_id}",
+                            status=404,
+                            code="file_not_found",
+                        )
+                    normalized_parts.append(self._render_input_file(meta))
+                else:
+                    continue
+            elif isinstance(part, list):
+                nested = self._normalize_response_content_parts(part, tenant, _depth=_depth + 1, _max_depth=_max_depth)
+                if nested:
+                    normalized_parts.append(nested)
+            if sum(len(p) for p in normalized_parts) >= MAX_NORMALIZED_TEXT_LENGTH:
+                break
+        combined = "\n".join([p for p in normalized_parts if p])
+        if len(combined) > MAX_NORMALIZED_TEXT_LENGTH:
+            combined = combined[:MAX_NORMALIZED_TEXT_LENGTH]
+        return combined
+
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
         auth_err = self._check_auth(request)
@@ -1441,8 +1532,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     input_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
                     role = item.get("role", "user")
-                    content = _normalize_chat_content(item.get("content", ""))
+                    raw_content = item.get("content", "")
+                    if isinstance(raw_content, list):
+                        try:
+                            content = self._normalize_response_content_parts(raw_content, tenant)
+                        except _InputFileNormalizationError as exc:
+                            return web.json_response(
+                                _openai_error(exc.message, code=exc.code),
+                                status=exc.status,
+                            )
+                    else:
+                        content = _normalize_chat_content(raw_content)
                     input_messages.append({"role": role, "content": content})
+                else:
+                    return web.json_response(_openai_error("'input' array items must be strings or objects"), status=400)
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
 
