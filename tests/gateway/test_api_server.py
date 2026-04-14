@@ -809,6 +809,142 @@ class TestChatCompletionsEndpoint:
             assert mock_run.await_count == 0
 
     @pytest.mark.asyncio
+    async def test_chat_file_reference_reused_same_tenant_and_denied_cross_tenant(self, adapter):
+        """Same-tenant retained files are reusable; other tenants are denied."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            created = await cli.post(
+                "/v1/files",
+                json={"filename": "shared.txt", "content": "tenant secret"},
+                headers={"X-Hermes-User-Id": "owner"},
+            )
+            assert created.status == 201
+            file_id = (await created.json())["id"]
+
+            mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+            usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, usage)
+
+                resp1 = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-User-Id": "owner"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "first turn"},
+                                    {"type": "input_file", "file_id": file_id},
+                                ],
+                            }
+                        ],
+                    },
+                )
+
+                resp2 = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-User-Id": "owner"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "second turn"},
+                                    {"type": "input_file", "file_id": file_id},
+                                ],
+                            }
+                        ],
+                    },
+                )
+
+                resp_intruder = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-User-Id": "intruder"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {"role": "user", "content": [{"type": "input_file", "file_id": file_id}]}
+                        ],
+                    },
+                )
+
+            assert resp1.status == 200
+            assert resp2.status == 200
+            assert resp_intruder.status == 404
+            intruder_body = await resp_intruder.json()
+            assert intruder_body["error"]["code"] == "file_not_found"
+
+            assert mock_run.await_count == 2
+            first_msg = mock_run.await_args_list[0].kwargs["user_message"]
+            second_msg = mock_run.await_args_list[1].kwargs["user_message"]
+            for user_msg in (first_msg, second_msg):
+                assert "shared.txt" in user_msg
+                assert "tenant secret" in user_msg
+
+    @pytest.mark.asyncio
+    async def test_chat_file_reference_rejected_for_default_tenant(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            owned = await cli.post(
+                "/v1/files",
+                json={"filename": "owned.txt", "content": "owned by alpha"},
+                headers={"X-Hermes-User-Id": "alpha"},
+            )
+            assert owned.status == 201
+            owned_id = (await owned.json())["id"]
+
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {"role": "user", "content": [{"type": "input_file", "file_id": owned_id}]}
+                        ],
+                    },
+                )
+
+            assert resp.status == 404
+            body = await resp.json()
+            assert body["error"]["code"] == "file_not_found"
+            assert mock_run.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_chat_content_array_without_files_behaves_like_text(self, adapter):
+        mock_result = {"final_response": "done", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, usage)
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "Hello"},
+                                    {"type": "text", "text": "world"},
+                                ],
+                            }
+                        ],
+                    },
+                )
+
+        assert resp.status == 200
+        user_message = mock_run.call_args.kwargs["user_message"]
+        assert "Hello" in user_message
+        assert "world" in user_message
+        assert mock_run.call_args.kwargs["conversation_history"] == []
+
+    @pytest.mark.asyncio
     async def test_agent_error_returns_500(self, adapter):
         """Agent exception returns 500."""
         app = _create_app(adapter)
