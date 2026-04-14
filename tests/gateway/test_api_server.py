@@ -1462,6 +1462,40 @@ class TestFilesTenantRoutes:
             )
             assert content_other.status == 404
 
+    @pytest.mark.asyncio
+    async def test_default_tenant_isolated_from_named_tenant_files(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/v1/files",
+                json={"filename": "owner.txt", "content": "owned by alpha", "purpose": "user_upload"},
+                headers={"X-Hermes-User-Id": "alpha"},
+            )
+            assert create.status == 201
+            file_id = (await create.json())["id"]
+
+            default_listing = await cli.get("/v1/files")
+            assert default_listing.status == 200
+            default_body = await default_listing.json()
+            assert all(item["id"] != file_id for item in default_body["data"])
+
+            default_meta = await cli.get(f"/v1/files/{file_id}")
+            assert default_meta.status == 404
+            default_meta_body = await default_meta.json()
+            assert default_meta_body["error"]["code"] == "file_not_found"
+
+            default_content = await cli.get(f"/v1/files/{file_id}/content")
+            assert default_content.status == 404
+            default_content_body = await default_content.json()
+            assert default_content_body["error"]["code"] == "file_not_found"
+
+            owner_content = await cli.get(
+                f"/v1/files/{file_id}/content",
+                headers={"X-Hermes-User-Id": "alpha"},
+            )
+            assert owner_content.status == 200
+            assert await owner_content.text() == "owned by alpha"
+
 
 class TestMultipartUploads:
     @pytest.mark.asyncio
