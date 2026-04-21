@@ -12,6 +12,7 @@ Tests cover:
 - Error handling (invalid JSON, missing fields)
 """
 
+import asyncio
 import base64
 import json
 import time
@@ -3088,8 +3089,177 @@ class TestRunsEndpoint:
                     json={"input": "follow up", "previous_response_id": "resp_alice"},
                 )
                 assert missing.status == 202
+                for _ in range(20):
+                    if fake_agent.run_conversation.call_args is not None:
+                        break
+                    await asyncio.sleep(0.01)
                 assert fake_agent.run_conversation.call_args.kwargs["conversation_history"] == []
                 assert mock_create_agent.call_args.kwargs["user_id"] == "bob"
+
+    @pytest.mark.asyncio
+    async def test_runs_normalize_same_tenant_input_file_parts(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            created = await cli.post(
+                "/v1/files",
+                headers={"X-Hermes-User-Id": "owner"},
+                json={"filename": "report.txt", "content": "tenant scoped file"},
+            )
+            assert created.status == 201
+            file_id = (await created.json())["id"]
+
+            with patch.object(adapter, "_create_agent") as mock_create_agent:
+                fake_agent = MagicMock()
+                fake_agent.run_conversation.return_value = {"final_response": "done"}
+                fake_agent.session_prompt_tokens = 0
+                fake_agent.session_completion_tokens = 0
+                fake_agent.session_total_tokens = 0
+                mock_create_agent.return_value = fake_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    headers={"X-Hermes-User-Id": "owner"},
+                    json={
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": "summarize this"},
+                                    {"type": "input_file", "file_id": file_id},
+                                ],
+                            }
+                        ]
+                    },
+                )
+                assert resp.status == 202
+
+                for _ in range(20):
+                    if fake_agent.run_conversation.call_args is not None:
+                        break
+                    await asyncio.sleep(0.01)
+
+                call_kwargs = fake_agent.run_conversation.call_args.kwargs
+                assert "summarize this" in call_kwargs["user_message"]
+                assert "report.txt" in call_kwargs["user_message"]
+                assert "tenant scoped file" in call_kwargs["user_message"]
+                assert mock_create_agent.call_args.kwargs["user_id"] == "owner"
+
+    @pytest.mark.asyncio
+    async def test_runs_reject_missing_or_foreign_input_file(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            created = await cli.post(
+                "/v1/files",
+                headers={"X-Hermes-User-Id": "owner"},
+                json={"filename": "owner.txt", "content": "owned content"},
+            )
+            assert created.status == 201
+            file_id = (await created.json())["id"]
+
+            with patch.object(adapter, "_create_agent") as mock_create_agent:
+                missing = await cli.post(
+                    "/v1/runs",
+                    headers={"X-Hermes-User-Id": "owner"},
+                    json={"input": [{"role": "user", "content": [{"type": "input_file", "file_id": "file_missing"}]}]},
+                )
+                assert missing.status == 404
+                missing_body = await missing.json()
+                assert missing_body["error"]["code"] == "file_not_found"
+
+                foreign = await cli.post(
+                    "/v1/runs",
+                    headers={"X-Hermes-User-Id": "intruder"},
+                    json={"input": [{"role": "user", "content": [{"type": "input_file", "file_id": file_id}]}]},
+                )
+                assert foreign.status == 404
+                foreign_body = await foreign.json()
+                assert foreign_body["error"]["code"] == "file_not_found"
+
+                missing_file_id = await cli.post(
+                    "/v1/runs",
+                    headers={"X-Hermes-User-Id": "owner"},
+                    json={"input": [{"role": "user", "content": [{"type": "input_file"}]}]},
+                )
+                assert missing_file_id.status == 400
+                missing_file_id_body = await missing_file_id.json()
+                assert "Missing file_id" in missing_file_id_body["error"]["message"]
+
+                assert mock_create_agent.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_runs_with_session_id_replays_tenant_scoped_sanitized_history(self, adapter):
+        raw_history = [
+            {
+                "role": "user",
+                "content": (
+                    "[input_file:report.txt (text/plain, 11 bytes)]\n"
+                    "[local_path:/home/owner/.hermes/profiles/dev/files/report.txt]\n"
+                    "hello world"
+                ),
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+        sanitized = adapter._sanitize_history_local_paths(raw_history)
+
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = raw_history
+        adapter._session_db = mock_db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create_agent:
+                fake_agent = MagicMock()
+                fake_agent.run_conversation.return_value = {"final_response": "done"}
+                fake_agent.session_prompt_tokens = 0
+                fake_agent.session_completion_tokens = 0
+                fake_agent.session_total_tokens = 0
+                mock_create_agent.return_value = fake_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    headers={"X-Hermes-User-Id": "owner"},
+                    json={"input": "continue", "session_id": "session-files"},
+                )
+                assert resp.status == 202
+
+                for _ in range(20):
+                    if fake_agent.run_conversation.call_args is not None:
+                        break
+                    await asyncio.sleep(0.01)
+
+                call_kwargs = fake_agent.run_conversation.call_args.kwargs
+                assert mock_create_agent.call_args.kwargs["session_id"] == "session-files"
+                assert call_kwargs["conversation_history"] == sanitized
+                history_text = "\n".join(str(msg.get("content", "")) for msg in call_kwargs["conversation_history"])
+                assert "report.txt" in history_text
+                assert "hello world" in history_text
+                assert "[local_path:" not in history_text
+                assert ".hermes" not in history_text
+
+                assert mock_db.get_messages_as_conversation.call_args.kwargs["user_id"] == "owner"
+
+    @pytest.mark.asyncio
+    async def test_runs_rejects_malformed_stored_session_history(self, adapter):
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "assistant", "content": "ok"},
+            {"role": "user"},
+        ]
+        adapter._session_db = mock_db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create_agent:
+                resp = await cli.post(
+                    "/v1/runs",
+                    headers={"X-Hermes-User-Id": "owner"},
+                    json={"input": "continue", "session_id": "session-bad"},
+                )
+
+                assert resp.status == 400
+                body = await resp.json()
+                assert body["error"]["code"] == "invalid_session_history"
+                assert mock_create_agent.call_count == 0
 
 
 # ---------------------------------------------------------------------------

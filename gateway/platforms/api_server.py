@@ -3478,14 +3478,208 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(str(exc), param="user", code="invalid_user"), status=400)
 
         raw_input = body.get("input")
-        if not raw_input:
+        if raw_input is None:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
+        file_counter = [0]
+        input_messages: List[Dict[str, Any]] = []
+        if isinstance(raw_input, str):
+            input_messages = [{"role": "user", "content": raw_input}]
+        elif isinstance(raw_input, list):
+            if not raw_input:
+                return web.json_response(_openai_error("No user message found in input"), status=400)
+            for idx, item in enumerate(raw_input):
+                if isinstance(item, str):
+                    input_messages.append({"role": "user", "content": item})
+                    continue
+                if not isinstance(item, dict):
+                    return web.json_response(
+                        _openai_error("'input' array items must be strings or objects"),
+                        status=400,
+                    )
+
+                role = str(item.get("role") or "user")
+                raw_content = item.get("content", "")
+                if isinstance(raw_content, list):
+                    try:
+                        has_file_parts = any(
+                            isinstance(part, dict)
+                            and str(part.get("type") or "").strip().lower() in _FILE_PART_TYPES
+                            for part in raw_content
+                        )
+                        if has_file_parts:
+                            normalized_content, _ = await self._normalize_response_content_parts(
+                                raw_content,
+                                tenant,
+                                _file_counter=file_counter,
+                            )
+                        else:
+                            normalized_content = _normalize_multimodal_content(raw_content)
+                    except _InputFileNormalizationError as exc:
+                        return web.json_response(
+                            _openai_error(exc.message, code=exc.code),
+                            status=exc.status,
+                        )
+                    except ValueError as exc:
+                        return _multimodal_validation_error(exc, param=f"input[{idx}].content")
+                else:
+                    try:
+                        normalized_content = _normalize_multimodal_content(raw_content)
+                    except ValueError as exc:
+                        return _multimodal_validation_error(exc, param=f"input[{idx}].content")
+
+                input_messages.append({"role": role, "content": normalized_content})
+        else:
+            return web.json_response(_openai_error("'input' must be a string or array"), status=400)
+
+        user_message = input_messages[-1].get("content", "") if input_messages else ""
+        if not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
+        previous_response_id = body.get("previous_response_id")
+        instructions = body.get("instructions")
+
+        # Accept explicit conversation_history from the request body.
+        # Precedence: explicit conversation_history > previous_response_id > session_id replay.
+        conversation_history: List[Dict[str, Any]] = []
+        history_supplied = "conversation_history" in body
+        raw_history = body.get("conversation_history")
+        if history_supplied:
+            if not isinstance(raw_history, list):
+                return web.json_response(
+                    _openai_error("'conversation_history' must be an array of message objects"),
+                    status=400,
+                )
+            for i, entry in enumerate(raw_history):
+                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+                    return web.json_response(
+                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
+                        status=400,
+                    )
+                entry_content = entry.get("content")
+                if isinstance(entry_content, list):
+                    try:
+                        has_file_parts = any(
+                            isinstance(part, dict)
+                            and str(part.get("type") or "").strip().lower() in _FILE_PART_TYPES
+                            for part in entry_content
+                        )
+                        if has_file_parts:
+                            normalized_history_content, _ = await self._normalize_response_content_parts(
+                                entry_content,
+                                tenant,
+                                _file_counter=file_counter,
+                            )
+                        else:
+                            normalized_history_content = _normalize_multimodal_content(entry_content)
+                    except _InputFileNormalizationError as exc:
+                        return web.json_response(
+                            _openai_error(exc.message, code=exc.code),
+                            status=exc.status,
+                        )
+                    except ValueError as exc:
+                        return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
+                else:
+                    try:
+                        normalized_history_content = _normalize_multimodal_content(entry_content)
+                    except ValueError as exc:
+                        return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
+                conversation_history.append({"role": str(entry["role"]), "content": normalized_history_content})
+            if previous_response_id:
+                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
+
+        stored_session_id = None
+        if not conversation_history and previous_response_id:
+            stored = self._response_store.get(previous_response_id, user_id=tenant)
+            if stored:
+                raw_stored_history = stored.get("conversation_history", [])
+                if not isinstance(raw_stored_history, list):
+                    return web.json_response(
+                        _openai_error("Stored conversation history is malformed", code="invalid_session_history"),
+                        status=400,
+                    )
+                for i, entry in enumerate(raw_stored_history):
+                    if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+                        return web.json_response(
+                            _openai_error(
+                                f"Stored conversation history is malformed at index {i}",
+                                code="invalid_session_history",
+                            ),
+                            status=400,
+                        )
+                conversation_history = self._sanitize_history_local_paths(list(raw_stored_history))
+                stored_session_id = stored.get("session_id")
+                if instructions is None:
+                    instructions = stored.get("instructions")
+
+        session_id_value = body.get("session_id")
+        session_id: Optional[str] = None
+        if session_id_value is not None:
+            if isinstance(session_id_value, (int, float)) and not isinstance(session_id_value, bool):
+                session_id_value = str(session_id_value)
+            if not isinstance(session_id_value, str) or not session_id_value.strip():
+                return web.json_response(
+                    _openai_error("Invalid session_id: must be a non-empty string.", code="invalid_session_id"),
+                    status=400,
+                )
+            if re.search(r"[\r\n\x00]", session_id_value):
+                return web.json_response(
+                    _openai_error("Invalid session_id", code="invalid_session_id"),
+                    status=400,
+                )
+            session_id = session_id_value.strip()
+
+        # When continuing a known session without explicit history, replay tenant-scoped
+        # SessionDB history server-side so browser clients don't need to send it back.
+        if session_id and not history_supplied and not conversation_history:
+            db = self._ensure_session_db()
+            if db is None:
+                return web.json_response(
+                    _openai_error(
+                        "Session history is unavailable for this request.",
+                        err_type="server_error",
+                        code="session_history_unavailable",
+                    ),
+                    status=503,
+                )
+            try:
+                db_history = db.get_messages_as_conversation(session_id, user_id=tenant)
+            except Exception as exc:
+                logger.warning("Failed to load run session history for %s: %s", session_id, exc)
+                return web.json_response(
+                    _openai_error(
+                        "Failed to load session history.",
+                        err_type="server_error",
+                        code="session_history_unavailable",
+                    ),
+                    status=500,
+                )
+            if db_history is None:
+                db_history = []
+            if not isinstance(db_history, list):
+                return web.json_response(
+                    _openai_error("Stored conversation history is malformed", code="invalid_session_history"),
+                    status=400,
+                )
+            for i, entry in enumerate(db_history):
+                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+                    return web.json_response(
+                        _openai_error(
+                            f"Stored conversation history is malformed at index {i}",
+                            code="invalid_session_history",
+                        ),
+                        status=400,
+                    )
+            conversation_history = self._sanitize_history_local_paths(db_history)
+
+        # Include all prior input items as immediate history context, preserving order.
+        for msg in input_messages[:-1]:
+            conversation_history.append(msg)
+
         run_id = f"run_{uuid.uuid4().hex}"
+        session_id = session_id or stored_session_id or run_id
+        ephemeral_system_prompt = instructions
+
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         self._run_streams[run_id] = q
@@ -3507,56 +3701,6 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        instructions = body.get("instructions")
-        previous_response_id = body.get("previous_response_id")
-
-        # Accept explicit conversation_history from the request body.
-        # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
-        raw_history = body.get("conversation_history")
-        if raw_history:
-            if not isinstance(raw_history, list):
-                return web.json_response(
-                    _openai_error("'conversation_history' must be an array of message objects"),
-                    status=400,
-                )
-            for i, entry in enumerate(raw_history):
-                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
-                    return web.json_response(
-                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
-                        status=400,
-                    )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
-            if previous_response_id:
-                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
-
-        stored_session_id = None
-        if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id, user_id=tenant)
-            if stored:
-                conversation_history = list(stored.get("conversation_history", []))
-                stored_session_id = stored.get("session_id")
-                if instructions is None:
-                    instructions = stored.get("instructions")
-
-        # When input is a multi-message array, extract all but the last
-        # message as conversation history (the last becomes user_message).
-        # Only fires when no explicit history was provided.
-        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
-            for msg in raw_input[:-1]:
-                if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                    content = msg["content"]
-                    if isinstance(content, list):
-                        # Flatten multi-part content blocks to text
-                        content = " ".join(
-                            part.get("text", "") for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
-                        )
-                    conversation_history.append({"role": msg["role"], "content": str(content)})
-
-        session_id = body.get("session_id") or stored_session_id or run_id
-        ephemeral_system_prompt = instructions
-
         async def _run_and_close():
             try:
                 agent = self._create_agent(
@@ -3566,6 +3710,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=event_cb,
                     user_id=tenant,
                 )
+
                 def _run_sync():
                     r = agent.run_conversation(
                         user_message=user_message,
