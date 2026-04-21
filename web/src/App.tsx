@@ -232,6 +232,7 @@ export default function App() {
       <main className="relative z-2 mx-auto w-full max-w-[1600px] flex-1 px-3 sm:px-6 pt-16 sm:pt-20 pb-4 sm:pb-8">
         <Routes>
           <Route path="/" element={<WorkbenchPage />} />
+          <Route path="/workbench" element={<Navigate to="/" replace />} />
           <Route path="/status" element={<StatusPage />} />
           <Route path="/sessions" element={<SessionsPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />

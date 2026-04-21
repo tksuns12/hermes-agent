@@ -542,6 +542,33 @@ class TestWebServerEndpoints:
         assert "run.completed" in resp.text
         assert resp.headers.get("X-Workbench-Request-Id")
 
+    def test_workbench_unknown_api_route_fails_closed_with_correlation(self, caplog):
+        caplog.clear()
+
+        resp = self.client.get("/api/workbench/not-a-real-route")
+
+        assert resp.status_code == 404
+        assert resp.headers.get("content-type", "").startswith("application/json")
+        request_id = resp.headers.get("X-Workbench-Request-Id")
+        assert request_id
+
+        detail = resp.json()["detail"]
+        assert detail["code"] == "workbench_route_not_found"
+        assert detail["request_id"] == request_id
+        assert detail["path"] == "/api/workbench/not-a-real-route"
+
+        assert any(
+            "workbench/proxy_unknown_route" in record.getMessage()
+            and request_id in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_workbench_unknown_api_route_never_serves_spa_html(self):
+        resp = self.client.get("/api/workbench/not-a-real-route")
+
+        assert resp.status_code == 404
+        assert "<!doctype html>" not in resp.text.lower()
+
     def test_path_traversal_blocked(self):
         """Verify URL-encoded path traversal is blocked."""
         # %2e%2e = ..

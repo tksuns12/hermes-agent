@@ -2760,6 +2760,40 @@ def mount_spa(application: FastAPI):
 
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str):
+        api_path = full_path == "api" or full_path.startswith("api/")
+        if api_path:
+            request_path = f"/{full_path}"
+            if full_path == "api/workbench" or full_path.startswith("api/workbench/"):
+                request_id = _new_workbench_request_id()
+                _log.warning(
+                    "workbench/proxy_unknown_route request_id=%s path=%s",
+                    request_id,
+                    request_path,
+                )
+                return JSONResponse(
+                    status_code=404,
+                    headers={"X-Workbench-Request-Id": request_id},
+                    content={
+                        "detail": {
+                            "code": "workbench_route_not_found",
+                            "message": "Unknown workbench API route.",
+                            "path": request_path,
+                            "request_id": request_id,
+                        }
+                    },
+                )
+
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": {
+                        "code": "api_route_not_found",
+                        "message": "Unknown API route.",
+                        "path": request_path,
+                    }
+                },
+            )
+
         file_path = WEB_DIST / full_path
         # Prevent path traversal via url-encoded sequences (%2e%2e/)
         if (
