@@ -21,8 +21,10 @@ import secrets
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -53,7 +55,7 @@ from hermes_constants import DEFAULT_TENANT, normalize_tenant
 try:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -462,6 +464,196 @@ def _resolve_browser_tenant(request: Request) -> Dict[str, Any]:
     }
 
 
+def _apply_browser_identity_cookie(response: JSONResponse | StreamingResponse, request: Request, resolved: Dict[str, Any]) -> None:
+    """Persist or clear the browser identity cookie on any workbench response."""
+    secure_cookie = (
+        request.url.scheme == "https"
+        or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+    )
+    if resolved.get("set_cookie_value"):
+        response.set_cookie(
+            key=_BROWSER_TENANT_COOKIE_NAME,
+            value=resolved["set_cookie_value"],
+            max_age=_BROWSER_TENANT_COOKIE_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            secure=secure_cookie,
+            path="/",
+        )
+    elif resolved.get("clear_cookie"):
+        response.delete_cookie(key=_BROWSER_TENANT_COOKIE_NAME, path="/")
+
+
+class _WorkbenchUpstreamHTTPError(Exception):
+    """Normalized upstream HTTP error envelope for workbench proxy routes."""
+
+    def __init__(self, status_code: int, body: bytes, headers: Dict[str, str]):
+        super().__init__(f"upstream status={status_code}")
+        self.status_code = status_code
+        self.body = body
+        self.headers = headers
+
+
+_WORKBENCH_PROXY_TIMEOUT = float(os.getenv("HERMES_WORKBENCH_PROXY_TIMEOUT", "30"))
+_WORKBENCH_UPSTREAM_URL = os.getenv("HERMES_WORKBENCH_UPSTREAM_URL", "")
+_WORKBENCH_UPSTREAM_KEY = os.getenv("HERMES_WORKBENCH_UPSTREAM_KEY", "")
+
+
+def _new_workbench_request_id() -> str:
+    return f"wb_{uuid.uuid4().hex[:12]}"
+
+
+def _normalize_gateway_base_url(raw_url: str | None) -> str:
+    """Normalize a gateway/base URL so callers can append known route paths."""
+    base = (raw_url or "").strip().rstrip("/")
+    for suffix in ("/health/detailed", "/health", "/v1"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base
+
+
+def _resolve_workbench_upstream() -> tuple[str, str]:
+    """Resolve upstream API server base URL + key for same-origin proxying."""
+    api_key = (_WORKBENCH_UPSTREAM_KEY or "").strip()
+    if not api_key:
+        api_key = os.getenv("API_SERVER_KEY", "").strip() or os.getenv("GATEWAY_PROXY_KEY", "").strip()
+
+    if _WORKBENCH_UPSTREAM_URL:
+        return _normalize_gateway_base_url(_WORKBENCH_UPSTREAM_URL), api_key
+
+    if _GATEWAY_HEALTH_URL:
+        return _normalize_gateway_base_url(_GATEWAY_HEALTH_URL), api_key
+
+    host = os.getenv("API_SERVER_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = os.getenv("API_SERVER_PORT", "8642").strip() or "8642"
+
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        gateway_config = load_gateway_config()
+        api_platform = gateway_config.platforms.get(Platform.API_SERVER)
+        if api_platform and isinstance(api_platform.extra, dict):
+            host = str(api_platform.extra.get("host", host) or host)
+            port = str(api_platform.extra.get("port", port) or port)
+            if not api_key:
+                api_key = str(api_platform.extra.get("key", "") or "")
+    except Exception:
+        pass
+
+    if host in {"0.0.0.0", "::", "[::]"}:
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+
+    return f"http://{host}:{port}", api_key
+
+
+def _decode_upstream_json(body: bytes) -> Dict[str, Any]:
+    if not body:
+        return {}
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+        return decoded if isinstance(decoded, dict) else {}
+    except Exception:
+        return {}
+
+
+def _extract_upstream_detail(payload: Dict[str, Any], fallback: str) -> str:
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("detail")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    detail = payload.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()
+    return fallback
+
+
+def _strip_browser_user_fields(payload: Dict[str, Any]) -> tuple[Dict[str, Any], list[str]]:
+    """Drop browser-controlled tenant fields from outbound upstream payloads."""
+    cleaned: Dict[str, Any] = {}
+    ignored_sources: list[str] = []
+    for key, value in payload.items():
+        if key in {"user", "user_id"}:
+            has_value = not (value is None or (isinstance(value, str) and not value.strip()))
+            if has_value:
+                ignored_sources.append(f"body.{key}")
+            continue
+        cleaned[key] = value
+    return cleaned, ignored_sources
+
+
+def _upstream_request_json(
+    method: str,
+    path: str,
+    request_id: str,
+    payload: Dict[str, Any] | None = None,
+) -> tuple[int, Dict[str, Any], Dict[str, str], str]:
+    """Execute a blocking JSON upstream request and return status/body/headers/url."""
+    base_url, api_key = _resolve_workbench_upstream()
+    url = f"{base_url.rstrip('/')}{path}"
+    headers: Dict[str, str] = {
+        "Accept": "application/json",
+        "X-Hermes-Workbench-Request-Id": request_id,
+    }
+    data: bytes | None = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=_WORKBENCH_PROXY_TIMEOUT) as resp:
+            body = resp.read()
+            return resp.status, _decode_upstream_json(body), dict(resp.headers.items()), url
+    except urllib.error.HTTPError as exc:
+        body = exc.read() if hasattr(exc, "read") else b""
+        raise _WorkbenchUpstreamHTTPError(exc.code, body, dict((exc.headers or {}).items())) from exc
+
+
+def _translate_upstream_error(
+    exc: _WorkbenchUpstreamHTTPError,
+    *,
+    request_id: str,
+    phase: str,
+    tenant_id: str,
+) -> HTTPException:
+    """Translate upstream errors into stable, browser-safe API errors."""
+    payload = _decode_upstream_json(exc.body)
+    detail = _extract_upstream_detail(payload, f"Workbench upstream request failed ({exc.status_code}).")
+
+    if exc.status_code in {400, 401, 403, 404, 409, 422, 429}:
+        status_code = exc.status_code
+        error_code = "proxy_upstream_rejected"
+    else:
+        status_code = 502
+        error_code = "proxy_upstream_error"
+
+    _log.warning(
+        "workbench/proxy_error request_id=%s phase=%s tenant=%s upstream_status=%s detail=%s",
+        request_id,
+        phase,
+        tenant_id,
+        exc.status_code,
+        detail,
+    )
+
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": error_code,
+            "message": detail,
+            "request_id": request_id,
+            "phase": phase,
+            "upstream_status": exc.status_code,
+        },
+    )
+
+
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
 _GATEWAY_HEALTH_TIMEOUT = float(os.getenv("GATEWAY_HEALTH_TIMEOUT", "3"))
 
@@ -483,12 +675,8 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
         return False, None
 
     # Normalise to base URL so we always probe the right paths regardless of
-    # whether the user included /health or /health/detailed in the env var.
-    base = _GATEWAY_HEALTH_URL.rstrip("/")
-    if base.endswith("/health/detailed"):
-        base = base[: -len("/health/detailed")]
-    elif base.endswith("/health"):
-        base = base[: -len("/health")]
+    # whether the user included /health, /health/detailed, or /v1.
+    base = _normalize_gateway_base_url(_GATEWAY_HEALTH_URL)
 
     for path in (f"{base}/health/detailed", f"{base}/health"):
         try:
@@ -612,6 +800,7 @@ async def get_status():
 @app.get("/api/workbench/context")
 async def get_workbench_bootstrap(request: Request):
     """Resolve browser tenant context for the workbench shell."""
+    request_id = _new_workbench_request_id()
     resolved = _resolve_browser_tenant(request)
 
     payload = {
@@ -627,29 +816,368 @@ async def get_workbench_bootstrap(request: Request):
             "context_version": 1,
             "tenant_id": resolved["tenant_id"],
             "tenant_label": resolved["tenant_label"],
+            "request_id": request_id,
             "ignored_browser_user_id": bool(resolved["ignored_browser_user_id_sources"]),
             "ignored_browser_user_id_sources": resolved["ignored_browser_user_id_sources"],
         },
     }
 
-    response = JSONResponse(payload)
-    secure_cookie = (
-        request.url.scheme == "https"
-        or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
-    )
-    if resolved["set_cookie_value"]:
-        response.set_cookie(
-            key=_BROWSER_TENANT_COOKIE_NAME,
-            value=resolved["set_cookie_value"],
-            max_age=_BROWSER_TENANT_COOKIE_TTL_SECONDS,
-            httponly=True,
-            samesite="lax",
-            secure=secure_cookie,
-            path="/",
-        )
-    elif resolved["clear_cookie"]:
-        response.delete_cookie(key=_BROWSER_TENANT_COOKIE_NAME, path="/")
+    response = JSONResponse(payload, headers={"X-Workbench-Request-Id": request_id})
+    _apply_browser_identity_cookie(response, request, resolved)
+    return response
 
+
+@app.get("/api/workbench/sessions")
+async def get_workbench_sessions(request: Request, limit: int = 20, offset: int = 0):
+    """Tenant-scoped workbench session list (same-origin browser contract)."""
+    request_id = _new_workbench_request_id()
+    resolved = _resolve_browser_tenant(request)
+    tenant_id = resolved["tenant_id"]
+
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            sessions = db.list_sessions_rich(limit=limit, offset=offset, user_id=tenant_id)
+            total = db.session_count(user_id=tenant_id)
+            now = time.time()
+            for session in sessions:
+                session["is_active"] = (
+                    session.get("ended_at") is None
+                    and (now - session.get("last_active", session.get("started_at", 0))) < 300
+                )
+
+            _log.info(
+                "workbench/proxy_sessions_list request_id=%s tenant=%s count=%s total=%s",
+                request_id,
+                tenant_id,
+                len(sessions),
+                total,
+            )
+
+            response = JSONResponse(
+                {
+                    "sessions": sessions,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                },
+                headers={"X-Workbench-Request-Id": request_id},
+            )
+            _apply_browser_identity_cookie(response, request, resolved)
+            return response
+        finally:
+            db.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("workbench/proxy_sessions_list_failed request_id=%s tenant=%s", request_id, tenant_id)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "workbench_sessions_failed",
+                "message": "Failed to load workbench sessions.",
+                "request_id": request_id,
+            },
+        )
+
+
+@app.get("/api/workbench/sessions/{session_id}")
+async def get_workbench_session_detail(request: Request, session_id: str):
+    """Tenant-scoped session detail for workbench session rail/transcript."""
+    request_id = _new_workbench_request_id()
+    resolved = _resolve_browser_tenant(request)
+    tenant_id = resolved["tenant_id"]
+
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            resolved_session_id = db.resolve_session_id(session_id, user_id=tenant_id)
+            session = db.get_session(resolved_session_id, user_id=tenant_id) if resolved_session_id else None
+            if not session:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "workbench_session_not_found",
+                        "message": "Session not found for this tenant.",
+                        "request_id": request_id,
+                    },
+                )
+
+            _log.info(
+                "workbench/proxy_session_detail request_id=%s tenant=%s session_id=%s",
+                request_id,
+                tenant_id,
+                session.get("id"),
+            )
+
+            response = JSONResponse(session, headers={"X-Workbench-Request-Id": request_id})
+            _apply_browser_identity_cookie(response, request, resolved)
+            return response
+        finally:
+            db.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("workbench/proxy_session_detail_failed request_id=%s tenant=%s", request_id, tenant_id)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "workbench_session_detail_failed",
+                "message": "Failed to load workbench session detail.",
+                "request_id": request_id,
+            },
+        )
+
+
+@app.get("/api/workbench/sessions/{session_id}/messages")
+async def get_workbench_session_messages(request: Request, session_id: str):
+    """Tenant-scoped session messages for the workbench transcript view."""
+    request_id = _new_workbench_request_id()
+    resolved = _resolve_browser_tenant(request)
+    tenant_id = resolved["tenant_id"]
+
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            resolved_session_id = db.resolve_session_id(session_id, user_id=tenant_id)
+            if not resolved_session_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "workbench_session_not_found",
+                        "message": "Session not found for this tenant.",
+                        "request_id": request_id,
+                    },
+                )
+
+            messages = db.get_messages(resolved_session_id, user_id=tenant_id)
+            _log.info(
+                "workbench/proxy_session_messages request_id=%s tenant=%s session_id=%s messages=%s",
+                request_id,
+                tenant_id,
+                resolved_session_id,
+                len(messages),
+            )
+
+            response = JSONResponse(
+                {"session_id": resolved_session_id, "messages": messages},
+                headers={"X-Workbench-Request-Id": request_id},
+            )
+            _apply_browser_identity_cookie(response, request, resolved)
+            return response
+        finally:
+            db.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("workbench/proxy_session_messages_failed request_id=%s tenant=%s", request_id, tenant_id)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "workbench_session_messages_failed",
+                "message": "Failed to load workbench session messages.",
+                "request_id": request_id,
+            },
+        )
+
+
+@app.post("/api/workbench/runs")
+async def create_workbench_run(request: Request):
+    """Create a live run via same-origin endpoint while injecting tenant server-side."""
+    request_id = _new_workbench_request_id()
+    resolved = _resolve_browser_tenant(request)
+    tenant_id = resolved["tenant_id"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_json",
+                "message": "Invalid JSON in workbench run request.",
+                "request_id": request_id,
+            },
+        )
+
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_request",
+                "message": "Workbench run payload must be a JSON object.",
+                "request_id": request_id,
+            },
+        )
+
+    outbound_payload, ignored_body_sources = _strip_browser_user_fields(body)
+    ignored_sources = list(resolved["ignored_browser_user_id_sources"]) + ignored_body_sources
+    if ignored_sources:
+        _log.info(
+            "workbench/proxy_ignore_browser_user_id request_id=%s tenant=%s sources=%s",
+            request_id,
+            tenant_id,
+            ",".join(sorted(set(ignored_sources))),
+        )
+
+    outbound_payload["user_id"] = tenant_id
+
+    loop = asyncio.get_running_loop()
+    try:
+        status_code, upstream_payload, upstream_headers, upstream_url = await loop.run_in_executor(
+            None,
+            lambda: _upstream_request_json(
+                "POST",
+                "/v1/runs",
+                request_id,
+                outbound_payload,
+            ),
+        )
+    except _WorkbenchUpstreamHTTPError as exc:
+        raise _translate_upstream_error(
+            exc,
+            request_id=request_id,
+            phase="run.create",
+            tenant_id=tenant_id,
+        )
+    except urllib.error.URLError as exc:
+        _log.warning(
+            "workbench/proxy_unreachable request_id=%s phase=run.create tenant=%s reason=%s",
+            request_id,
+            tenant_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "proxy_unreachable",
+                "message": "Workbench upstream is unreachable.",
+                "request_id": request_id,
+                "phase": "run.create",
+            },
+        )
+
+    run_id = str(upstream_payload.get("run_id") or "")
+    upstream_session_id = upstream_headers.get("X-Hermes-Session-Id")
+    _log.info(
+        "workbench/proxy_run_started request_id=%s tenant=%s upstream_run_id=%s upstream_session_id=%s upstream=%s",
+        request_id,
+        tenant_id,
+        run_id or "none",
+        upstream_session_id or "none",
+        upstream_url,
+    )
+
+    response_headers = {"X-Workbench-Request-Id": request_id}
+    if run_id:
+        response_headers["X-Upstream-Run-Id"] = run_id
+    if upstream_session_id:
+        response_headers["X-Hermes-Session-Id"] = upstream_session_id
+
+    response = JSONResponse(upstream_payload, status_code=status_code, headers=response_headers)
+    _apply_browser_identity_cookie(response, request, resolved)
+    return response
+
+
+@app.get("/api/workbench/runs/{run_id}/events")
+async def stream_workbench_run_events(request: Request, run_id: str):
+    """Proxy upstream run SSE events through same-origin workbench endpoint."""
+    request_id = _new_workbench_request_id()
+    resolved = _resolve_browser_tenant(request)
+    tenant_id = resolved["tenant_id"]
+
+    base_url, api_key = _resolve_workbench_upstream()
+    encoded_run_id = urllib.parse.quote(run_id, safe="")
+    upstream_url = f"{base_url.rstrip('/')}/v1/runs/{encoded_run_id}/events"
+    upstream_headers = {
+        "Accept": "text/event-stream",
+        "X-Hermes-Workbench-Request-Id": request_id,
+    }
+    if api_key:
+        upstream_headers["Authorization"] = f"Bearer {api_key}"
+
+    open_request = urllib.request.Request(upstream_url, headers=upstream_headers, method="GET")
+    loop = asyncio.get_running_loop()
+
+    try:
+        upstream_response = await loop.run_in_executor(
+            None,
+            lambda: urllib.request.urlopen(open_request, timeout=_WORKBENCH_PROXY_TIMEOUT),
+        )
+    except urllib.error.HTTPError as exc:
+        body = exc.read() if hasattr(exc, "read") else b""
+        raise _translate_upstream_error(
+            _WorkbenchUpstreamHTTPError(exc.code, body, dict((exc.headers or {}).items())),
+            request_id=request_id,
+            phase="run.events",
+            tenant_id=tenant_id,
+        )
+    except urllib.error.URLError as exc:
+        _log.warning(
+            "workbench/proxy_unreachable request_id=%s phase=run.events tenant=%s reason=%s",
+            request_id,
+            tenant_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "proxy_unreachable",
+                "message": "Workbench upstream events stream is unreachable.",
+                "request_id": request_id,
+                "phase": "run.events",
+            },
+        )
+
+    upstream_session_id = upstream_response.headers.get("X-Hermes-Session-Id")
+    _log.info(
+        "workbench/proxy_events_open request_id=%s tenant=%s run_id=%s upstream_session_id=%s upstream=%s",
+        request_id,
+        tenant_id,
+        run_id,
+        upstream_session_id or "none",
+        upstream_url,
+    )
+
+    async def _event_stream():
+        try:
+            while True:
+                line = await loop.run_in_executor(None, upstream_response.readline)
+                if not line:
+                    break
+                yield line
+        finally:
+            await loop.run_in_executor(None, upstream_response.close)
+            _log.info(
+                "workbench/proxy_events_closed request_id=%s tenant=%s run_id=%s",
+                request_id,
+                tenant_id,
+                run_id,
+            )
+
+    response_headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "X-Workbench-Request-Id": request_id,
+    }
+    if upstream_session_id:
+        response_headers["X-Hermes-Session-Id"] = upstream_session_id
+
+    response = StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers=response_headers,
+    )
+    _apply_browser_identity_cookie(response, request, resolved)
     return response
 
 

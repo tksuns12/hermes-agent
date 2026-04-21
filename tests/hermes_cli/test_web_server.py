@@ -1,8 +1,10 @@
 """Tests for hermes_cli.web_server and related config utilities."""
 
+import io
 import os
 import json
 import tempfile
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -367,6 +369,178 @@ class TestWebServerEndpoints:
         set_cookie = resp.headers.get("set-cookie", "")
         assert "hermes_browser_id=" in set_cookie
         assert "Max-Age=0" in set_cookie or "max-age=0" in set_cookie.lower()
+
+    def test_workbench_sessions_are_tenant_scoped(self):
+        from hermes_state import SessionDB
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant_id = bootstrap.json()["tenant"]["id"]
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        db = SessionDB()
+        try:
+            db.create_session("wb-tenant-session", source="web", model="test/model", user_id=tenant_id)
+            db.create_session("wb-other-session", source="web", model="test/model", user_id="other-tenant")
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/workbench/sessions",
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["total"] == 1
+        assert [s["id"] for s in payload["sessions"]] == ["wb-tenant-session"]
+        assert resp.headers.get("X-Workbench-Request-Id")
+
+    def test_workbench_session_detail_denies_cross_tenant_access(self):
+        from hermes_state import SessionDB
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        db = SessionDB()
+        try:
+            db.create_session("wb-cross-tenant", source="web", model="test/model", user_id="other-tenant")
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/workbench/sessions/wb-cross-tenant",
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert resp.status_code == 404
+        detail = resp.json()["detail"]
+        assert detail["code"] == "workbench_session_not_found"
+
+    def test_workbench_runs_proxy_injects_tenant_and_ignores_browser_user_id(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant_id = bootstrap.json()["tenant"]["id"]
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        captured = {}
+
+        class _FakeJSONResponse:
+            def __init__(self, status, payload, headers=None):
+                self.status = status
+                self._payload = json.dumps(payload).encode("utf-8")
+                self.headers = headers or {}
+
+            def read(self):
+                return self._payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _mock_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["authorization"] = req.get_header("Authorization")
+            captured["request_id"] = req.get_header("X-hermes-workbench-request-id")
+            captured["body"] = json.loads((req.data or b"{}").decode("utf-8"))
+            return _FakeJSONResponse(
+                202,
+                {"run_id": "run_proxy_test", "status": "started"},
+                headers={"X-Hermes-Session-Id": "session_proxy_test"},
+            )
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", _mock_urlopen)
+
+        resp = self.client.post(
+            "/api/workbench/runs?user_id=query-attacker",
+            cookies={"hermes_browser_id": browser_id},
+            headers={
+                "Authorization": self.client.headers["Authorization"],
+                "X-Hermes-User-Id": "header-attacker",
+            },
+            json={
+                "input": "hello from browser",
+                "user": "browser-user",
+                "user_id": "browser-tenant",
+            },
+        )
+
+        assert resp.status_code == 202
+        assert resp.json()["run_id"] == "run_proxy_test"
+        assert captured["url"].endswith("/v1/runs")
+        assert captured["body"]["user_id"] == tenant_id
+        assert "user" not in captured["body"]
+        assert resp.headers.get("X-Upstream-Run-Id") == "run_proxy_test"
+        assert resp.headers.get("X-Hermes-Session-Id") == "session_proxy_test"
+        assert resp.headers.get("X-Workbench-Request-Id")
+
+    def test_workbench_runs_proxy_translates_upstream_5xx(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        def _mock_urlopen(req, timeout=0):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                503,
+                "service unavailable",
+                hdrs={},
+                fp=io.BytesIO(b'{"error":{"message":"upstream exploded"}}'),
+            )
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", _mock_urlopen)
+
+        resp = self.client.post(
+            "/api/workbench/runs",
+            cookies={"hermes_browser_id": browser_id},
+            json={"input": "trigger"},
+        )
+
+        assert resp.status_code == 502
+        detail = resp.json()["detail"]
+        assert detail["code"] == "proxy_upstream_error"
+        assert detail["upstream_status"] == 503
+        assert detail["phase"] == "run.create"
+        assert detail["request_id"]
+
+    def test_workbench_run_events_proxy_streams_sse(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        class _FakeSSEStream:
+            def __init__(self):
+                self.headers = {"X-Hermes-Session-Id": "session_evt"}
+                self._lines = [
+                    b'data: {"event":"message.delta","delta":"hi"}\n',
+                    b'\n',
+                    b'data: {"event":"run.completed"}\n',
+                    b'\n',
+                ]
+
+            def readline(self):
+                if not self._lines:
+                    return b""
+                return self._lines.pop(0)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", lambda req, timeout=0: _FakeSSEStream())
+
+        resp = self.client.get(
+            "/api/workbench/runs/run_evt_123/events",
+            cookies={"hermes_browser_id": browser_id},
+        )
+
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers.get("content-type", "")
+        assert resp.headers.get("X-Hermes-Session-Id") == "session_evt"
+        assert "message.delta" in resp.text
+        assert "run.completed" in resp.text
+        assert resp.headers.get("X-Workbench-Request-Id")
 
     def test_path_traversal_blocked(self):
         """Verify URL-encoded path traversal is blocked."""
