@@ -517,7 +517,8 @@ class TestWebServerEndpoints:
                 self._lines = [
                     b'data: {"event":"message.delta","delta":"hi"}\n',
                     b'\n',
-                    b'data: {"event":"run.completed"}\n',
+                    b'data: {"event":"run.completed","files":[{"type":"output_file","file_id":"file_evt_123","filename":"demo.txt","size_bytes":17,"download_url":"/v1/files/file_evt_123/content"}]}'
+                    b'\n',
                     b'\n',
                 ]
 
@@ -541,6 +542,7 @@ class TestWebServerEndpoints:
         assert resp.headers.get("X-Hermes-Session-Id") == "session_evt"
         assert "message.delta" in resp.text
         assert "run.completed" in resp.text
+        assert "file_evt_123" in resp.text
         assert resp.headers.get("X-Workbench-Request-Id")
 
     def test_workbench_files_upload_and_list_ignore_browser_user_id(self, monkeypatch):

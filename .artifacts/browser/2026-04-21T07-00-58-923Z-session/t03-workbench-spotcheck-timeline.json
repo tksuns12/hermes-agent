@@ -1,0 +1,53 @@
+{
+  "entries": [
+    {
+      "id": 1,
+      "tool": "browser_navigate",
+      "status": "success",
+      "durationMs": 1312,
+      "beforeUrl": "about:blank",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#1 | browser_navigate | success | 1312ms | screenshot=true, url=\"http://127.0.0.1:9119/\" | URL changed to http://127.0.0.1:9119/; title changed to Hermes Agent - Dashboard; landmarks 0→9; buttons 0→6 | Warnings: JS: Failed to load resource: the server responded with a status of 502 (Bad Gateway); Network: GET fetch 502\nUse browser_get_console_logs/browser_get_network_logs for full diagnostics."
+    },
+    {
+      "id": 2,
+      "tool": "browser_type",
+      "status": "success",
+      "durationMs": 105,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#2 | browser_type | success | 105ms | clearFirst=true, selector=\"textarea\", text=\"Summarize the attached file in one sentence and include t...\" | PASS (value_equals_expected, value_contains_expected) | focus changed"
+    },
+    {
+      "id": 3,
+      "tool": "browser_click",
+      "status": "success",
+      "durationMs": 564,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#3 | browser_click | success | 564ms | selector=\"button:has-text('Send')\" | SOFT-FAIL (no observable state change) | focus changed; visible text changed"
+    },
+    {
+      "id": 4,
+      "tool": "browser_batch",
+      "status": "success",
+      "durationMs": 664,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#4 | browser_batch | success | 664ms | steps=[3] | visible text changed"
+    },
+    {
+      "id": 5,
+      "tool": "browser_batch",
+      "status": "success",
+      "durationMs": 641,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#5 | browser_batch | success | 641ms | steps=[3] | visible text changed"
+    }
+  ],
+  "retained": 5,
+  "totalRecorded": 5,
+  "bounded": false,
+  "summary": "Timeline: 5 browser actions recorded."
+}
