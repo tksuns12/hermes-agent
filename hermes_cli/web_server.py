@@ -368,6 +368,7 @@ _BROWSER_TENANT_NOUNS: tuple[str, ...] = (
     "vector",
     "willow",
 )
+_WORKBENCH_FILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,191}$")
 
 
 def _mask_browser_identity(identity: str | None) -> str:
@@ -494,6 +495,10 @@ class _WorkbenchUpstreamHTTPError(Exception):
         self.headers = headers
 
 
+class _WorkbenchUpstreamMalformedResponseError(Exception):
+    """Raised when upstream returns malformed success payloads."""
+
+
 _WORKBENCH_PROXY_TIMEOUT = float(os.getenv("HERMES_WORKBENCH_PROXY_TIMEOUT", "30"))
 _WORKBENCH_UPSTREAM_URL = os.getenv("HERMES_WORKBENCH_UPSTREAM_URL", "")
 _WORKBENCH_UPSTREAM_KEY = os.getenv("HERMES_WORKBENCH_UPSTREAM_KEY", "")
@@ -559,6 +564,21 @@ def _decode_upstream_json(body: bytes) -> Dict[str, Any]:
         return {}
 
 
+def _decode_upstream_json_required(body: bytes) -> Dict[str, Any]:
+    """Decode upstream JSON and fail closed on malformed success payloads."""
+    if not body:
+        raise _WorkbenchUpstreamMalformedResponseError("Empty upstream JSON response body.")
+
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+    except Exception as exc:  # pragma: no cover - defensive edge case
+        raise _WorkbenchUpstreamMalformedResponseError("Upstream returned invalid JSON.") from exc
+
+    if not isinstance(decoded, dict):
+        raise _WorkbenchUpstreamMalformedResponseError("Upstream JSON response must be an object.")
+    return decoded
+
+
 def _extract_upstream_detail(payload: Dict[str, Any], fallback: str) -> str:
     error = payload.get("error")
     if isinstance(error, dict):
@@ -585,34 +605,66 @@ def _strip_browser_user_fields(payload: Dict[str, Any]) -> tuple[Dict[str, Any],
     return cleaned, ignored_sources
 
 
+def _upstream_request_raw(
+    method: str,
+    path: str,
+    request_id: str,
+    payload: bytes | None = None,
+    *,
+    content_type: str | None = None,
+    accept: str | None = None,
+    extra_headers: Dict[str, str] | None = None,
+) -> tuple[int, bytes, Dict[str, str], str]:
+    """Execute a blocking upstream request and return raw status/body/headers/url."""
+    base_url, api_key = _resolve_workbench_upstream()
+    url = f"{base_url.rstrip('/')}{path}"
+    headers: Dict[str, str] = {
+        "X-Hermes-Workbench-Request-Id": request_id,
+    }
+    if accept:
+        headers["Accept"] = accept
+    if content_type:
+        headers["Content-Type"] = content_type
+    if extra_headers:
+        headers.update(extra_headers)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=_WORKBENCH_PROXY_TIMEOUT) as resp:
+            body = resp.read()
+            return resp.status, body, dict(resp.headers.items()), url
+    except urllib.error.HTTPError as exc:
+        body = exc.read() if hasattr(exc, "read") else b""
+        raise _WorkbenchUpstreamHTTPError(exc.code, body, dict((exc.headers or {}).items())) from exc
+
+
 def _upstream_request_json(
     method: str,
     path: str,
     request_id: str,
     payload: Dict[str, Any] | None = None,
+    *,
+    strict: bool = False,
 ) -> tuple[int, Dict[str, Any], Dict[str, str], str]:
-    """Execute a blocking JSON upstream request and return status/body/headers/url."""
-    base_url, api_key = _resolve_workbench_upstream()
-    url = f"{base_url.rstrip('/')}{path}"
-    headers: Dict[str, str] = {
-        "Accept": "application/json",
-        "X-Hermes-Workbench-Request-Id": request_id,
-    }
+    """Execute an upstream JSON request and return status/body/headers/url."""
     data: bytes | None = None
+    content_type: str | None = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        content_type = "application/json"
 
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=_WORKBENCH_PROXY_TIMEOUT) as resp:
-            body = resp.read()
-            return resp.status, _decode_upstream_json(body), dict(resp.headers.items()), url
-    except urllib.error.HTTPError as exc:
-        body = exc.read() if hasattr(exc, "read") else b""
-        raise _WorkbenchUpstreamHTTPError(exc.code, body, dict((exc.headers or {}).items())) from exc
+    status, body, headers, url = _upstream_request_raw(
+        method,
+        path,
+        request_id,
+        payload=data,
+        content_type=content_type,
+        accept="application/json",
+    )
+    parsed_payload = _decode_upstream_json_required(body) if strict else _decode_upstream_json(body)
+    return status, parsed_payload, headers, url
 
 
 def _translate_upstream_error(
@@ -651,7 +703,70 @@ def _translate_upstream_error(
             "phase": phase,
             "upstream_status": exc.status_code,
         },
+        headers={"X-Workbench-Request-Id": request_id},
     )
+
+
+def _translate_upstream_malformed_response(
+    *,
+    request_id: str,
+    phase: str,
+    tenant_id: str,
+    detail: str,
+) -> HTTPException:
+    """Translate malformed upstream success payloads into stable proxy errors."""
+    _log.warning(
+        "workbench/proxy_malformed request_id=%s phase=%s tenant=%s detail=%s",
+        request_id,
+        phase,
+        tenant_id,
+        detail,
+    )
+    return HTTPException(
+        status_code=502,
+        detail={
+            "code": "proxy_upstream_malformed",
+            "message": detail,
+            "request_id": request_id,
+            "phase": phase,
+        },
+        headers={"X-Workbench-Request-Id": request_id},
+    )
+
+
+def _validate_workbench_file_id(file_id: str, *, request_id: str) -> None:
+    if _WORKBENCH_FILE_ID_RE.fullmatch(file_id):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "code": "invalid_file_id",
+            "message": "Invalid workbench file id.",
+            "request_id": request_id,
+        },
+        headers={"X-Workbench-Request-Id": request_id},
+    )
+
+
+def _normalize_workbench_file_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite upstream file metadata so browser-facing links stay same-origin."""
+    file_id = payload.get("id")
+    if not isinstance(file_id, str) or not file_id.strip():
+        raise _WorkbenchUpstreamMalformedResponseError("Upstream file metadata missing id.")
+
+    normalized = dict(payload)
+    encoded_file_id = urllib.parse.quote(file_id, safe="")
+    normalized["download_url"] = f"/api/workbench/files/{encoded_file_id}/content"
+    return normalized
+
+
+def _workbench_proxy_headers(request_id: str, upstream_headers: Dict[str, str] | None = None) -> Dict[str, str]:
+    """Build browser response headers with mandatory correlation ids."""
+    headers: Dict[str, str] = {"X-Workbench-Request-Id": request_id}
+    upstream_session_id = (upstream_headers or {}).get("X-Hermes-Session-Id")
+    if upstream_session_id:
+        headers["X-Hermes-Session-Id"] = upstream_session_id
+    return headers
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
@@ -1176,6 +1291,353 @@ async def stream_workbench_run_events(request: Request, run_id: str):
         _event_stream(),
         media_type="text/event-stream",
         headers=response_headers,
+    )
+    _apply_browser_identity_cookie(response, request, resolved)
+    return response
+
+
+@app.get("/api/workbench/files")
+async def list_workbench_files(request: Request):
+    """List tenant-scoped files via same-origin workbench proxy."""
+    request_id = _new_workbench_request_id()
+    resolved = _resolve_browser_tenant(request)
+    tenant_id = resolved["tenant_id"]
+
+    ignored_sources = list(resolved["ignored_browser_user_id_sources"])
+    if ignored_sources:
+        _log.info(
+            "workbench/proxy_file_ignore_browser_user_id request_id=%s tenant=%s sources=%s",
+            request_id,
+            tenant_id,
+            ",".join(sorted(set(ignored_sources))),
+        )
+
+    path = f"/v1/files?{urllib.parse.urlencode({'user_id': tenant_id})}"
+
+    loop = asyncio.get_running_loop()
+    try:
+        status_code, upstream_payload, upstream_headers, upstream_url = await loop.run_in_executor(
+            None,
+            lambda: _upstream_request_json("GET", path, request_id, strict=True),
+        )
+    except _WorkbenchUpstreamHTTPError as exc:
+        raise _translate_upstream_error(
+            exc,
+            request_id=request_id,
+            phase="file.list",
+            tenant_id=tenant_id,
+        )
+    except _WorkbenchUpstreamMalformedResponseError as exc:
+        raise _translate_upstream_malformed_response(
+            request_id=request_id,
+            phase="file.list",
+            tenant_id=tenant_id,
+            detail=str(exc),
+        )
+    except urllib.error.URLError as exc:
+        _log.warning(
+            "workbench/proxy_unreachable request_id=%s phase=file.list tenant=%s reason=%s",
+            request_id,
+            tenant_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "proxy_unreachable",
+                "message": "Workbench upstream is unreachable.",
+                "request_id": request_id,
+                "phase": "file.list",
+            },
+            headers={"X-Workbench-Request-Id": request_id},
+        )
+
+    data = upstream_payload.get("data")
+    if not isinstance(data, list):
+        raise _translate_upstream_malformed_response(
+            request_id=request_id,
+            phase="file.list",
+            tenant_id=tenant_id,
+            detail="Upstream files list response missing data array.",
+        )
+
+    normalized_payload = dict(upstream_payload)
+    try:
+        normalized_payload["data"] = [_normalize_workbench_file_metadata(item) for item in data]
+    except _WorkbenchUpstreamMalformedResponseError as exc:
+        raise _translate_upstream_malformed_response(
+            request_id=request_id,
+            phase="file.list",
+            tenant_id=tenant_id,
+            detail=str(exc),
+        )
+
+    _log.info(
+        "workbench/proxy_file_list request_id=%s tenant=%s count=%s upstream=%s",
+        request_id,
+        tenant_id,
+        len(normalized_payload["data"]),
+        upstream_url,
+    )
+
+    response = JSONResponse(
+        normalized_payload,
+        status_code=status_code,
+        headers=_workbench_proxy_headers(request_id, upstream_headers),
+    )
+    _apply_browser_identity_cookie(response, request, resolved)
+    return response
+
+
+@app.post("/api/workbench/files")
+async def create_workbench_file(request: Request):
+    """Upload tenant-scoped file bytes via same-origin workbench proxy."""
+    request_id = _new_workbench_request_id()
+    resolved = _resolve_browser_tenant(request)
+    tenant_id = resolved["tenant_id"]
+
+    query_params = request.query_params
+    filename = (query_params.get("filename") or request.headers.get("X-Filename") or "").strip()
+    purpose = (query_params.get("purpose") or "uploads").strip() or "uploads"
+    source_kind = (query_params.get("source") or "upload").strip() or "upload"
+
+    if not filename:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "missing_filename",
+                "message": "Missing filename metadata.",
+                "request_id": request_id,
+            },
+            headers={"X-Workbench-Request-Id": request_id},
+        )
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_request",
+                "message": "Missing file content.",
+                "request_id": request_id,
+            },
+            headers={"X-Workbench-Request-Id": request_id},
+        )
+
+    ignored_sources = list(resolved["ignored_browser_user_id_sources"])
+    if ignored_sources:
+        _log.info(
+            "workbench/proxy_file_ignore_browser_user_id request_id=%s tenant=%s sources=%s",
+            request_id,
+            tenant_id,
+            ",".join(sorted(set(ignored_sources))),
+        )
+
+    path = "/v1/files?" + urllib.parse.urlencode(
+        {
+            "user_id": tenant_id,
+            "filename": filename,
+            "purpose": purpose,
+            "source": source_kind,
+        }
+    )
+    content_type = request.headers.get("Content-Type", "application/octet-stream")
+
+    loop = asyncio.get_running_loop()
+    try:
+        status_code, upstream_body, upstream_headers, upstream_url = await loop.run_in_executor(
+            None,
+            lambda: _upstream_request_raw(
+                "POST",
+                path,
+                request_id,
+                payload=body,
+                content_type=content_type,
+                accept="application/json",
+                extra_headers={"X-Filename": filename},
+            ),
+        )
+        upstream_payload = _decode_upstream_json_required(upstream_body)
+        normalized_payload = _normalize_workbench_file_metadata(upstream_payload)
+    except _WorkbenchUpstreamHTTPError as exc:
+        raise _translate_upstream_error(
+            exc,
+            request_id=request_id,
+            phase="file.upload",
+            tenant_id=tenant_id,
+        )
+    except _WorkbenchUpstreamMalformedResponseError as exc:
+        raise _translate_upstream_malformed_response(
+            request_id=request_id,
+            phase="file.upload",
+            tenant_id=tenant_id,
+            detail=str(exc),
+        )
+    except urllib.error.URLError as exc:
+        _log.warning(
+            "workbench/proxy_unreachable request_id=%s phase=file.upload tenant=%s reason=%s",
+            request_id,
+            tenant_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "proxy_unreachable",
+                "message": "Workbench upstream is unreachable.",
+                "request_id": request_id,
+                "phase": "file.upload",
+            },
+            headers={"X-Workbench-Request-Id": request_id},
+        )
+
+    _log.info(
+        "workbench/proxy_file_upload request_id=%s tenant=%s file_id=%s size=%s upstream=%s",
+        request_id,
+        tenant_id,
+        normalized_payload.get("id", "none"),
+        len(body),
+        upstream_url,
+    )
+
+    response = JSONResponse(
+        normalized_payload,
+        status_code=status_code,
+        headers=_workbench_proxy_headers(request_id, upstream_headers),
+    )
+    _apply_browser_identity_cookie(response, request, resolved)
+    return response
+
+
+@app.get("/api/workbench/files/{file_id}")
+async def get_workbench_file_metadata(request: Request, file_id: str):
+    """Get tenant-scoped file metadata through the same-origin proxy."""
+    request_id = _new_workbench_request_id()
+    _validate_workbench_file_id(file_id, request_id=request_id)
+
+    resolved = _resolve_browser_tenant(request)
+    tenant_id = resolved["tenant_id"]
+    encoded_file_id = urllib.parse.quote(file_id, safe="")
+    path = f"/v1/files/{encoded_file_id}?{urllib.parse.urlencode({'user_id': tenant_id})}"
+
+    loop = asyncio.get_running_loop()
+    try:
+        status_code, upstream_payload, upstream_headers, upstream_url = await loop.run_in_executor(
+            None,
+            lambda: _upstream_request_json("GET", path, request_id, strict=True),
+        )
+        normalized_payload = _normalize_workbench_file_metadata(upstream_payload)
+    except _WorkbenchUpstreamHTTPError as exc:
+        raise _translate_upstream_error(
+            exc,
+            request_id=request_id,
+            phase="file.metadata",
+            tenant_id=tenant_id,
+        )
+    except _WorkbenchUpstreamMalformedResponseError as exc:
+        raise _translate_upstream_malformed_response(
+            request_id=request_id,
+            phase="file.metadata",
+            tenant_id=tenant_id,
+            detail=str(exc),
+        )
+    except urllib.error.URLError as exc:
+        _log.warning(
+            "workbench/proxy_unreachable request_id=%s phase=file.metadata tenant=%s reason=%s",
+            request_id,
+            tenant_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "proxy_unreachable",
+                "message": "Workbench upstream is unreachable.",
+                "request_id": request_id,
+                "phase": "file.metadata",
+            },
+            headers={"X-Workbench-Request-Id": request_id},
+        )
+
+    _log.info(
+        "workbench/proxy_file_metadata request_id=%s tenant=%s file_id=%s upstream=%s",
+        request_id,
+        tenant_id,
+        file_id,
+        upstream_url,
+    )
+
+    response = JSONResponse(
+        normalized_payload,
+        status_code=status_code,
+        headers=_workbench_proxy_headers(request_id, upstream_headers),
+    )
+    _apply_browser_identity_cookie(response, request, resolved)
+    return response
+
+
+@app.get("/api/workbench/files/{file_id}/content")
+async def get_workbench_file_content(request: Request, file_id: str):
+    """Download tenant-scoped file content through the same-origin proxy."""
+    request_id = _new_workbench_request_id()
+    _validate_workbench_file_id(file_id, request_id=request_id)
+
+    resolved = _resolve_browser_tenant(request)
+    tenant_id = resolved["tenant_id"]
+    encoded_file_id = urllib.parse.quote(file_id, safe="")
+    path = f"/v1/files/{encoded_file_id}/content?{urllib.parse.urlencode({'user_id': tenant_id})}"
+
+    loop = asyncio.get_running_loop()
+    try:
+        status_code, upstream_body, upstream_headers, upstream_url = await loop.run_in_executor(
+            None,
+            lambda: _upstream_request_raw("GET", path, request_id, accept="*/*"),
+        )
+    except _WorkbenchUpstreamHTTPError as exc:
+        raise _translate_upstream_error(
+            exc,
+            request_id=request_id,
+            phase="file.content",
+            tenant_id=tenant_id,
+        )
+    except urllib.error.URLError as exc:
+        _log.warning(
+            "workbench/proxy_unreachable request_id=%s phase=file.content tenant=%s reason=%s",
+            request_id,
+            tenant_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "proxy_unreachable",
+                "message": "Workbench upstream is unreachable.",
+                "request_id": request_id,
+                "phase": "file.content",
+            },
+            headers={"X-Workbench-Request-Id": request_id},
+        )
+
+    _log.info(
+        "workbench/proxy_file_content request_id=%s tenant=%s file_id=%s size=%s upstream=%s",
+        request_id,
+        tenant_id,
+        file_id,
+        len(upstream_body),
+        upstream_url,
+    )
+
+    passthrough_headers = _workbench_proxy_headers(request_id, upstream_headers)
+    for header_name in ("Content-Disposition", "ETag", "Last-Modified", "Content-Length"):
+        header_value = upstream_headers.get(header_name)
+        if header_value:
+            passthrough_headers[header_name] = header_value
+
+    response = StreamingResponse(
+        iter([upstream_body]),
+        media_type=upstream_headers.get("Content-Type") or "application/octet-stream",
+        status_code=status_code,
+        headers=passthrough_headers,
     )
     _apply_browser_identity_cookie(response, request, resolved)
     return response

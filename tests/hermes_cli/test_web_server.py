@@ -5,6 +5,7 @@ import os
 import json
 import tempfile
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -541,6 +542,308 @@ class TestWebServerEndpoints:
         assert "message.delta" in resp.text
         assert "run.completed" in resp.text
         assert resp.headers.get("X-Workbench-Request-Id")
+
+    def test_workbench_files_upload_and_list_ignore_browser_user_id(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant_id = bootstrap.json()["tenant"]["id"]
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        captured_calls = []
+
+        class _FakeJSONResponse:
+            def __init__(self, status, payload, headers=None):
+                self.status = status
+                self._payload = json.dumps(payload).encode("utf-8")
+                self.headers = headers or {}
+
+            def read(self):
+                return self._payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _mock_urlopen(req, timeout=0):
+            parsed = urllib.parse.urlparse(req.full_url)
+            query = urllib.parse.parse_qs(parsed.query)
+            captured_calls.append(
+                {
+                    "method": req.get_method(),
+                    "path": parsed.path,
+                    "query": query,
+                    "body": req.data,
+                    "request_id": req.get_header("X-hermes-workbench-request-id"),
+                }
+            )
+
+            if req.get_method() == "POST":
+                return _FakeJSONResponse(
+                    201,
+                    {
+                        "id": "file_demo_123",
+                        "object": "file",
+                        "filename": "demo.txt",
+                        "bytes": 5,
+                        "download_url": "/v1/files/file_demo_123/content",
+                    },
+                    headers={"X-Hermes-Session-Id": "sess_file_proxy"},
+                )
+
+            return _FakeJSONResponse(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "file_demo_123",
+                            "object": "file",
+                            "filename": "demo.txt",
+                            "bytes": 5,
+                            "download_url": "/v1/files/file_demo_123/content",
+                        }
+                    ],
+                },
+            )
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", _mock_urlopen)
+
+        upload = self.client.post(
+            "/api/workbench/files?user_id=attacker&filename=demo.txt",
+            headers={
+                "Authorization": self.client.headers["Authorization"],
+                "X-Hermes-User-Id": "header-attacker",
+                "Content-Type": "text/plain",
+            },
+            cookies={"hermes_browser_id": browser_id},
+            content=b"hello",
+        )
+        assert upload.status_code == 201
+        assert upload.json()["download_url"] == "/api/workbench/files/file_demo_123/content"
+        assert upload.headers.get("X-Workbench-Request-Id")
+        assert upload.headers.get("X-Hermes-Session-Id") == "sess_file_proxy"
+
+        listed = self.client.get(
+            "/api/workbench/files?user_id=query-attacker",
+            headers={
+                "Authorization": self.client.headers["Authorization"],
+                "X-Hermes-User-Id": "header-attacker",
+            },
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert listed.status_code == 200
+        assert listed.headers.get("X-Workbench-Request-Id")
+        payload = listed.json()
+        assert payload["object"] == "list"
+        assert payload["data"][0]["download_url"] == "/api/workbench/files/file_demo_123/content"
+
+        assert len(captured_calls) == 2
+        assert captured_calls[0]["path"].endswith("/v1/files")
+        assert captured_calls[0]["query"]["user_id"] == [tenant_id]
+        assert captured_calls[0]["query"].get("filename") == ["demo.txt"]
+        assert captured_calls[0]["body"] == b"hello"
+        assert captured_calls[0]["request_id"]
+        assert captured_calls[1]["path"].endswith("/v1/files")
+        assert captured_calls[1]["query"]["user_id"] == [tenant_id]
+        assert captured_calls[1]["request_id"]
+
+    def test_workbench_files_metadata_and_content_proxy(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant_id = bootstrap.json()["tenant"]["id"]
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        captured_queries = []
+
+        class _FakeRawResponse:
+            def __init__(self, status, body, headers=None):
+                self.status = status
+                self._body = body
+                self.headers = headers or {}
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _mock_urlopen(req, timeout=0):
+            parsed = urllib.parse.urlparse(req.full_url)
+            captured_queries.append(urllib.parse.parse_qs(parsed.query))
+
+            if parsed.path.endswith("/content"):
+                return _FakeRawResponse(
+                    200,
+                    b"tenant-owned-bytes",
+                    headers={
+                        "Content-Type": "text/plain",
+                        "Content-Disposition": 'attachment; filename="demo.txt"',
+                        "X-Hermes-Session-Id": "session_file_content",
+                    },
+                )
+
+            return _FakeRawResponse(
+                200,
+                json.dumps(
+                    {
+                        "id": "file_demo_123",
+                        "object": "file",
+                        "filename": "demo.txt",
+                        "bytes": 17,
+                        "download_url": "/v1/files/file_demo_123/content",
+                    }
+                ).encode("utf-8"),
+                headers={"X-Hermes-Session-Id": "session_file_meta"},
+            )
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", _mock_urlopen)
+
+        metadata = self.client.get(
+            "/api/workbench/files/file_demo_123",
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert metadata.status_code == 200
+        assert metadata.json()["download_url"] == "/api/workbench/files/file_demo_123/content"
+        assert metadata.headers.get("X-Workbench-Request-Id")
+        assert metadata.headers.get("X-Hermes-Session-Id") == "session_file_meta"
+
+        content = self.client.get(
+            "/api/workbench/files/file_demo_123/content",
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert content.status_code == 200
+        assert content.content == b"tenant-owned-bytes"
+        assert "text/plain" in content.headers.get("content-type", "")
+        assert "attachment" in content.headers.get("content-disposition", "")
+        assert content.headers.get("X-Workbench-Request-Id")
+        assert content.headers.get("X-Hermes-Session-Id") == "session_file_content"
+
+        assert captured_queries[0]["user_id"] == [tenant_id]
+        assert captured_queries[1]["user_id"] == [tenant_id]
+
+    def test_workbench_files_validation_rejects_missing_fields_and_bad_ids(self):
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        missing_filename = self.client.post(
+            "/api/workbench/files",
+            cookies={"hermes_browser_id": browser_id},
+            content=b"abc",
+            headers={"Authorization": self.client.headers["Authorization"]},
+        )
+        assert missing_filename.status_code == 400
+        missing_filename_detail = missing_filename.json()["detail"]
+        assert missing_filename_detail["code"] == "missing_filename"
+        assert missing_filename_detail["request_id"]
+        assert missing_filename.headers.get("X-Workbench-Request-Id") == missing_filename_detail["request_id"]
+
+        missing_body = self.client.post(
+            "/api/workbench/files?filename=demo.txt",
+            cookies={"hermes_browser_id": browser_id},
+            content=b"",
+            headers={"Authorization": self.client.headers["Authorization"]},
+        )
+        assert missing_body.status_code == 400
+        missing_body_detail = missing_body.json()["detail"]
+        assert missing_body_detail["code"] == "invalid_request"
+        assert missing_body_detail["request_id"]
+        assert missing_body.headers.get("X-Workbench-Request-Id") == missing_body_detail["request_id"]
+
+        invalid_file_id = self.client.get(
+            "/api/workbench/files/not%20valid",
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert invalid_file_id.status_code == 400
+        invalid_file_id_detail = invalid_file_id.json()["detail"]
+        assert invalid_file_id_detail["code"] == "invalid_file_id"
+        assert invalid_file_id_detail["request_id"]
+        assert invalid_file_id.headers.get("X-Workbench-Request-Id") == invalid_file_id_detail["request_id"]
+
+    def test_workbench_files_proxy_handles_upstream_denial(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        def _mock_urlopen(req, timeout=0):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                404,
+                "not found",
+                hdrs={},
+                fp=io.BytesIO(b'{"error":{"message":"File not found: file_foreign"}}'),
+            )
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", _mock_urlopen)
+
+        denied = self.client.get(
+            "/api/workbench/files/file_foreign",
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert denied.status_code == 404
+        detail = denied.json()["detail"]
+        assert detail["code"] == "proxy_upstream_rejected"
+        assert detail["phase"] == "file.metadata"
+        assert detail["request_id"]
+        assert denied.headers.get("X-Workbench-Request-Id") == detail["request_id"]
+
+    def test_workbench_files_proxy_handles_unreachable_and_malformed_upstream(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        class _FakeRawResponse:
+            def __init__(self, status, body, headers=None):
+                self.status = status
+                self._body = body
+                self.headers = headers or {}
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _mock_urlopen(req, timeout=0):
+            parsed = urllib.parse.urlparse(req.full_url)
+            if parsed.path.endswith("/v1/files"):
+                raise urllib.error.URLError("gateway down")
+            return _FakeRawResponse(200, b"not-json")
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", _mock_urlopen)
+
+        unreachable = self.client.get(
+            "/api/workbench/files",
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert unreachable.status_code == 502
+        unreachable_detail = unreachable.json()["detail"]
+        assert unreachable_detail["code"] == "proxy_unreachable"
+        assert unreachable_detail["phase"] == "file.list"
+        assert unreachable_detail["request_id"]
+        assert unreachable.headers.get("X-Workbench-Request-Id") == unreachable_detail["request_id"]
+
+        malformed = self.client.get(
+            "/api/workbench/files/file_demo_123",
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert malformed.status_code == 502
+        malformed_detail = malformed.json()["detail"]
+        assert malformed_detail["code"] == "proxy_upstream_malformed"
+        assert malformed_detail["phase"] == "file.metadata"
+        assert malformed_detail["request_id"]
+        assert malformed.headers.get("X-Workbench-Request-Id") == malformed_detail["request_id"]
 
     def test_workbench_unknown_api_route_fails_closed_with_correlation(self, caplog):
         caplog.clear()
