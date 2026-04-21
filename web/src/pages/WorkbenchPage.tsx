@@ -26,6 +26,7 @@ import type {
     SessionMessage,
     WorkbenchBootstrapResponse,
     WorkbenchFileMetadata,
+    WorkbenchProxyMeta,
     WorkbenchRunEvent,
     WorkbenchRunOutputFile,
 } from "@/lib/api";
@@ -36,8 +37,38 @@ import { timeAgo } from "@/lib/utils";
 import { useToast } from "@/hooks/useToast";
 import { Toast } from "@/components/Toast";
 
-type ActivityKind = "run" | "reasoning" | "tool" | "file" | "stream";
+type ActivityKind = "run" | "reasoning" | "tool" | "file" | "stream" | "tenant";
 type ActivityStatus = "info" | "success" | "error";
+
+const LAST_SEEN_TENANT_STORAGE_KEY = "hermes.workbench.lastSeenTenant.v1";
+const LAST_SEEN_TENANT_STORAGE_VERSION = 1;
+
+interface LastSeenTenantRecord {
+    version: number;
+    tenantId: string;
+    tenantLabel: string;
+    tenantSource: string;
+    seenAt: number;
+    requestId?: string;
+}
+
+interface TenantMismatchWarning {
+    kind: "bootstrap_mismatch" | "live_mismatch" | "missing_meta";
+    flow:
+        | "bootstrap"
+        | "sessions"
+        | "messages"
+        | "files"
+        | "upload"
+        | "run_start"
+        | "run_stream";
+    message: string;
+    expectedTenantId?: string;
+    observedTenantId?: string;
+    storedTenantId?: string;
+    storedTenantLabel?: string;
+    requestId?: string;
+}
 
 interface WorkspaceActivityEntry {
     id: string;
@@ -177,6 +208,70 @@ function mergeGeneratedFiles(
     return Array.from(byId.values()).sort((a, b) => a.filename.localeCompare(b.filename));
 }
 
+function readLastSeenTenantRecord(): LastSeenTenantRecord | null {
+    try {
+        const raw = window.localStorage.getItem(LAST_SEEN_TENANT_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        if (!parsed || typeof parsed !== "object") return null;
+
+        if (parsed.version !== LAST_SEEN_TENANT_STORAGE_VERSION) {
+            return null;
+        }
+
+        const tenantId =
+            typeof parsed.tenantId === "string" ? parsed.tenantId.trim() : "";
+        const tenantLabel =
+            typeof parsed.tenantLabel === "string" ? parsed.tenantLabel.trim() : "";
+        const tenantSource =
+            typeof parsed.tenantSource === "string" ? parsed.tenantSource.trim() : "";
+        const seenAt =
+            typeof parsed.seenAt === "number" && Number.isFinite(parsed.seenAt)
+                ? parsed.seenAt
+                : 0;
+
+        if (!tenantId || !tenantLabel || !tenantSource || seenAt <= 0) {
+            return null;
+        }
+
+        return {
+            version: LAST_SEEN_TENANT_STORAGE_VERSION,
+            tenantId,
+            tenantLabel,
+            tenantSource,
+            seenAt,
+            requestId:
+                typeof parsed.requestId === "string" && parsed.requestId.trim()
+                    ? parsed.requestId.trim()
+                    : undefined,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function persistLastSeenTenantRecord(
+    bootstrap: WorkbenchBootstrapResponse,
+    requestId?: string,
+): void {
+    try {
+        const payload: LastSeenTenantRecord = {
+            version: LAST_SEEN_TENANT_STORAGE_VERSION,
+            tenantId: bootstrap.tenant.id,
+            tenantLabel: bootstrap.tenant.label,
+            tenantSource: bootstrap.tenant.source,
+            seenAt: Date.now(),
+            ...(requestId ? { requestId } : {}),
+        };
+        window.localStorage.setItem(
+            LAST_SEEN_TENANT_STORAGE_KEY,
+            JSON.stringify(payload),
+        );
+    } catch {
+        // Ignore localStorage write failures; runtime data remains source of truth.
+    }
+}
+
 export default function WorkbenchPage() {
     const [bootstrap, setBootstrap] =
         useState<WorkbenchBootstrapResponse | null>(null);
@@ -207,12 +302,15 @@ export default function WorkbenchPage() {
     const [runError, setRunError] = useState<string | null>(null);
     const [runRequestId, setRunRequestId] = useState<string | null>(null);
     const [streamRequestId, setStreamRequestId] = useState<string | null>(null);
+    const [tenantMismatchWarning, setTenantMismatchWarning] =
+        useState<TenantMismatchWarning | null>(null);
 
     const [generatedFiles, setGeneratedFiles] = useState<WorkspaceGeneratedFile[]>([]);
     const [activityEntries, setActivityEntries] = useState<WorkspaceActivityEntry[]>([]);
 
     const activityIdRef = useRef(0);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
+    const streamAbortRef = useRef<AbortController | null>(null);
     const { toast, showToast } = useToast();
 
     const selectedSession = useMemo(
@@ -254,19 +352,151 @@ export default function WorkbenchPage() {
         [],
     );
 
+    const mismatchActive = tenantMismatchWarning !== null;
+
+    const clearTenantScopedState = useCallback(() => {
+        streamAbortRef.current?.abort();
+        streamAbortRef.current = null;
+
+        setSessions([]);
+        setSessionsError(null);
+        setSelectedSessionId(null);
+
+        setMessages([]);
+        setMessagesError(null);
+
+        setRetainedFiles([]);
+        setFilesError(null);
+        setFilesRequestId(null);
+        setSelectedFileIds([]);
+
+        setGeneratedFiles([]);
+        setActivityEntries([]);
+
+        setSessionsLoading(false);
+        setMessagesLoading(false);
+        setFilesLoading(false);
+
+        setRunPending(false);
+        setRunRequestId(null);
+        setStreamRequestId(null);
+        setUploadPending(false);
+        setUploadRequestId(null);
+        setUploadError(null);
+        setComposer("");
+    }, []);
+
+    const triggerTenantMismatch = useCallback((warning: TenantMismatchWarning) => {
+        clearTenantScopedState();
+        setTenantMismatchWarning(warning);
+        setRunError(warning.message);
+        appendActivity("tenant", "error", warning.message, warning.requestId);
+        showToast(warning.message, "error");
+    }, [appendActivity, clearTenantScopedState, showToast]);
+
+    const ensureTenantMetaAligned = useCallback(
+        (
+            flow: TenantMismatchWarning["flow"],
+            meta: WorkbenchProxyMeta,
+        ): boolean => {
+            if (!bootstrap) return true;
+
+            const expectedTenant = bootstrap.tenant;
+            if (!meta.tenantId || !meta.tenantLabel || !meta.tenantSource) {
+                triggerTenantMismatch({
+                    kind: "missing_meta",
+                    flow,
+                    message:
+                        `Unsafe workbench response for ${flow}: tenant metadata headers were missing, so tenant-scoped state was cleared.`,
+                    expectedTenantId: expectedTenant.id,
+                    requestId: meta.requestId,
+                });
+                return false;
+            }
+
+            if (meta.tenantId !== expectedTenant.id) {
+                triggerTenantMismatch({
+                    kind: "live_mismatch",
+                    flow,
+                    message:
+                        `Tenant drift detected on ${flow}: expected ${expectedTenant.id} but response resolved ${meta.tenantId}. Tenant-scoped state was cleared.`,
+                    expectedTenantId: expectedTenant.id,
+                    observedTenantId: meta.tenantId,
+                    requestId: meta.requestId,
+                });
+                return false;
+            }
+
+            return true;
+        },
+        [bootstrap, triggerTenantMismatch],
+    );
+
     const loadBootstrap = useCallback(async () => {
         setBootstrapLoading(true);
         setBootstrapError(null);
 
         try {
             const payload = await api.getWorkbenchBootstrap();
-            setBootstrap(payload);
+            const nextBootstrap = payload.bootstrap;
+            setBootstrap(nextBootstrap);
+
+            let warning: TenantMismatchWarning | null = null;
+
+            if (!payload.tenantId || !payload.tenantLabel || !payload.tenantSource) {
+                warning = {
+                    kind: "missing_meta",
+                    flow: "bootstrap",
+                    message:
+                        "Unsafe bootstrap response: tenant metadata headers were missing. Tenant-scoped state was cleared.",
+                    requestId: payload.requestId ?? nextBootstrap.workbench.request_id,
+                    expectedTenantId: nextBootstrap.tenant.id,
+                };
+            } else if (payload.tenantId !== nextBootstrap.tenant.id) {
+                warning = {
+                    kind: "live_mismatch",
+                    flow: "bootstrap",
+                    message:
+                        `Bootstrap tenant mismatch: payload tenant ${nextBootstrap.tenant.id} disagreed with response header tenant ${payload.tenantId}. Tenant-scoped state was cleared.`,
+                    expectedTenantId: nextBootstrap.tenant.id,
+                    observedTenantId: payload.tenantId,
+                    requestId: payload.requestId ?? nextBootstrap.workbench.request_id,
+                };
+            } else {
+                const stored = readLastSeenTenantRecord();
+                if (stored && stored.tenantId !== nextBootstrap.tenant.id) {
+                    warning = {
+                        kind: "bootstrap_mismatch",
+                        flow: "bootstrap",
+                        message:
+                            `Stored tenant ${stored.tenantId} no longer matches resolved tenant ${nextBootstrap.tenant.id}. Tenant-scoped state was cleared until explicit reload.`,
+                        expectedTenantId: nextBootstrap.tenant.id,
+                        observedTenantId: nextBootstrap.tenant.id,
+                        storedTenantId: stored.tenantId,
+                        storedTenantLabel: stored.tenantLabel,
+                        requestId: payload.requestId ?? nextBootstrap.workbench.request_id,
+                    };
+                }
+            }
+
+            if (!warning || warning.kind === "bootstrap_mismatch") {
+                persistLastSeenTenantRecord(
+                    nextBootstrap,
+                    payload.requestId ?? nextBootstrap.workbench.request_id,
+                );
+            }
+
+            if (warning) {
+                triggerTenantMismatch(warning);
+            } else {
+                setTenantMismatchWarning(null);
+            }
         } catch (error) {
             setBootstrapError(formatApiError(error));
         } finally {
             setBootstrapLoading(false);
         }
-    }, []);
+    }, [triggerTenantMismatch]);
 
     const loadSessions = useCallback(async () => {
         setSessionsLoading(true);
@@ -274,6 +504,8 @@ export default function WorkbenchPage() {
 
         try {
             const payload = await api.getWorkbenchSessions(50, 0);
+            if (!ensureTenantMetaAligned("sessions", payload)) return;
+
             setSessions(payload.sessions);
             setSelectedSessionId((current) => {
                 if (current && payload.sessions.some((session) => session.id === current)) {
@@ -290,7 +522,7 @@ export default function WorkbenchPage() {
         } finally {
             setSessionsLoading(false);
         }
-    }, [appendActivity]);
+    }, [appendActivity, ensureTenantMetaAligned]);
 
     const loadMessages = useCallback(async (sessionId: string) => {
         setMessagesLoading(true);
@@ -298,6 +530,8 @@ export default function WorkbenchPage() {
 
         try {
             const payload = await api.getWorkbenchSessionMessages(sessionId);
+            if (!ensureTenantMetaAligned("messages", payload)) return;
+
             setMessages(payload.messages);
         } catch (error) {
             const detail = formatApiError(error);
@@ -307,7 +541,7 @@ export default function WorkbenchPage() {
         } finally {
             setMessagesLoading(false);
         }
-    }, [appendActivity]);
+    }, [appendActivity, ensureTenantMetaAligned]);
 
     const loadFiles = useCallback(async () => {
         setFilesLoading(true);
@@ -315,6 +549,8 @@ export default function WorkbenchPage() {
 
         try {
             const payload = await api.getWorkbenchFiles();
+            if (!ensureTenantMetaAligned("files", payload)) return;
+
             setFilesRequestId(payload.requestId ?? null);
             setRetainedFiles(payload.files);
             setSelectedFileIds((current) => {
@@ -331,26 +567,26 @@ export default function WorkbenchPage() {
         } finally {
             setFilesLoading(false);
         }
-    }, [appendActivity, showToast]);
+    }, [appendActivity, ensureTenantMetaAligned, showToast]);
 
     useEffect(() => {
         void loadBootstrap();
     }, [loadBootstrap]);
 
     useEffect(() => {
-        if (!bootstrap) return;
+        if (!bootstrap || mismatchActive) return;
         void loadSessions();
         void loadFiles();
-    }, [bootstrap, loadFiles, loadSessions]);
+    }, [bootstrap, loadFiles, loadSessions, mismatchActive]);
 
     useEffect(() => {
-        if (!selectedSessionId) {
+        if (!selectedSessionId || mismatchActive) {
             setMessages([]);
             setMessagesError(null);
             return;
         }
         void loadMessages(selectedSessionId);
-    }, [selectedSessionId, loadMessages]);
+    }, [mismatchActive, selectedSessionId, loadMessages]);
 
     useEffect(() => {
         if (selectedFileIds.length === 0) return;
@@ -379,7 +615,13 @@ export default function WorkbenchPage() {
         setGeneratedFiles((current) => mergeGeneratedFiles(current, derived));
     }, [retainedFiles]);
 
+    useEffect(() => () => {
+        streamAbortRef.current?.abort();
+    }, []);
+
     const toggleFileSelection = (fileId: string) => {
+        if (mismatchActive) return;
+
         setSelectedFileIds((current) => {
             if (current.includes(fileId)) {
                 return current.filter((existing) => existing !== fileId);
@@ -391,7 +633,7 @@ export default function WorkbenchPage() {
     const handleUploadInputChange = async (event: ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0];
         event.target.value = "";
-        if (!file || runPending) return;
+        if (!file || runPending || mismatchActive) return;
 
         setUploadPending(true);
         setUploadError(null);
@@ -402,6 +644,8 @@ export default function WorkbenchPage() {
                 purpose: "uploads",
                 source: "upload",
             });
+
+            if (!ensureTenantMetaAligned("upload", uploaded)) return;
 
             setUploadRequestId(uploaded.requestId ?? null);
             setRetainedFiles((current) => {
@@ -434,8 +678,12 @@ export default function WorkbenchPage() {
     const handleDownloadFile = useCallback(async (
         file: { id: string; filename: string },
     ) => {
+        if (mismatchActive) return;
+
         try {
             const downloaded = await downloadWorkbenchFile(file.id);
+            if (!ensureTenantMetaAligned("files", downloaded)) return;
+
             const objectUrl = window.URL.createObjectURL(downloaded.blob);
             const link = document.createElement("a");
             link.href = objectUrl;
@@ -452,7 +700,7 @@ export default function WorkbenchPage() {
             appendActivity("file", "error", `Download failed: ${detail}`);
             showToast(`Download failed: ${detail}`, "error");
         }
-    }, [appendActivity, showToast]);
+    }, [appendActivity, ensureTenantMetaAligned, mismatchActive, showToast]);
 
     const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
@@ -464,7 +712,7 @@ export default function WorkbenchPage() {
             return;
         }
 
-        if (runPending || bootstrapLoading || !bootstrap) return;
+        if (runPending || bootstrapLoading || !bootstrap || mismatchActive) return;
 
         setComposer("");
         setRunPending(true);
@@ -496,6 +744,10 @@ export default function WorkbenchPage() {
             const runStart = await api.createWorkbenchRun(payload);
             setRunRequestId(runStart.requestId ?? null);
 
+            if (!ensureTenantMetaAligned("run_start", runStart)) {
+                return;
+            }
+
             appendActivity(
                 "run",
                 "info",
@@ -506,6 +758,9 @@ export default function WorkbenchPage() {
             if (runStart.sessionId && runStart.sessionId !== selectedSessionId) {
                 setSelectedSessionId(runStart.sessionId);
             }
+
+            const streamAbortController = new AbortController();
+            streamAbortRef.current = streamAbortController;
 
             const streamMeta = await api.streamWorkbenchRunEvents(
                 runStart.runId,
@@ -570,9 +825,15 @@ export default function WorkbenchPage() {
                             break;
                     }
                 },
+                streamAbortController.signal,
             );
 
+            streamAbortRef.current = null;
             setStreamRequestId(streamMeta.requestId ?? null);
+
+            if (!ensureTenantMetaAligned("run_stream", streamMeta)) {
+                return;
+            }
 
             const nextSessionId =
                 streamMeta.sessionId ?? runStart.sessionId ?? baseSessionId ?? null;
@@ -583,6 +844,11 @@ export default function WorkbenchPage() {
                 await loadMessages(nextSessionId);
             }
         } catch (error) {
+            if (error instanceof DOMException && error.name === "AbortError") {
+                appendActivity("stream", "info", "Run stream aborted due to tenant safety guard.");
+                return;
+            }
+
             const detail = formatApiError(error);
             setRunError(detail);
             appendActivity("run", "error", `Run error: ${detail}`);
@@ -603,9 +869,17 @@ export default function WorkbenchPage() {
             });
             showToast(`Run failed: ${detail}`, "error");
         } finally {
+            streamAbortRef.current = null;
             setRunPending(false);
         }
     };
+
+    const handleMismatchRecovery = useCallback(async () => {
+        clearTenantScopedState();
+        setRunError(null);
+        setTenantMismatchWarning(null);
+        await loadBootstrap();
+    }, [clearTenantScopedState, loadBootstrap]);
 
     if (bootstrapLoading) {
         return (
@@ -670,6 +944,52 @@ export default function WorkbenchPage() {
                             <strong>Proxy/stream error:</strong> {runError}
                         </div>
                     )}
+
+                    {tenantMismatchWarning && (
+                        <div className="mt-3 border border-warning/40 bg-warning/[0.08] p-3 text-xs text-warning">
+                            <div className="flex items-center gap-2 text-sm font-semibold">
+                                <AlertTriangle className="h-4 w-4" />
+                                Tenant safety lock active
+                            </div>
+                            <p className="mt-2 text-[11px] leading-relaxed">
+                                {tenantMismatchWarning.message}
+                            </p>
+                            <p className="mt-2 font-mono-ui text-[10px] text-warning/90">
+                                flow={tenantMismatchWarning.flow}
+                                {tenantMismatchWarning.expectedTenantId
+                                    ? ` · expected=${tenantMismatchWarning.expectedTenantId}`
+                                    : ""}
+                                {tenantMismatchWarning.observedTenantId
+                                    ? ` · observed=${tenantMismatchWarning.observedTenantId}`
+                                    : ""}
+                                {tenantMismatchWarning.storedTenantId
+                                    ? ` · stored=${tenantMismatchWarning.storedTenantId}`
+                                    : ""}
+                                {tenantMismatchWarning.requestId
+                                    ? ` · request_id=${tenantMismatchWarning.requestId}`
+                                    : ""}
+                            </p>
+                            {tenantMismatchWarning.storedTenantLabel && (
+                                <p className="mt-1 text-[10px] text-warning/90">
+                                    previous_label={tenantMismatchWarning.storedTenantLabel}
+                                </p>
+                            )}
+                            <div className="mt-3">
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => void handleMismatchRecovery()}
+                                    disabled={bootstrapLoading}
+                                    className="gap-2"
+                                >
+                                    <RefreshCw
+                                        className={`h-3.5 w-3.5 ${bootstrapLoading ? "animate-spin" : ""}`}
+                                    />
+                                    Reload tenant context
+                                </Button>
+                            </div>
+                        </div>
+                    )}
                 </section>
 
                 <section className="grid grid-cols-1 gap-4 xl:grid-cols-[290px_minmax(0,1fr)_340px]">
@@ -684,7 +1004,7 @@ export default function WorkbenchPage() {
                                 size="icon"
                                 className="h-7 w-7"
                                 onClick={() => void loadSessions()}
-                                disabled={sessionsLoading}
+                                disabled={sessionsLoading || mismatchActive}
                                 aria-label="Refresh sessions"
                             >
                                 <RefreshCw
@@ -708,6 +1028,7 @@ export default function WorkbenchPage() {
                                         key={session.id}
                                         type="button"
                                         onClick={() => setSelectedSessionId(session.id)}
+                                        disabled={mismatchActive}
                                         className={`w-full border p-2 text-left transition-colors ${active
                                                 ? "border-primary/40 bg-primary/[0.08]"
                                                 : "border-border hover:bg-secondary/30"
@@ -770,6 +1091,7 @@ export default function WorkbenchPage() {
                                         className="inline-flex items-center gap-1 border border-primary/40 bg-primary/[0.08] px-2 py-1 text-primary"
                                         onClick={() => toggleFileSelection(file.id)}
                                         title="Remove attachment"
+                                        disabled={mismatchActive}
                                     >
                                         <Paperclip className="h-3 w-3" />
                                         {file.filename}
@@ -782,20 +1104,22 @@ export default function WorkbenchPage() {
                             <textarea
                                 value={composer}
                                 onChange={(e) => setComposer(e.target.value)}
-                                disabled={runPending}
+                                disabled={runPending || mismatchActive}
                                 rows={4}
                                 placeholder="Type your prompt for this tenant-scoped workbench..."
                                 className="flex min-h-[100px] w-full border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                             />
                             <div className="flex items-center justify-between gap-2">
                                 <span className="text-[11px] text-muted-foreground">
-                                    {selectedFileIds.length > 0
-                                        ? `${selectedFileIds.length} retained file(s) attached`
-                                        : "Text-only run"}
+                                    {mismatchActive
+                                        ? "Tenant safety lock active — reload context to continue."
+                                        : selectedFileIds.length > 0
+                                            ? `${selectedFileIds.length} retained file(s) attached`
+                                            : "Text-only run"}
                                 </span>
                                 <Button
                                     type="submit"
-                                    disabled={runPending || !composer.trim()}
+                                    disabled={runPending || mismatchActive || !composer.trim()}
                                     className="gap-2"
                                 >
                                     {runPending ? (
@@ -818,7 +1142,7 @@ export default function WorkbenchPage() {
                                     size="icon"
                                     className="h-7 w-7"
                                     onClick={() => void loadFiles()}
-                                    disabled={filesLoading || runPending}
+                                    disabled={filesLoading || runPending || mismatchActive}
                                     aria-label="Refresh files"
                                 >
                                     <RefreshCw className={`h-3.5 w-3.5 ${filesLoading ? "animate-spin" : ""}`} />
@@ -827,7 +1151,7 @@ export default function WorkbenchPage() {
                                     variant="outline"
                                     size="sm"
                                     className="h-7 gap-1 text-[11px]"
-                                    disabled={uploadPending || runPending}
+                                    disabled={uploadPending || runPending || mismatchActive}
                                     onClick={() => fileInputRef.current?.click()}
                                 >
                                     {uploadPending ? (
@@ -877,7 +1201,7 @@ export default function WorkbenchPage() {
                                                 className="mt-0.5"
                                                 checked={checked}
                                                 onChange={() => toggleFileSelection(file.id)}
-                                                disabled={runPending}
+                                                disabled={runPending || mismatchActive}
                                             />
                                             <div className="min-w-0 flex-1">
                                                 <p className="truncate text-xs font-medium">{file.filename}</p>
@@ -891,6 +1215,7 @@ export default function WorkbenchPage() {
                                                 onClick={() => void handleDownloadFile(file)}
                                                 className="inline-flex h-6 w-6 items-center justify-center border border-border/80 text-muted-foreground hover:text-foreground"
                                                 title="Download file"
+                                                disabled={mismatchActive}
                                             >
                                                 <FileDown className="h-3.5 w-3.5" />
                                             </button>
@@ -923,6 +1248,7 @@ export default function WorkbenchPage() {
                                             type="button"
                                             className="inline-flex items-center gap-1 border border-primary/40 bg-primary/[0.08] px-2 py-1 text-[10px] text-primary"
                                             onClick={() => toggleFileSelection(file.id)}
+                                            disabled={mismatchActive}
                                         >
                                             {file.filename}
                                         </button>
@@ -962,6 +1288,7 @@ export default function WorkbenchPage() {
                                                 })}
                                                 className="inline-flex h-6 w-6 items-center justify-center border border-border/80 text-muted-foreground hover:text-foreground"
                                                 title="Download generated file"
+                                                disabled={mismatchActive}
                                             >
                                                 <FileDown className="h-3.5 w-3.5" />
                                             </button>

@@ -1,0 +1,272 @@
+[
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/",
+    "status": 200,
+    "resourceType": "document",
+    "timestamp": 1776758956340,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-3pwHx_Bs.css",
+    "status": 200,
+    "resourceType": "stylesheet",
+    "timestamp": 1776758956343,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-Cba9HW7v.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776758956353,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/ds-assets/filler-bg0.jpg",
+    "status": 200,
+    "resourceType": "image",
+    "timestamp": 1776758956643,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Collapse-Bold.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776758956643,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Mondwest-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776758956684,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/plugins",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776758956684,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/themes",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776758956684,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/bootstrap",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776758956684,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776758956691,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/dashboard-plugins/example/dist/index.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776758956696,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776758956725,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/RulesCompressed-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776758956799,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/",
+    "status": 200,
+    "resourceType": "document",
+    "timestamp": 1776758989504,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-Cba9HW7v.js",
+    "status": 304,
+    "resourceType": "script",
+    "timestamp": 1776758989504,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-3pwHx_Bs.css",
+    "status": 304,
+    "resourceType": "stylesheet",
+    "timestamp": 1776758989504,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Collapse-Bold.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776758989507,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/RulesCompressed-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776758989507,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Mondwest-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776758989507,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/bootstrap",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776758989617,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/themes",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776758989617,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/plugins",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776758989617,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/ds-assets/filler-bg0.jpg",
+    "status": 200,
+    "resourceType": "image",
+    "timestamp": 1776758989633,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/dashboard-plugins/example/dist/index.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776758989659,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Collapse-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776759018384,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/bootstrap",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759033477,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759033477,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759033490,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759033495,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759033505,
+    "failed": false,
+    "pageId": 1
+  }
+]

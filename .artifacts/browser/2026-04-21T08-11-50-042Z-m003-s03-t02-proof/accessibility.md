@@ -1,0 +1,52 @@
+- banner:
+  - text: Hermes Agent
+  - link "Workbench":
+    - /url: /
+  - link "Status":
+    - /url: /status
+  - link "Sessions":
+    - /url: /sessions
+  - link "Analytics":
+    - /url: /analytics
+  - link "Logs":
+    - /url: /logs
+  - link "Cron":
+    - /url: /cron
+  - link "Skills":
+    - /url: /skills
+  - link "Example":
+    - /url: /example
+  - link "Config":
+    - /url: /config
+  - link "Keys":
+    - /url: /env
+  - button "Switch theme": Hermes Teal
+  - button "Switch to Chinese": 🇬🇧 EN
+  - text: Web UI
+- main:
+  - heading "Workbench" [level=2]
+  - text: "tenant: Cinder Falcon 64A8 resolved source: cookie"
+  - paragraph: Tenant ID cinder-falcon-64a8 · bootstrap_request_id=wb_72ad78f2c851
+  - complementary:
+    - text: Sessions
+    - button "Refresh sessions"
+    - paragraph: No sessions yet for this tenant.
+  - text: New tenant-scoped conversation
+  - paragraph: Send a prompt to start this tenant session.
+  - textbox "Type your prompt for this tenant-scoped workbench..."
+  - text: Text-only run
+  - button "Send" [disabled]
+  - complementary:
+    - text: Workspace Files
+    - button "Refresh files"
+    - button "Upload"
+    - text: files_request_id=wb_597fa03ed4d0 No retained files yet for this tenant. Attached to next run (0)
+    - paragraph: Select retained files to attach.
+    - text: Generated outputs (0)
+    - paragraph:
+      - text: Generated files from
+      - code: run.completed.files
+      - text: will appear here.
+    - text: Activity (0)
+    - paragraph: Stream/tool activity will appear here.
+- contentinfo: Hermes Agent Nous Research

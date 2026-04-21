@@ -1,0 +1,26 @@
+{
+  "entries": [
+    {
+      "id": 1,
+      "tool": "browser_navigate",
+      "status": "success",
+      "durationMs": 1280,
+      "beforeUrl": "about:blank",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#1 | browser_navigate | success | 1280ms | screenshot=true, url=\"http://127.0.0.1:9119/\" | URL changed to http://127.0.0.1:9119/; title changed to Hermes Agent - Dashboard; landmarks 0→9; buttons 0→6"
+    },
+    {
+      "id": 2,
+      "tool": "browser_click",
+      "status": "success",
+      "durationMs": 193,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#2 | browser_click | success | 193ms | selector=\"button.inline-flex.items-center\" | PASS (target_state_changed) | focus changed; buttons 7→13; visible text changed"
+    }
+  ],
+  "retained": 2,
+  "totalRecorded": 2,
+  "bounded": false,
+  "summary": "Timeline: 2 browser actions recorded."
+}

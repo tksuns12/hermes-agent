@@ -1,0 +1,52 @@
+{
+  "counts": {
+    "pages": 1,
+    "actions": {
+      "total": 0,
+      "retained": 0,
+      "success": 0,
+      "error": 0,
+      "running": 0
+    },
+    "waits": {
+      "total": 0,
+      "success": 0,
+      "error": 0,
+      "running": 0
+    },
+    "assertions": {
+      "total": 0,
+      "passed": 0,
+      "failed": 0,
+      "running": 0
+    },
+    "consoleErrors": 0,
+    "failedRequests": 0,
+    "dialogs": 0
+  },
+  "activePage": {
+    "id": 1,
+    "title": "Hermes Agent - Dashboard",
+    "url": "http://127.0.0.1:9119/"
+  },
+  "caveats": [
+    "bounded network history may hide older requests."
+  ],
+  "failureHypothesis": {
+    "hasFailures": false,
+    "categories": [],
+    "summary": "No recent failure signals detected.",
+    "signals": []
+  },
+  "summary": "Session: 1 page, 0 actions, 0 waits, 0 asserts. bounded network history may hide older requests.",
+  "trace": null,
+  "har": {
+    "enabled": true,
+    "configuredAtContextCreation": true,
+    "path": "/home/tksuns/workspace/hs_ai_platform/hermes-agent/.artifacts/browser/2026-04-21T08-09-15-910Z-session/session.har",
+    "exportCount": 0,
+    "lastExportedPath": null,
+    "lastExportedAt": null
+  },
+  "sessionArtifactDir": "/home/tksuns/workspace/hs_ai_platform/hermes-agent/.artifacts/browser/2026-04-21T08-09-15-910Z-session"
+}

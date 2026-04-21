@@ -66,10 +66,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+function parseBooleanHeader(value: string | null): boolean | undefined {
+    if (value == null) return undefined;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+    return undefined;
+}
+
 function getWorkbenchProxyMeta(res: Response): WorkbenchProxyMeta {
     return {
         requestId: res.headers.get("X-Workbench-Request-Id") ?? undefined,
         sessionId: res.headers.get("X-Hermes-Session-Id") ?? undefined,
+        tenantId: res.headers.get("X-Hermes-Tenant-Id") ?? undefined,
+        tenantLabel: res.headers.get("X-Hermes-Tenant-Label") ?? undefined,
+        tenantSource: res.headers.get("X-Hermes-Tenant-Source") ?? undefined,
+        tenantFallback: parseBooleanHeader(res.headers.get("X-Hermes-Tenant-Fallback")),
+        tenantFallbackReason:
+            res.headers.get("X-Hermes-Tenant-Fallback-Reason") ?? undefined,
     };
 }
 
@@ -153,12 +167,9 @@ export function getWorkbenchFileDownloadUrl(fileId: string): string {
     return `/api/workbench/files/${encodeURIComponent(fileId)}/content`;
 }
 
-export async function downloadWorkbenchFile(id: string): Promise<{
-    blob: Blob;
-    requestId?: string;
-    sessionId?: string;
-    contentType?: string;
-}> {
+export async function downloadWorkbenchFile(id: string): Promise<
+    { blob: Blob; contentType?: string } & WorkbenchProxyMeta
+> {
     const headers = withSessionAuthHeaders();
     const res = await fetch(`${BASE}${getWorkbenchFileDownloadUrl(id)}`, {
         method: "GET",
@@ -304,16 +315,88 @@ export const api = {
         fetchJSON<SessionSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(q)}`),
 
     // Tenant-aware workbench
-    getWorkbenchBootstrap: () =>
-        fetchJSON<WorkbenchBootstrapResponse>("/api/workbench/bootstrap"),
-    getWorkbenchSessions: (limit = 50, offset = 0) =>
-        fetchJSON<PaginatedSessions>(
-            `/api/workbench/sessions?limit=${limit}&offset=${offset}`,
-        ),
-    getWorkbenchSessionMessages: (id: string) =>
-        fetchJSON<SessionMessagesResponse>(
-            `/api/workbench/sessions/${encodeURIComponent(id)}/messages`,
-        ),
+    getWorkbenchBootstrap: async () => {
+        const headers = withSessionAuthHeaders();
+        const res = await fetch(`${BASE}/api/workbench/bootstrap`, {
+            method: "GET",
+            headers,
+        });
+
+        const responseText = await res.text();
+        const parsed = responseText ? safeJSONParse(responseText) : null;
+
+        if (!res.ok) {
+            throw buildWorkbenchHttpError(res, responseText, "Failed to load workbench bootstrap");
+        }
+
+        if (!isRecord(parsed)) {
+            throw new Error("Malformed workbench bootstrap payload: expected object");
+        }
+
+        const tenant = parsed.tenant;
+        const workbench = parsed.workbench;
+
+        if (!isRecord(tenant) || !isRecord(workbench)) {
+            throw new Error("Malformed workbench bootstrap payload: missing tenant/workbench objects");
+        }
+
+        return {
+            bootstrap: parsed as unknown as WorkbenchBootstrapResponse,
+            ...getWorkbenchProxyMeta(res),
+        } satisfies WorkbenchBootstrapResult;
+    },
+    getWorkbenchSessions: async (limit = 50, offset = 0) => {
+        const headers = withSessionAuthHeaders();
+        const res = await fetch(
+            `${BASE}/api/workbench/sessions?limit=${limit}&offset=${offset}`,
+            {
+                method: "GET",
+                headers,
+            },
+        );
+
+        const responseText = await res.text();
+        const parsed = responseText ? safeJSONParse(responseText) : null;
+
+        if (!res.ok) {
+            throw buildWorkbenchHttpError(res, responseText, "Failed to load workbench sessions");
+        }
+
+        if (!isRecord(parsed) || !Array.isArray(parsed.sessions)) {
+            throw new Error("Malformed workbench sessions payload: missing sessions array");
+        }
+
+        return {
+            ...(parsed as unknown as PaginatedSessions),
+            ...getWorkbenchProxyMeta(res),
+        } satisfies WorkbenchSessionsResult;
+    },
+    getWorkbenchSessionMessages: async (id: string) => {
+        const headers = withSessionAuthHeaders();
+        const res = await fetch(
+            `${BASE}/api/workbench/sessions/${encodeURIComponent(id)}/messages`,
+            {
+                method: "GET",
+                headers,
+            },
+        );
+
+        const responseText = await res.text();
+        const parsed = responseText ? safeJSONParse(responseText) : null;
+
+        if (!res.ok) {
+            throw buildWorkbenchHttpError(res, responseText, "Failed to load workbench messages");
+        }
+
+        if (!isRecord(parsed) || !Array.isArray(parsed.messages)) {
+            throw new Error("Malformed workbench messages payload: missing messages array");
+        }
+
+        return {
+            ...(parsed as unknown as SessionMessagesResponse),
+            ...getWorkbenchProxyMeta(res),
+        } satisfies WorkbenchSessionMessagesResult;
+    },
     getWorkbenchFiles: async () => {
         const headers = withSessionAuthHeaders();
         const res = await fetch(`${BASE}/api/workbench/files`, {
@@ -427,9 +510,8 @@ export const api = {
                 typeof parsed.status === "string" && parsed.status
                     ? parsed.status
                     : "started",
-            requestId: res.headers.get("X-Workbench-Request-Id") ?? undefined,
             upstreamRunId: res.headers.get("X-Upstream-Run-Id") ?? undefined,
-            sessionId: res.headers.get("X-Hermes-Session-Id") ?? undefined,
+            ...getWorkbenchProxyMeta(res),
         } satisfies WorkbenchRunStartResult;
     },
     streamWorkbenchRunEvents: async (
@@ -485,8 +567,7 @@ export const api = {
         }
 
         return {
-            requestId: res.headers.get("X-Workbench-Request-Id") ?? undefined,
-            sessionId: res.headers.get("X-Hermes-Session-Id") ?? undefined,
+            ...getWorkbenchProxyMeta(res),
         };
     },
 
@@ -762,7 +843,22 @@ export interface WorkbenchBootstrapResponse {
 export interface WorkbenchProxyMeta {
     requestId?: string;
     sessionId?: string;
+    tenantId?: string;
+    tenantLabel?: string;
+    tenantSource?: string;
+    tenantFallback?: boolean;
+    tenantFallbackReason?: string;
 }
+
+export interface WorkbenchBootstrapResult extends WorkbenchProxyMeta {
+    bootstrap: WorkbenchBootstrapResponse;
+}
+
+export interface WorkbenchSessionsResult
+    extends PaginatedSessions, WorkbenchProxyMeta {}
+
+export interface WorkbenchSessionMessagesResult
+    extends SessionMessagesResponse, WorkbenchProxyMeta {}
 
 export interface WorkbenchFileMetadata {
     id: string;
@@ -809,12 +905,10 @@ export interface WorkbenchRunCreateResponse {
     status: string;
 }
 
-export interface WorkbenchRunStartResult {
+export interface WorkbenchRunStartResult extends WorkbenchProxyMeta {
     runId: string;
     status: string;
-    requestId?: string;
     upstreamRunId?: string;
-    sessionId?: string;
 }
 
 export interface WorkbenchRunOutputFile {
