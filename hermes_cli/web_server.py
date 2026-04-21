@@ -519,16 +519,18 @@ def _normalize_gateway_base_url(raw_url: str | None) -> str:
 
 
 def _resolve_workbench_upstream() -> tuple[str, str]:
-    """Resolve upstream API server base URL + key for same-origin proxying."""
+    """Resolve upstream API server base URL + key for same-origin proxying.
+
+    Note: ``GATEWAY_HEALTH_URL`` is intentionally excluded here. It exists for
+    dashboard liveness probes and may point at the dashboard HTTP server rather
+    than the API server workbench proxy routes need.
+    """
     api_key = (_WORKBENCH_UPSTREAM_KEY or "").strip()
     if not api_key:
         api_key = os.getenv("API_SERVER_KEY", "").strip() or os.getenv("GATEWAY_PROXY_KEY", "").strip()
 
     if _WORKBENCH_UPSTREAM_URL:
         return _normalize_gateway_base_url(_WORKBENCH_UPSTREAM_URL), api_key
-
-    if _GATEWAY_HEALTH_URL:
-        return _normalize_gateway_base_url(_GATEWAY_HEALTH_URL), api_key
 
     host = os.getenv("API_SERVER_HOST", "127.0.0.1").strip() or "127.0.0.1"
     port = os.getenv("API_SERVER_PORT", "8642").strip() or "8642"

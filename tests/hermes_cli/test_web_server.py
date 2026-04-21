@@ -777,6 +777,75 @@ class TestWebServerEndpoints:
         assert captured_calls[1]["query"]["user_id"] == [tenant_id]
         assert captured_calls[1]["request_id"]
 
+    def test_workbench_files_list_ignores_gateway_health_url_as_upstream(self, monkeypatch):
+        import gateway.config as gateway_config
+        import hermes_cli.web_server as ws
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant = bootstrap.json()["tenant"]
+        tenant_id = tenant["id"]
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        class _Config:
+            platforms = {}
+
+        captured_urls = []
+
+        class _FakeJSONResponse:
+            def __init__(self, status, payload, headers=None):
+                self.status = status
+                self._payload = json.dumps(payload).encode("utf-8")
+                self.headers = headers or {}
+
+            def read(self):
+                return self._payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _mock_urlopen(req, timeout=0):
+            captured_urls.append(req.full_url)
+            return _FakeJSONResponse(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "file_demo_123",
+                            "object": "file",
+                            "filename": "demo.txt",
+                            "bytes": 5,
+                            "download_url": "/v1/files/file_demo_123/content",
+                        }
+                    ],
+                },
+            )
+
+        monkeypatch.setattr(ws, "_WORKBENCH_UPSTREAM_URL", "")
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://127.0.0.1:9119/health")
+        monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: _Config())
+        monkeypatch.setattr(ws.urllib.request, "urlopen", _mock_urlopen)
+        monkeypatch.setenv("API_SERVER_HOST", "127.0.0.1")
+        monkeypatch.setenv("API_SERVER_PORT", "8642")
+
+        listed = self.client.get(
+            "/api/workbench/files",
+            cookies={"hermes_browser_id": browser_id},
+        )
+
+        assert listed.status_code == 200
+        _assert_workbench_tenant_headers(
+            listed,
+            tenant_id=tenant_id,
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
+        assert captured_urls == [f"http://127.0.0.1:8642/v1/files?user_id={tenant_id}"]
+
     def test_workbench_files_metadata_and_content_proxy(self, monkeypatch):
         import hermes_cli.web_server as ws
 
@@ -1075,6 +1144,44 @@ class TestWebServerEndpoints:
         assert resp.status_code in (200, 404)
         if resp.status_code == 200:
             assert "FastAPI" not in resp.text  # Should not serve the actual source
+
+
+# ---------------------------------------------------------------------------
+# Workbench upstream resolution tests
+# ---------------------------------------------------------------------------
+
+
+class TestResolveWorkbenchUpstream:
+    def test_ignores_gateway_health_url_for_workbench_proxy(self, monkeypatch):
+        import gateway.config as gateway_config
+        import hermes_cli.web_server as ws
+
+        class _Config:
+            platforms = {}
+
+        monkeypatch.setattr(ws, "_WORKBENCH_UPSTREAM_URL", "")
+        monkeypatch.setattr(ws, "_WORKBENCH_UPSTREAM_KEY", "")
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://127.0.0.1:9119/health")
+        monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: _Config())
+        monkeypatch.setenv("API_SERVER_HOST", "127.0.0.1")
+        monkeypatch.setenv("API_SERVER_PORT", "8642")
+
+        upstream, api_key = ws._resolve_workbench_upstream()
+
+        assert upstream == "http://127.0.0.1:8642"
+        assert api_key == ""
+
+    def test_prefers_explicit_workbench_upstream_url(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_WORKBENCH_UPSTREAM_URL", "http://remote-gateway:9999/health")
+        monkeypatch.setattr(ws, "_WORKBENCH_UPSTREAM_KEY", "test-key")
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", "http://127.0.0.1:9119/health")
+
+        upstream, api_key = ws._resolve_workbench_upstream()
+
+        assert upstream == "http://remote-gateway:9999"
+        assert api_key == "test-key"
 
 
 # ---------------------------------------------------------------------------
