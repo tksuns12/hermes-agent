@@ -66,7 +66,7 @@ function SnippetHighlight({ snippet }: { snippet: string }) {
   );
 }
 
-function ToolCallBlock({
+export function ToolCallBlock({
   toolCall,
 }: {
   toolCall: { id: string; function: { name: string; arguments: string } };
@@ -108,7 +108,7 @@ function ToolCallBlock({
   );
 }
 
-function MessageBubble({
+export function MessageBubble({
   msg,
   highlight,
 }: {
@@ -198,14 +198,25 @@ function MessageBubble({
 }
 
 /** Message list with auto-scroll to first search hit. */
-function MessageList({
+export function MessageList({
   messages,
   highlight,
+  autoScrollToBottom = false,
 }: {
   messages: SessionMessage[];
   highlight?: string;
+  autoScrollToBottom?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (autoScrollToBottom && containerRef.current) {
+      containerRef.current.scrollTo({
+        top: containerRef.current.scrollHeight,
+        behavior: "smooth",
+      });
+    }
+  }, [messages, autoScrollToBottom]);
 
   useEffect(() => {
     if (!highlight || !containerRef.current) return;

@@ -9,13 +9,17 @@ declare global {
 }
 let _sessionToken: string | null = null;
 
-export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
-  // Inject the session token into all /api/ requests.
+function withSessionAuthHeaders(init?: RequestInit): Headers {
   const headers = new Headers(init?.headers);
   const token = window.__HERMES_SESSION_TOKEN__;
   if (token && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${token}`);
   }
+  return headers;
+}
+
+export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
+  const headers = withSessionAuthHeaders(init);
   const res = await fetch(`${BASE}${url}`, { ...init, headers });
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
@@ -32,6 +36,30 @@ async function getSessionToken(): Promise<string> {
     return _sessionToken;
   }
   throw new Error("Session token not available — page must be served by the Hermes dashboard server");
+}
+
+function safeJSONParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function parseWorkbenchSSEChunk(chunk: string): WorkbenchRunEvent | null {
+  const lines = chunk
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const dataLines = lines
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim());
+
+  if (dataLines.length === 0) return null;
+  const payload = dataLines.join("\n");
+  const parsed = safeJSONParse(payload);
+  if (!parsed || typeof parsed !== "object") return null;
+  return parsed as WorkbenchRunEvent;
 }
 
 export const api = {
@@ -126,6 +154,101 @@ export const api = {
   // Session search (FTS5)
   searchSessions: (q: string) =>
     fetchJSON<SessionSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(q)}`),
+
+  // Tenant-aware workbench
+  getWorkbenchBootstrap: () =>
+    fetchJSON<WorkbenchBootstrapResponse>("/api/workbench/bootstrap"),
+  getWorkbenchSessions: (limit = 50, offset = 0) =>
+    fetchJSON<PaginatedSessions>(
+      `/api/workbench/sessions?limit=${limit}&offset=${offset}`,
+    ),
+  getWorkbenchSessionMessages: (id: string) =>
+    fetchJSON<SessionMessagesResponse>(
+      `/api/workbench/sessions/${encodeURIComponent(id)}/messages`,
+    ),
+  createWorkbenchRun: async (payload: WorkbenchRunCreatePayload) => {
+    const headers = withSessionAuthHeaders({
+      headers: { "Content-Type": "application/json" },
+    });
+    const res = await fetch(`${BASE}/api/workbench/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+
+    const responseText = await res.text();
+    const parsed = responseText ? safeJSONParse(responseText) : null;
+
+    if (!res.ok) {
+      throw new Error(
+        `${res.status}: ${responseText || res.statusText || "Workbench run start failed"}`,
+      );
+    }
+
+    const data = (parsed ?? {}) as Partial<WorkbenchRunCreateResponse>;
+    return {
+      runId: data.run_id ?? "",
+      status: data.status ?? "started",
+      requestId: res.headers.get("X-Workbench-Request-Id") ?? undefined,
+      upstreamRunId: res.headers.get("X-Upstream-Run-Id") ?? undefined,
+      sessionId: res.headers.get("X-Hermes-Session-Id") ?? undefined,
+    } satisfies WorkbenchRunStartResult;
+  },
+  streamWorkbenchRunEvents: async (
+    runId: string,
+    onEvent: (event: WorkbenchRunEvent) => void,
+    signal?: AbortSignal,
+  ) => {
+    const headers = withSessionAuthHeaders();
+    const res = await fetch(
+      `${BASE}/api/workbench/runs/${encodeURIComponent(runId)}/events`,
+      {
+        method: "GET",
+        headers,
+        signal,
+      },
+    );
+
+    if (!res.ok) {
+      const responseText = await res.text().catch(() => res.statusText);
+      throw new Error(
+        `${res.status}: ${responseText || res.statusText || "Workbench event stream failed"}`,
+      );
+    }
+
+    const reader = res.body?.getReader();
+    if (!reader) {
+      throw new Error("Workbench event stream did not include a readable body");
+    }
+
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let separatorIndex = buffer.indexOf("\n\n");
+      while (separatorIndex >= 0) {
+        const chunk = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+        const event = parseWorkbenchSSEChunk(chunk);
+        if (event) onEvent(event);
+        separatorIndex = buffer.indexOf("\n\n");
+      }
+    }
+
+    if (buffer.trim()) {
+      const event = parseWorkbenchSSEChunk(buffer);
+      if (event) onEvent(event);
+    }
+
+    return {
+      requestId: res.headers.get("X-Workbench-Request-Id") ?? undefined,
+      sessionId: res.headers.get("X-Hermes-Session-Id") ?? undefined,
+    };
+  },
 
   // OAuth provider management
   getOAuthProviders: () =>
@@ -375,6 +498,65 @@ export interface SessionSearchResult {
 
 export interface SessionSearchResponse {
   results: SessionSearchResult[];
+}
+
+export interface WorkbenchBootstrapResponse {
+  tenant: {
+    id: string;
+    label: string;
+    source: string;
+    fallback: boolean;
+    fallback_reason: string | null;
+    identity_hint: string;
+  };
+  workbench: {
+    context_version: number;
+    tenant_id: string;
+    tenant_label: string;
+    request_id: string;
+    ignored_browser_user_id: boolean;
+    ignored_browser_user_id_sources: string[];
+  };
+}
+
+export interface WorkbenchRunCreatePayload {
+  input: string;
+  session_id?: string;
+  conversation_history?: Array<{ role: string; content: string }>;
+  instructions?: string;
+  previous_response_id?: string;
+}
+
+export interface WorkbenchRunCreateResponse {
+  run_id: string;
+  status: string;
+}
+
+export interface WorkbenchRunStartResult {
+  runId: string;
+  status: string;
+  requestId?: string;
+  upstreamRunId?: string;
+  sessionId?: string;
+}
+
+export interface WorkbenchRunEvent {
+  event: string;
+  run_id: string;
+  timestamp?: number;
+  delta?: string;
+  output?: string;
+  error?: string;
+  tool?: string;
+  preview?: string;
+  duration?: number;
+  files?: Array<{ file_id: string; filename: string; bytes?: number }>;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  };
+  text?: string;
 }
 
 // ── Model info types ──────────────────────────────────────────────────

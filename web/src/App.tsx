@@ -25,6 +25,7 @@ import {
 import { Cell, Grid, SelectionSwitcher, Typography } from "@nous-research/ui";
 import { cn } from "@/lib/utils";
 import { Backdrop } from "@/components/Backdrop";
+import WorkbenchPage from "@/pages/WorkbenchPage";
 import StatusPage from "@/pages/StatusPage";
 import ConfigPage from "@/pages/ConfigPage";
 import EnvPage from "@/pages/EnvPage";
@@ -40,7 +41,8 @@ import { usePlugins } from "@/plugins";
 import type { RegisteredPlugin } from "@/plugins";
 
 const BUILTIN_NAV: NavItem[] = [
-  { path: "/", labelKey: "status", label: "Status", icon: Activity },
+  { path: "/", label: "Workbench", icon: Sparkles },
+  { path: "/status", labelKey: "status", label: "Status", icon: Activity },
   {
     path: "/sessions",
     labelKey: "sessions",
@@ -229,7 +231,8 @@ export default function App() {
 
       <main className="relative z-2 mx-auto w-full max-w-[1600px] flex-1 px-3 sm:px-6 pt-16 sm:pt-20 pb-4 sm:pb-8">
         <Routes>
-          <Route path="/" element={<StatusPage />} />
+          <Route path="/" element={<WorkbenchPage />} />
+          <Route path="/status" element={<StatusPage />} />
           <Route path="/sessions" element={<SessionsPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/logs" element={<LogsPage />} />
