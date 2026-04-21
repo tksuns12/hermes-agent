@@ -10,11 +10,13 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import hmac
 import importlib.util
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import threading
@@ -46,6 +48,7 @@ from hermes_cli.config import (
     redact_key,
 )
 from gateway.status import get_running_pid, read_runtime_status
+from hermes_constants import DEFAULT_TENANT, normalize_tenant
 
 try:
     from fastapi import FastAPI, HTTPException, Request
@@ -330,6 +333,135 @@ class EnvVarReveal(BaseModel):
     key: str
 
 
+_BROWSER_TENANT_COOKIE_NAME = "hermes_browser_id"
+_BROWSER_TENANT_COOKIE_TTL_SECONDS = int(
+    os.getenv("HERMES_BROWSER_ID_TTL_SECONDS", str(60 * 60 * 24 * 365))
+)
+_BROWSER_TENANT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
+_BROWSER_TENANT_ADJECTIVES: tuple[str, ...] = (
+    "amber",
+    "atlas",
+    "brisk",
+    "cinder",
+    "dawn",
+    "ember",
+    "granite",
+    "harbor",
+    "indigo",
+    "juniper",
+    "lumen",
+    "mosaic",
+)
+_BROWSER_TENANT_NOUNS: tuple[str, ...] = (
+    "falcon",
+    "forge",
+    "harbor",
+    "lantern",
+    "meadow",
+    "north",
+    "orbit",
+    "quartz",
+    "river",
+    "summit",
+    "vector",
+    "willow",
+)
+
+
+def _mask_browser_identity(identity: str | None) -> str:
+    """Return a privacy-safe hint for logs/debug payloads."""
+    if not identity:
+        return "none"
+    if len(identity) <= 10:
+        return "•••"
+    return f"{identity[:4]}…{identity[-4:]}"
+
+
+def _browser_supplied_user_id_sources(request: Request) -> list[str]:
+    """Return browser-controlled user_id-like sources that must be ignored."""
+    sources: list[str] = []
+    candidates = (
+        ("query.user_id", request.query_params.get("user_id")),
+        ("query.user", request.query_params.get("user")),
+        ("header.x-hermes-user-id", request.headers.get("X-Hermes-User-Id")),
+        ("header.x-openai-user", request.headers.get("X-OpenAI-User")),
+    )
+    for source, value in candidates:
+        if isinstance(value, str) and value.strip():
+            sources.append(source)
+    return sources
+
+
+def _mint_browser_identity() -> str:
+    """Mint a server-owned opaque browser identity token."""
+    return f"brw_{secrets.token_urlsafe(18)}"
+
+
+def _derive_tenant_from_browser_identity(identity: str) -> tuple[str, str]:
+    """Derive a deterministic, human-legible tenant slug + label."""
+    digest = hashlib.sha256(f"hermes-browser-tenant:{identity}".encode("utf-8")).hexdigest()
+    adjective = _BROWSER_TENANT_ADJECTIVES[int(digest[0:4], 16) % len(_BROWSER_TENANT_ADJECTIVES)]
+    noun = _BROWSER_TENANT_NOUNS[int(digest[4:8], 16) % len(_BROWSER_TENANT_NOUNS)]
+    suffix = digest[8:12]
+    tenant_id = normalize_tenant(f"{adjective}-{noun}-{suffix}")
+    tenant_label = f"{adjective.title()} {noun.title()} {suffix.upper()}"
+    return tenant_id, tenant_label
+
+
+def _resolve_browser_tenant(request: Request) -> Dict[str, Any]:
+    """Resolve tenant identity for the browser without trusting browser user_id."""
+    ignored_sources = _browser_supplied_user_id_sources(request)
+    if ignored_sources:
+        _log.info(
+            "workbench/tenant_ignore_browser_user_id sources=%s",
+            ",".join(ignored_sources),
+        )
+
+    raw_identity = request.cookies.get(_BROWSER_TENANT_COOKIE_NAME)
+    source = "generated"
+    fallback_reason: str | None = None
+    set_cookie_value: str | None = None
+    clear_cookie = False
+
+    if raw_identity is None:
+        identity = _mint_browser_identity()
+        set_cookie_value = identity
+        source = "generated"
+    elif _BROWSER_TENANT_ID_RE.fullmatch(raw_identity):
+        identity = raw_identity
+        source = "cookie"
+    else:
+        identity = None
+        source = "fallback"
+        fallback_reason = "malformed_browser_identity_cookie"
+        clear_cookie = True
+
+    if identity:
+        tenant_id, tenant_label = _derive_tenant_from_browser_identity(identity)
+    else:
+        tenant_id = DEFAULT_TENANT
+        tenant_label = "Default Tenant"
+
+    _log.info(
+        "workbench/tenant_resolved source=%s tenant=%s browser_hint=%s fallback_reason=%s",
+        source,
+        tenant_id,
+        _mask_browser_identity(identity or raw_identity),
+        fallback_reason or "none",
+    )
+
+    return {
+        "tenant_id": tenant_id,
+        "tenant_label": tenant_label,
+        "source": source,
+        "fallback_reason": fallback_reason,
+        "identity_hint": _mask_browser_identity(identity),
+        "set_cookie_value": set_cookie_value,
+        "clear_cookie": clear_cookie,
+        "ignored_browser_user_id_sources": ignored_sources,
+    }
+
+
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
 _GATEWAY_HEALTH_TIMEOUT = float(os.getenv("GATEWAY_HEALTH_TIMEOUT", "3"))
 
@@ -474,6 +606,51 @@ async def get_status():
         "gateway_updated_at": gateway_updated_at,
         "active_sessions": active_sessions,
     }
+
+
+@app.get("/api/workbench/bootstrap")
+@app.get("/api/workbench/context")
+async def get_workbench_bootstrap(request: Request):
+    """Resolve browser tenant context for the workbench shell."""
+    resolved = _resolve_browser_tenant(request)
+
+    payload = {
+        "tenant": {
+            "id": resolved["tenant_id"],
+            "label": resolved["tenant_label"],
+            "source": resolved["source"],
+            "fallback": resolved["fallback_reason"] is not None,
+            "fallback_reason": resolved["fallback_reason"],
+            "identity_hint": resolved["identity_hint"],
+        },
+        "workbench": {
+            "context_version": 1,
+            "tenant_id": resolved["tenant_id"],
+            "tenant_label": resolved["tenant_label"],
+            "ignored_browser_user_id": bool(resolved["ignored_browser_user_id_sources"]),
+            "ignored_browser_user_id_sources": resolved["ignored_browser_user_id_sources"],
+        },
+    }
+
+    response = JSONResponse(payload)
+    secure_cookie = (
+        request.url.scheme == "https"
+        or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+    )
+    if resolved["set_cookie_value"]:
+        response.set_cookie(
+            key=_BROWSER_TENANT_COOKIE_NAME,
+            value=resolved["set_cookie_value"],
+            max_age=_BROWSER_TENANT_COOKIE_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            secure=secure_cookie,
+            path="/",
+        )
+    elif resolved["clear_cookie"]:
+        response.delete_cookie(key=_BROWSER_TENANT_COOKIE_NAME, path="/")
+
+    return response
 
 
 @app.get("/api/sessions")

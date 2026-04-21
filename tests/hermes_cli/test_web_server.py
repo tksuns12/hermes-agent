@@ -295,6 +295,79 @@ class TestWebServerEndpoints:
         resp = unauth_client.get("/api/status")
         assert resp.status_code == 200
 
+    def test_workbench_bootstrap_sets_stable_server_tenant(self):
+        first = self.client.get("/api/workbench/bootstrap")
+        assert first.status_code == 200
+        first_payload = first.json()
+        tenant_id = first_payload["tenant"]["id"]
+
+        assert tenant_id
+        assert first_payload["tenant"]["source"] == "generated"
+        assert first_payload["tenant"]["fallback"] is False
+
+        browser_id = first.cookies.get("hermes_browser_id")
+        assert browser_id
+
+        second = self.client.get(
+            "/api/workbench/bootstrap",
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert second.status_code == 200
+        second_payload = second.json()
+
+        assert second_payload["tenant"]["id"] == tenant_id
+        assert second_payload["tenant"]["label"] == first_payload["tenant"]["label"]
+        assert second_payload["tenant"]["source"] == "cookie"
+        assert second_payload["tenant"]["fallback"] is False
+
+    def test_workbench_bootstrap_ignores_browser_user_id_inputs(self):
+        baseline = self.client.get("/api/workbench/bootstrap")
+        tenant_id = baseline.json()["tenant"]["id"]
+        browser_id = baseline.cookies.get("hermes_browser_id")
+
+        resp = self.client.get(
+            "/api/workbench/bootstrap?user_id=query-tenant&user=query-alias",
+            headers={
+                "Authorization": self.client.headers["Authorization"],
+                "X-Hermes-User-Id": "header-tenant",
+                "X-OpenAI-User": "header-alias",
+            },
+            cookies={"hermes_browser_id": browser_id},
+        )
+
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["tenant"]["id"] == tenant_id
+        assert payload["workbench"]["ignored_browser_user_id"] is True
+        assert sorted(payload["workbench"]["ignored_browser_user_id_sources"]) == [
+            "header.x-hermes-user-id",
+            "header.x-openai-user",
+            "query.user",
+            "query.user_id",
+        ]
+
+    def test_workbench_bootstrap_malformed_identity_falls_back_isolated(self):
+        resp = self.client.get(
+            "/api/workbench/bootstrap?user_id=evil-query",
+            headers={
+                "Authorization": self.client.headers["Authorization"],
+                "X-Hermes-User-Id": "evil-header",
+            },
+            cookies={"hermes_browser_id": "bad$$$cookie"},
+        )
+
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["tenant"]["id"] == "default"
+        assert payload["tenant"]["source"] == "fallback"
+        assert payload["tenant"]["fallback"] is True
+        assert payload["tenant"]["fallback_reason"] == "malformed_browser_identity_cookie"
+        assert payload["workbench"]["ignored_browser_user_id"] is True
+
+        set_cookie = resp.headers.get("set-cookie", "")
+        assert "hermes_browser_id=" in set_cookie
+        assert "Max-Age=0" in set_cookie or "max-age=0" in set_cookie.lower()
+
     def test_path_traversal_blocked(self):
         """Verify URL-encoded path traversal is blocked."""
         # %2e%2e = ..
