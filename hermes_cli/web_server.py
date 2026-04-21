@@ -673,6 +673,7 @@ def _translate_upstream_error(
     request_id: str,
     phase: str,
     tenant_id: str,
+    resolved: Dict[str, Any] | None = None,
 ) -> HTTPException:
     """Translate upstream errors into stable, browser-safe API errors."""
     payload = _decode_upstream_json(exc.body)
@@ -703,7 +704,7 @@ def _translate_upstream_error(
             "phase": phase,
             "upstream_status": exc.status_code,
         },
-        headers={"X-Workbench-Request-Id": request_id},
+        headers=_workbench_proxy_headers(request_id, resolved),
     )
 
 
@@ -713,6 +714,7 @@ def _translate_upstream_malformed_response(
     phase: str,
     tenant_id: str,
     detail: str,
+    resolved: Dict[str, Any] | None = None,
 ) -> HTTPException:
     """Translate malformed upstream success payloads into stable proxy errors."""
     _log.warning(
@@ -730,11 +732,16 @@ def _translate_upstream_malformed_response(
             "request_id": request_id,
             "phase": phase,
         },
-        headers={"X-Workbench-Request-Id": request_id},
+        headers=_workbench_proxy_headers(request_id, resolved),
     )
 
 
-def _validate_workbench_file_id(file_id: str, *, request_id: str) -> None:
+def _validate_workbench_file_id(
+    file_id: str,
+    *,
+    request_id: str,
+    resolved: Dict[str, Any] | None = None,
+) -> None:
     if _WORKBENCH_FILE_ID_RE.fullmatch(file_id):
         return
     raise HTTPException(
@@ -744,7 +751,7 @@ def _validate_workbench_file_id(file_id: str, *, request_id: str) -> None:
             "message": "Invalid workbench file id.",
             "request_id": request_id,
         },
-        headers={"X-Workbench-Request-Id": request_id},
+        headers=_workbench_proxy_headers(request_id, resolved),
     )
 
 
@@ -760,9 +767,31 @@ def _normalize_workbench_file_metadata(payload: Dict[str, Any]) -> Dict[str, Any
     return normalized
 
 
-def _workbench_proxy_headers(request_id: str, upstream_headers: Dict[str, str] | None = None) -> Dict[str, str]:
-    """Build browser response headers with mandatory correlation ids."""
+def _workbench_tenant_headers(resolved: Dict[str, Any] | None) -> Dict[str, str]:
+    """Build tenant metadata headers for browser-facing workbench responses."""
+    if not resolved:
+        return {}
+
+    fallback_reason = resolved.get("fallback_reason")
+    headers: Dict[str, str] = {
+        "X-Hermes-Tenant-Id": str(resolved.get("tenant_id") or DEFAULT_TENANT),
+        "X-Hermes-Tenant-Label": str(resolved.get("tenant_label") or "Default Tenant"),
+        "X-Hermes-Tenant-Source": str(resolved.get("source") or "fallback"),
+        "X-Hermes-Tenant-Fallback": "true" if fallback_reason else "false",
+    }
+    if fallback_reason:
+        headers["X-Hermes-Tenant-Fallback-Reason"] = str(fallback_reason)
+    return headers
+
+
+def _workbench_proxy_headers(
+    request_id: str,
+    resolved: Dict[str, Any] | None = None,
+    upstream_headers: Dict[str, str] | None = None,
+) -> Dict[str, str]:
+    """Build browser response headers with correlation + tenant metadata."""
     headers: Dict[str, str] = {"X-Workbench-Request-Id": request_id}
+    headers.update(_workbench_tenant_headers(resolved))
     upstream_session_id = (upstream_headers or {}).get("X-Hermes-Session-Id")
     if upstream_session_id:
         headers["X-Hermes-Session-Id"] = upstream_session_id
@@ -937,7 +966,7 @@ async def get_workbench_bootstrap(request: Request):
         },
     }
 
-    response = JSONResponse(payload, headers={"X-Workbench-Request-Id": request_id})
+    response = JSONResponse(payload, headers=_workbench_proxy_headers(request_id, resolved))
     _apply_browser_identity_cookie(response, request, resolved)
     return response
 
@@ -981,7 +1010,7 @@ async def get_workbench_sessions(request: Request, limit: int = 20, offset: int 
                     "limit": limit,
                     "offset": offset,
                 },
-                headers={"X-Workbench-Request-Id": request_id},
+                headers=_workbench_proxy_headers(request_id, resolved),
             )
             _apply_browser_identity_cookie(response, request, resolved)
             return response
@@ -998,6 +1027,7 @@ async def get_workbench_sessions(request: Request, limit: int = 20, offset: int 
                 "message": "Failed to load workbench sessions.",
                 "request_id": request_id,
             },
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
 
@@ -1023,6 +1053,7 @@ async def get_workbench_session_detail(request: Request, session_id: str):
                         "message": "Session not found for this tenant.",
                         "request_id": request_id,
                     },
+                    headers=_workbench_proxy_headers(request_id, resolved),
                 )
 
             _log.info(
@@ -1032,7 +1063,7 @@ async def get_workbench_session_detail(request: Request, session_id: str):
                 session.get("id"),
             )
 
-            response = JSONResponse(session, headers={"X-Workbench-Request-Id": request_id})
+            response = JSONResponse(session, headers=_workbench_proxy_headers(request_id, resolved))
             _apply_browser_identity_cookie(response, request, resolved)
             return response
         finally:
@@ -1048,6 +1079,7 @@ async def get_workbench_session_detail(request: Request, session_id: str):
                 "message": "Failed to load workbench session detail.",
                 "request_id": request_id,
             },
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
 
@@ -1072,6 +1104,7 @@ async def get_workbench_session_messages(request: Request, session_id: str):
                         "message": "Session not found for this tenant.",
                         "request_id": request_id,
                     },
+                    headers=_workbench_proxy_headers(request_id, resolved),
                 )
 
             messages = db.get_messages(resolved_session_id, user_id=tenant_id)
@@ -1085,7 +1118,7 @@ async def get_workbench_session_messages(request: Request, session_id: str):
 
             response = JSONResponse(
                 {"session_id": resolved_session_id, "messages": messages},
-                headers={"X-Workbench-Request-Id": request_id},
+                headers=_workbench_proxy_headers(request_id, resolved),
             )
             _apply_browser_identity_cookie(response, request, resolved)
             return response
@@ -1102,6 +1135,7 @@ async def get_workbench_session_messages(request: Request, session_id: str):
                 "message": "Failed to load workbench session messages.",
                 "request_id": request_id,
             },
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
 
@@ -1122,6 +1156,7 @@ async def create_workbench_run(request: Request):
                 "message": "Invalid JSON in workbench run request.",
                 "request_id": request_id,
             },
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
     if not isinstance(body, dict):
@@ -1132,6 +1167,7 @@ async def create_workbench_run(request: Request):
                 "message": "Workbench run payload must be a JSON object.",
                 "request_id": request_id,
             },
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
     outbound_payload, ignored_body_sources = _strip_browser_user_fields(body)
@@ -1163,6 +1199,7 @@ async def create_workbench_run(request: Request):
             request_id=request_id,
             phase="run.create",
             tenant_id=tenant_id,
+            resolved=resolved,
         )
     except urllib.error.URLError as exc:
         _log.warning(
@@ -1179,6 +1216,7 @@ async def create_workbench_run(request: Request):
                 "request_id": request_id,
                 "phase": "run.create",
             },
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
     run_id = str(upstream_payload.get("run_id") or "")
@@ -1192,11 +1230,9 @@ async def create_workbench_run(request: Request):
         upstream_url,
     )
 
-    response_headers = {"X-Workbench-Request-Id": request_id}
+    response_headers = _workbench_proxy_headers(request_id, resolved, upstream_headers)
     if run_id:
         response_headers["X-Upstream-Run-Id"] = run_id
-    if upstream_session_id:
-        response_headers["X-Hermes-Session-Id"] = upstream_session_id
 
     response = JSONResponse(upstream_payload, status_code=status_code, headers=response_headers)
     _apply_browser_identity_cookie(response, request, resolved)
@@ -1235,6 +1271,7 @@ async def stream_workbench_run_events(request: Request, run_id: str):
             request_id=request_id,
             phase="run.events",
             tenant_id=tenant_id,
+            resolved=resolved,
         )
     except urllib.error.URLError as exc:
         _log.warning(
@@ -1251,6 +1288,7 @@ async def stream_workbench_run_events(request: Request, run_id: str):
                 "request_id": request_id,
                 "phase": "run.events",
             },
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
     upstream_session_id = upstream_response.headers.get("X-Hermes-Session-Id")
@@ -1279,13 +1317,17 @@ async def stream_workbench_run_events(request: Request, run_id: str):
                 run_id,
             )
 
-    response_headers = {
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-        "X-Workbench-Request-Id": request_id,
-    }
-    if upstream_session_id:
-        response_headers["X-Hermes-Session-Id"] = upstream_session_id
+    response_headers = _workbench_proxy_headers(
+        request_id,
+        resolved,
+        {"X-Hermes-Session-Id": upstream_session_id} if upstream_session_id else None,
+    )
+    response_headers.update(
+        {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
     response = StreamingResponse(
         _event_stream(),
@@ -1326,6 +1368,7 @@ async def list_workbench_files(request: Request):
             request_id=request_id,
             phase="file.list",
             tenant_id=tenant_id,
+            resolved=resolved,
         )
     except _WorkbenchUpstreamMalformedResponseError as exc:
         raise _translate_upstream_malformed_response(
@@ -1333,6 +1376,7 @@ async def list_workbench_files(request: Request):
             phase="file.list",
             tenant_id=tenant_id,
             detail=str(exc),
+            resolved=resolved,
         )
     except urllib.error.URLError as exc:
         _log.warning(
@@ -1349,7 +1393,7 @@ async def list_workbench_files(request: Request):
                 "request_id": request_id,
                 "phase": "file.list",
             },
-            headers={"X-Workbench-Request-Id": request_id},
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
     data = upstream_payload.get("data")
@@ -1359,6 +1403,7 @@ async def list_workbench_files(request: Request):
             phase="file.list",
             tenant_id=tenant_id,
             detail="Upstream files list response missing data array.",
+            resolved=resolved,
         )
 
     normalized_payload = dict(upstream_payload)
@@ -1370,6 +1415,7 @@ async def list_workbench_files(request: Request):
             phase="file.list",
             tenant_id=tenant_id,
             detail=str(exc),
+            resolved=resolved,
         )
 
     _log.info(
@@ -1383,7 +1429,7 @@ async def list_workbench_files(request: Request):
     response = JSONResponse(
         normalized_payload,
         status_code=status_code,
-        headers=_workbench_proxy_headers(request_id, upstream_headers),
+        headers=_workbench_proxy_headers(request_id, resolved, upstream_headers),
     )
     _apply_browser_identity_cookie(response, request, resolved)
     return response
@@ -1409,7 +1455,7 @@ async def create_workbench_file(request: Request):
                 "message": "Missing filename metadata.",
                 "request_id": request_id,
             },
-            headers={"X-Workbench-Request-Id": request_id},
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
     body = await request.body()
@@ -1421,7 +1467,7 @@ async def create_workbench_file(request: Request):
                 "message": "Missing file content.",
                 "request_id": request_id,
             },
-            headers={"X-Workbench-Request-Id": request_id},
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
     ignored_sources = list(resolved["ignored_browser_user_id_sources"])
@@ -1465,6 +1511,7 @@ async def create_workbench_file(request: Request):
             request_id=request_id,
             phase="file.upload",
             tenant_id=tenant_id,
+            resolved=resolved,
         )
     except _WorkbenchUpstreamMalformedResponseError as exc:
         raise _translate_upstream_malformed_response(
@@ -1472,6 +1519,7 @@ async def create_workbench_file(request: Request):
             phase="file.upload",
             tenant_id=tenant_id,
             detail=str(exc),
+            resolved=resolved,
         )
     except urllib.error.URLError as exc:
         _log.warning(
@@ -1488,7 +1536,7 @@ async def create_workbench_file(request: Request):
                 "request_id": request_id,
                 "phase": "file.upload",
             },
-            headers={"X-Workbench-Request-Id": request_id},
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
     _log.info(
@@ -1503,7 +1551,7 @@ async def create_workbench_file(request: Request):
     response = JSONResponse(
         normalized_payload,
         status_code=status_code,
-        headers=_workbench_proxy_headers(request_id, upstream_headers),
+        headers=_workbench_proxy_headers(request_id, resolved, upstream_headers),
     )
     _apply_browser_identity_cookie(response, request, resolved)
     return response
@@ -1513,9 +1561,9 @@ async def create_workbench_file(request: Request):
 async def get_workbench_file_metadata(request: Request, file_id: str):
     """Get tenant-scoped file metadata through the same-origin proxy."""
     request_id = _new_workbench_request_id()
-    _validate_workbench_file_id(file_id, request_id=request_id)
-
     resolved = _resolve_browser_tenant(request)
+    _validate_workbench_file_id(file_id, request_id=request_id, resolved=resolved)
+
     tenant_id = resolved["tenant_id"]
     encoded_file_id = urllib.parse.quote(file_id, safe="")
     path = f"/v1/files/{encoded_file_id}?{urllib.parse.urlencode({'user_id': tenant_id})}"
@@ -1533,6 +1581,7 @@ async def get_workbench_file_metadata(request: Request, file_id: str):
             request_id=request_id,
             phase="file.metadata",
             tenant_id=tenant_id,
+            resolved=resolved,
         )
     except _WorkbenchUpstreamMalformedResponseError as exc:
         raise _translate_upstream_malformed_response(
@@ -1540,6 +1589,7 @@ async def get_workbench_file_metadata(request: Request, file_id: str):
             phase="file.metadata",
             tenant_id=tenant_id,
             detail=str(exc),
+            resolved=resolved,
         )
     except urllib.error.URLError as exc:
         _log.warning(
@@ -1556,7 +1606,7 @@ async def get_workbench_file_metadata(request: Request, file_id: str):
                 "request_id": request_id,
                 "phase": "file.metadata",
             },
-            headers={"X-Workbench-Request-Id": request_id},
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
     _log.info(
@@ -1570,7 +1620,7 @@ async def get_workbench_file_metadata(request: Request, file_id: str):
     response = JSONResponse(
         normalized_payload,
         status_code=status_code,
-        headers=_workbench_proxy_headers(request_id, upstream_headers),
+        headers=_workbench_proxy_headers(request_id, resolved, upstream_headers),
     )
     _apply_browser_identity_cookie(response, request, resolved)
     return response
@@ -1580,9 +1630,9 @@ async def get_workbench_file_metadata(request: Request, file_id: str):
 async def get_workbench_file_content(request: Request, file_id: str):
     """Download tenant-scoped file content through the same-origin proxy."""
     request_id = _new_workbench_request_id()
-    _validate_workbench_file_id(file_id, request_id=request_id)
-
     resolved = _resolve_browser_tenant(request)
+    _validate_workbench_file_id(file_id, request_id=request_id, resolved=resolved)
+
     tenant_id = resolved["tenant_id"]
     encoded_file_id = urllib.parse.quote(file_id, safe="")
     path = f"/v1/files/{encoded_file_id}/content?{urllib.parse.urlencode({'user_id': tenant_id})}"
@@ -1599,6 +1649,7 @@ async def get_workbench_file_content(request: Request, file_id: str):
             request_id=request_id,
             phase="file.content",
             tenant_id=tenant_id,
+            resolved=resolved,
         )
     except urllib.error.URLError as exc:
         _log.warning(
@@ -1615,7 +1666,7 @@ async def get_workbench_file_content(request: Request, file_id: str):
                 "request_id": request_id,
                 "phase": "file.content",
             },
-            headers={"X-Workbench-Request-Id": request_id},
+            headers=_workbench_proxy_headers(request_id, resolved),
         )
 
     _log.info(
@@ -1627,7 +1678,7 @@ async def get_workbench_file_content(request: Request, file_id: str):
         upstream_url,
     )
 
-    passthrough_headers = _workbench_proxy_headers(request_id, upstream_headers)
+    passthrough_headers = _workbench_proxy_headers(request_id, resolved, upstream_headers)
     for header_name in ("Content-Disposition", "ETag", "Last-Modified", "Content-Length"):
         header_value = upstream_headers.get(header_name)
         if header_value:

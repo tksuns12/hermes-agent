@@ -18,6 +18,7 @@ import { H2 } from "@nous-research/ui";
 import {
     api,
     buildWorkbenchRunPayload,
+    downloadWorkbenchFile,
     getWorkbenchFileDownloadUrl,
 } from "@/lib/api";
 import type {
@@ -429,6 +430,29 @@ export default function WorkbenchPage() {
             setUploadPending(false);
         }
     };
+
+    const handleDownloadFile = useCallback(async (
+        file: { id: string; filename: string },
+    ) => {
+        try {
+            const downloaded = await downloadWorkbenchFile(file.id);
+            const objectUrl = window.URL.createObjectURL(downloaded.blob);
+            const link = document.createElement("a");
+            link.href = objectUrl;
+            link.download = file.filename;
+            link.rel = "noopener";
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1000);
+            appendActivity("file", "success", `Downloaded ${file.filename}`, downloaded.requestId);
+            showToast(`Downloaded ${file.filename}`, "success");
+        } catch (error) {
+            const detail = formatApiError(error);
+            appendActivity("file", "error", `Download failed: ${detail}`);
+            showToast(`Download failed: ${detail}`, "error");
+        }
+    }, [appendActivity, showToast]);
 
     const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
@@ -862,13 +886,14 @@ export default function WorkbenchPage() {
                                                     {file.source ? ` · ${file.source}` : ""}
                                                 </p>
                                             </div>
-                                            <a
-                                                href={getWorkbenchFileDownloadUrl(file.id)}
+                                            <button
+                                                type="button"
+                                                onClick={() => void handleDownloadFile(file)}
                                                 className="inline-flex h-6 w-6 items-center justify-center border border-border/80 text-muted-foreground hover:text-foreground"
                                                 title="Download file"
                                             >
                                                 <FileDown className="h-3.5 w-3.5" />
-                                            </a>
+                                            </button>
                                         </div>
                                     </label>
                                 );
@@ -929,13 +954,17 @@ export default function WorkbenchPage() {
                                                     {file.mimeType ? ` · ${file.mimeType}` : ""}
                                                 </p>
                                             </div>
-                                            <a
-                                                href={file.downloadUrl}
+                                            <button
+                                                type="button"
+                                                onClick={() => void handleDownloadFile({
+                                                    id: file.id,
+                                                    filename: file.filename,
+                                                })}
                                                 className="inline-flex h-6 w-6 items-center justify-center border border-border/80 text-muted-foreground hover:text-foreground"
                                                 title="Download generated file"
                                             >
                                                 <FileDown className="h-3.5 w-3.5" />
-                                            </a>
+                                            </button>
                                         </div>
                                     ))}
                                 </div>

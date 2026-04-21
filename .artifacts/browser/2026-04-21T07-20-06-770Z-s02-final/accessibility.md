@@ -1,0 +1,75 @@
+- banner:
+  - text: Hermes Agent
+  - link "Workbench":
+    - /url: /
+  - link "Status":
+    - /url: /status
+  - link "Sessions":
+    - /url: /sessions
+  - link "Analytics":
+    - /url: /analytics
+  - link "Logs":
+    - /url: /logs
+  - link "Cron":
+    - /url: /cron
+  - link "Skills":
+    - /url: /skills
+  - link "Example":
+    - /url: /example
+  - link "Config":
+    - /url: /config
+  - link "Keys":
+    - /url: /env
+  - button "Switch theme": Hermes Teal
+  - button "Switch to Chinese": 🇬🇧 EN
+  - text: Web UI
+- main:
+  - heading "Workbench" [level=2]
+  - text: "tenant: Atlas North CB5C resolved source: cookie"
+  - paragraph: Tenant ID atlas-north-cb5c · bootstrap_request_id=wb_961cdaff2356
+  - complementary:
+    - text: Sessions
+    - button "Refresh sessions"
+    - button "Read the attached file and summarize its contents in one sen... 6 msgs · 4m ago":
+      - paragraph: Read the attached file and summarize its contents in one sen...
+      - paragraph: 6 msgs · 4m ago
+  - text: Untitled · run_5380c511cece46b2a5d92e56b91ec2bf User 5m ago
+  - paragraph: Read the attached file and summarize its contents in one sentence. Mention the tenant-scoped isolation note. [input_file:hermes-s02-upload-P7gA.txt (text/plain, 97 bytes)] Tenant scoped upload proof for S02. This file should remain visible only to the resolved tenant.
+  - paragraph: "[local_path:/home/tksuns/.hermes/users/atlas-north-cb5c/api_server/files/file_164c4ee3e13340b5a086df3b_hermes-s02-upload-P7gA.txt]"
+  - text: Assistant 5m ago
+  - paragraph: This file serves as proof of a tenant-scoped upload for S02 and includes a note specifying that the file must remain visible only to the resolved tenant for isolation.
+  - text: User 4m ago
+  - paragraph: "Using available tools if needed, create a small UTF-8 text file at /tmp/s02-generated-proof.txt containing exactly two bullet points: one about tenant isolation and one about request correlation. Then reply with a line in this exact format: FILE: /tmp/s02-generated-proof.txt [input_file:hermes-s02-upload-P7gA.txt (text/plain, 97 bytes)] Tenant scoped upload proof for S02. This file should remain visible only to the resolved tenant."
+  - paragraph: "[local_path:/home/tksuns/.hermes/users/atlas-north-cb5c/api_server/files/file_164c4ee3e13340b5a086df3b_hermes-s02-upload-P7gA.txt]"
+  - text: Assistant 4m ago
+  - button "Expand tool call write_file": write_file chatcmpl-tool-be93b367f39b81fc
+  - text: Tool 4m ago
+  - paragraph: "{\"bytes_written\": 93, \"dirs_created\": true}"
+  - text: Assistant 4m ago
+  - paragraph: "FILE: /tmp/s02-generated-proof.txt"
+  - textbox "Type your prompt for this tenant-scoped workbench..."
+  - text: Text-only run
+  - button "Send" [disabled]
+  - complementary:
+    - text: Workspace Files
+    - button "Refresh files"
+    - button "Upload"
+    - text: files_request_id=wb_a5460497ec8b
+    - checkbox "s02-generated-proof.txt file_37a035d78dfb4c7bac2219cb · 93 B · assistant_output"
+    - paragraph: s02-generated-proof.txt
+    - paragraph: file_37a035d78dfb4c7bac2219cb · 93 B · assistant_output
+    - button "Download file"
+    - checkbox "hermes-s02-upload-P7gA.txt file_164c4ee3e13340b5a086df3b · 97 B · upload"
+    - paragraph: hermes-s02-upload-P7gA.txt
+    - paragraph: file_164c4ee3e13340b5a086df3b · 97 B · upload
+    - button "Download file"
+    - text: Attached to next run (0)
+    - paragraph: Select retained files to attach.
+    - text: Generated outputs (1)
+    - paragraph: s02-generated-proof.txt
+    - paragraph: file_37a035d78dfb4c7bac2219cb · 93 B · text/plain
+    - button "Download generated file"
+    - text: Activity (1) file 04:19:08 PM
+    - paragraph: Downloaded s02-generated-proof.txt
+    - paragraph: request_id=wb_63f5b6380c31
+- contentinfo: Hermes Agent Nous Research

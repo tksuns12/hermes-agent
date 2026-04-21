@@ -1,0 +1,9 @@
+[
+  {
+    "type": "error",
+    "text": "Failed to load resource: the server responded with a status of 401 (Unauthorized)",
+    "timestamp": 1776755775215,
+    "url": "http://127.0.0.1:9119/api/workbench/files/file_37a035d78dfb4c7bac2219cb/content",
+    "pageId": 1
+  }
+]

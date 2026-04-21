@@ -20,6 +20,20 @@ from hermes_cli.config import (
 )
 
 
+def _assert_workbench_tenant_headers(
+    response,
+    *,
+    tenant_id: str,
+    tenant_label: str,
+    tenant_source: str,
+    fallback: bool,
+):
+    assert response.headers.get("X-Hermes-Tenant-Id") == tenant_id
+    assert response.headers.get("X-Hermes-Tenant-Label") == tenant_label
+    assert response.headers.get("X-Hermes-Tenant-Source") == tenant_source
+    assert response.headers.get("X-Hermes-Tenant-Fallback") == ("true" if fallback else "false")
+
+
 # ---------------------------------------------------------------------------
 # reload_env tests
 # ---------------------------------------------------------------------------
@@ -303,10 +317,18 @@ class TestWebServerEndpoints:
         assert first.status_code == 200
         first_payload = first.json()
         tenant_id = first_payload["tenant"]["id"]
+        tenant_label = first_payload["tenant"]["label"]
 
         assert tenant_id
         assert first_payload["tenant"]["source"] == "generated"
         assert first_payload["tenant"]["fallback"] is False
+        _assert_workbench_tenant_headers(
+            first,
+            tenant_id=tenant_id,
+            tenant_label=tenant_label,
+            tenant_source="generated",
+            fallback=False,
+        )
 
         browser_id = first.cookies.get("hermes_browser_id")
         assert browser_id
@@ -319,9 +341,39 @@ class TestWebServerEndpoints:
         second_payload = second.json()
 
         assert second_payload["tenant"]["id"] == tenant_id
-        assert second_payload["tenant"]["label"] == first_payload["tenant"]["label"]
+        assert second_payload["tenant"]["label"] == tenant_label
         assert second_payload["tenant"]["source"] == "cookie"
         assert second_payload["tenant"]["fallback"] is False
+        _assert_workbench_tenant_headers(
+            second,
+            tenant_id=tenant_id,
+            tenant_label=tenant_label,
+            tenant_source="cookie",
+            fallback=False,
+        )
+
+    def test_workbench_tenant_headers_differ_for_distinct_browser_identities(self):
+        resp_a = self.client.get(
+            "/api/workbench/sessions",
+            cookies={"hermes_browser_id": "brw_identity_alpha_1234567890"},
+        )
+        resp_b = self.client.get(
+            "/api/workbench/sessions",
+            cookies={"hermes_browser_id": "brw_identity_bravo_0987654321"},
+        )
+
+        assert resp_a.status_code == 200
+        assert resp_b.status_code == 200
+
+        tenant_a = resp_a.headers.get("X-Hermes-Tenant-Id")
+        tenant_b = resp_b.headers.get("X-Hermes-Tenant-Id")
+        assert tenant_a
+        assert tenant_b
+        assert tenant_a != tenant_b
+        assert resp_a.headers.get("X-Hermes-Tenant-Source") == "cookie"
+        assert resp_b.headers.get("X-Hermes-Tenant-Source") == "cookie"
+        assert resp_a.headers.get("X-Hermes-Tenant-Fallback") == "false"
+        assert resp_b.headers.get("X-Hermes-Tenant-Fallback") == "false"
 
     def test_workbench_bootstrap_ignores_browser_user_id_inputs(self):
         baseline = self.client.get("/api/workbench/bootstrap")
@@ -348,6 +400,13 @@ class TestWebServerEndpoints:
             "query.user",
             "query.user_id",
         ]
+        _assert_workbench_tenant_headers(
+            resp,
+            tenant_id=tenant_id,
+            tenant_label=payload["tenant"]["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
     def test_workbench_bootstrap_malformed_identity_falls_back_isolated(self):
         resp = self.client.get(
@@ -366,6 +425,14 @@ class TestWebServerEndpoints:
         assert payload["tenant"]["fallback"] is True
         assert payload["tenant"]["fallback_reason"] == "malformed_browser_identity_cookie"
         assert payload["workbench"]["ignored_browser_user_id"] is True
+        _assert_workbench_tenant_headers(
+            resp,
+            tenant_id="default",
+            tenant_label="Default Tenant",
+            tenant_source="fallback",
+            fallback=True,
+        )
+        assert resp.headers.get("X-Hermes-Tenant-Fallback-Reason") == "malformed_browser_identity_cookie"
 
         set_cookie = resp.headers.get("set-cookie", "")
         assert "hermes_browser_id=" in set_cookie
@@ -375,7 +442,9 @@ class TestWebServerEndpoints:
         from hermes_state import SessionDB
 
         bootstrap = self.client.get("/api/workbench/bootstrap")
-        tenant_id = bootstrap.json()["tenant"]["id"]
+        tenant = bootstrap.json()["tenant"]
+        tenant_id = tenant["id"]
+        tenant_label = tenant["label"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
         db = SessionDB()
@@ -394,11 +463,19 @@ class TestWebServerEndpoints:
         assert payload["total"] == 1
         assert [s["id"] for s in payload["sessions"]] == ["wb-tenant-session"]
         assert resp.headers.get("X-Workbench-Request-Id")
+        _assert_workbench_tenant_headers(
+            resp,
+            tenant_id=tenant_id,
+            tenant_label=tenant_label,
+            tenant_source="cookie",
+            fallback=False,
+        )
 
     def test_workbench_session_detail_denies_cross_tenant_access(self):
         from hermes_state import SessionDB
 
         bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant = bootstrap.json()["tenant"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
         db = SessionDB()
@@ -414,12 +491,21 @@ class TestWebServerEndpoints:
         assert resp.status_code == 404
         detail = resp.json()["detail"]
         assert detail["code"] == "workbench_session_not_found"
+        assert resp.headers.get("X-Workbench-Request-Id") == detail["request_id"]
+        _assert_workbench_tenant_headers(
+            resp,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
     def test_workbench_runs_proxy_injects_tenant_and_ignores_browser_user_id(self, monkeypatch):
         import hermes_cli.web_server as ws
 
         bootstrap = self.client.get("/api/workbench/bootstrap")
-        tenant_id = bootstrap.json()["tenant"]["id"]
+        tenant = bootstrap.json()["tenant"]
+        tenant_id = tenant["id"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
         captured = {}
@@ -474,11 +560,19 @@ class TestWebServerEndpoints:
         assert resp.headers.get("X-Upstream-Run-Id") == "run_proxy_test"
         assert resp.headers.get("X-Hermes-Session-Id") == "session_proxy_test"
         assert resp.headers.get("X-Workbench-Request-Id")
+        _assert_workbench_tenant_headers(
+            resp,
+            tenant_id=tenant_id,
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
     def test_workbench_runs_proxy_translates_upstream_5xx(self, monkeypatch):
         import hermes_cli.web_server as ws
 
         bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant = bootstrap.json()["tenant"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
         def _mock_urlopen(req, timeout=0):
@@ -504,11 +598,20 @@ class TestWebServerEndpoints:
         assert detail["upstream_status"] == 503
         assert detail["phase"] == "run.create"
         assert detail["request_id"]
+        assert resp.headers.get("X-Workbench-Request-Id") == detail["request_id"]
+        _assert_workbench_tenant_headers(
+            resp,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
     def test_workbench_run_events_proxy_streams_sse(self, monkeypatch):
         import hermes_cli.web_server as ws
 
         bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant = bootstrap.json()["tenant"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
         class _FakeSSEStream:
@@ -544,12 +647,20 @@ class TestWebServerEndpoints:
         assert "run.completed" in resp.text
         assert "file_evt_123" in resp.text
         assert resp.headers.get("X-Workbench-Request-Id")
+        _assert_workbench_tenant_headers(
+            resp,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
     def test_workbench_files_upload_and_list_ignore_browser_user_id(self, monkeypatch):
         import hermes_cli.web_server as ws
 
         bootstrap = self.client.get("/api/workbench/bootstrap")
-        tenant_id = bootstrap.json()["tenant"]["id"]
+        tenant = bootstrap.json()["tenant"]
+        tenant_id = tenant["id"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
         captured_calls = []
@@ -627,6 +738,13 @@ class TestWebServerEndpoints:
         assert upload.json()["download_url"] == "/api/workbench/files/file_demo_123/content"
         assert upload.headers.get("X-Workbench-Request-Id")
         assert upload.headers.get("X-Hermes-Session-Id") == "sess_file_proxy"
+        _assert_workbench_tenant_headers(
+            upload,
+            tenant_id=tenant_id,
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
         listed = self.client.get(
             "/api/workbench/files?user_id=query-attacker",
@@ -638,6 +756,13 @@ class TestWebServerEndpoints:
         )
         assert listed.status_code == 200
         assert listed.headers.get("X-Workbench-Request-Id")
+        _assert_workbench_tenant_headers(
+            listed,
+            tenant_id=tenant_id,
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
         payload = listed.json()
         assert payload["object"] == "list"
         assert payload["data"][0]["download_url"] == "/api/workbench/files/file_demo_123/content"
@@ -656,7 +781,8 @@ class TestWebServerEndpoints:
         import hermes_cli.web_server as ws
 
         bootstrap = self.client.get("/api/workbench/bootstrap")
-        tenant_id = bootstrap.json()["tenant"]["id"]
+        tenant = bootstrap.json()["tenant"]
+        tenant_id = tenant["id"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
         captured_queries = []
@@ -715,6 +841,13 @@ class TestWebServerEndpoints:
         assert metadata.json()["download_url"] == "/api/workbench/files/file_demo_123/content"
         assert metadata.headers.get("X-Workbench-Request-Id")
         assert metadata.headers.get("X-Hermes-Session-Id") == "session_file_meta"
+        _assert_workbench_tenant_headers(
+            metadata,
+            tenant_id=tenant_id,
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
         content = self.client.get(
             "/api/workbench/files/file_demo_123/content",
@@ -726,12 +859,20 @@ class TestWebServerEndpoints:
         assert "attachment" in content.headers.get("content-disposition", "")
         assert content.headers.get("X-Workbench-Request-Id")
         assert content.headers.get("X-Hermes-Session-Id") == "session_file_content"
+        _assert_workbench_tenant_headers(
+            content,
+            tenant_id=tenant_id,
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
         assert captured_queries[0]["user_id"] == [tenant_id]
         assert captured_queries[1]["user_id"] == [tenant_id]
 
     def test_workbench_files_validation_rejects_missing_fields_and_bad_ids(self):
         bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant = bootstrap.json()["tenant"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
         missing_filename = self.client.post(
@@ -745,6 +886,13 @@ class TestWebServerEndpoints:
         assert missing_filename_detail["code"] == "missing_filename"
         assert missing_filename_detail["request_id"]
         assert missing_filename.headers.get("X-Workbench-Request-Id") == missing_filename_detail["request_id"]
+        _assert_workbench_tenant_headers(
+            missing_filename,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
         missing_body = self.client.post(
             "/api/workbench/files?filename=demo.txt",
@@ -757,6 +905,13 @@ class TestWebServerEndpoints:
         assert missing_body_detail["code"] == "invalid_request"
         assert missing_body_detail["request_id"]
         assert missing_body.headers.get("X-Workbench-Request-Id") == missing_body_detail["request_id"]
+        _assert_workbench_tenant_headers(
+            missing_body,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
         invalid_file_id = self.client.get(
             "/api/workbench/files/not%20valid",
@@ -767,11 +922,19 @@ class TestWebServerEndpoints:
         assert invalid_file_id_detail["code"] == "invalid_file_id"
         assert invalid_file_id_detail["request_id"]
         assert invalid_file_id.headers.get("X-Workbench-Request-Id") == invalid_file_id_detail["request_id"]
+        _assert_workbench_tenant_headers(
+            invalid_file_id,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
     def test_workbench_files_proxy_handles_upstream_denial(self, monkeypatch):
         import hermes_cli.web_server as ws
 
         bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant = bootstrap.json()["tenant"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
         def _mock_urlopen(req, timeout=0):
@@ -795,11 +958,19 @@ class TestWebServerEndpoints:
         assert detail["phase"] == "file.metadata"
         assert detail["request_id"]
         assert denied.headers.get("X-Workbench-Request-Id") == detail["request_id"]
+        _assert_workbench_tenant_headers(
+            denied,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
     def test_workbench_files_proxy_handles_unreachable_and_malformed_upstream(self, monkeypatch):
         import hermes_cli.web_server as ws
 
         bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant = bootstrap.json()["tenant"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
         class _FakeRawResponse:
@@ -835,6 +1006,13 @@ class TestWebServerEndpoints:
         assert unreachable_detail["phase"] == "file.list"
         assert unreachable_detail["request_id"]
         assert unreachable.headers.get("X-Workbench-Request-Id") == unreachable_detail["request_id"]
+        _assert_workbench_tenant_headers(
+            unreachable,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
         malformed = self.client.get(
             "/api/workbench/files/file_demo_123",
@@ -846,6 +1024,13 @@ class TestWebServerEndpoints:
         assert malformed_detail["phase"] == "file.metadata"
         assert malformed_detail["request_id"]
         assert malformed.headers.get("X-Workbench-Request-Id") == malformed_detail["request_id"]
+        _assert_workbench_tenant_headers(
+            malformed,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
     def test_workbench_unknown_api_route_fails_closed_with_correlation(self, caplog):
         caplog.clear()

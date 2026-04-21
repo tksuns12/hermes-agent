@@ -153,6 +153,30 @@ export function getWorkbenchFileDownloadUrl(fileId: string): string {
     return `/api/workbench/files/${encodeURIComponent(fileId)}/content`;
 }
 
+export async function downloadWorkbenchFile(id: string): Promise<{
+    blob: Blob;
+    requestId?: string;
+    sessionId?: string;
+    contentType?: string;
+}> {
+    const headers = withSessionAuthHeaders();
+    const res = await fetch(`${BASE}${getWorkbenchFileDownloadUrl(id)}`, {
+        method: "GET",
+        headers,
+    });
+
+    if (!res.ok) {
+        const responseText = await res.text().catch(() => res.statusText);
+        throw buildWorkbenchHttpError(res, responseText, "Failed to download workbench file");
+    }
+
+    return {
+        blob: await res.blob(),
+        contentType: res.headers.get("content-type") ?? undefined,
+        ...getWorkbenchProxyMeta(res),
+    };
+}
+
 export function buildWorkbenchRunPayload(params: {
     prompt: string;
     sessionId?: string | null;

@@ -1,0 +1,625 @@
+[
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/",
+    "status": null,
+    "resourceType": "document",
+    "timestamp": 1776755297342,
+    "failed": true,
+    "failureText": "net::ERR_CONNECTION_REFUSED",
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-C1lP4esh.css",
+    "status": 200,
+    "resourceType": "stylesheet",
+    "timestamp": 1776755511124,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/",
+    "status": 200,
+    "resourceType": "document",
+    "timestamp": 1776755511124,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-7sXGqoof.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776755511133,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/ds-assets/filler-bg0.jpg",
+    "status": 200,
+    "resourceType": "image",
+    "timestamp": 1776755511253,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Collapse-Bold.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755511304,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Mondwest-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755511304,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/plugins",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755511304,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/bootstrap",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755511304,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/themes",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755511304,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/dashboard-plugins/example/dist/index.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776755511346,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755511346,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/RulesCompressed-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755511351,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755511371,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "POST",
+    "url": "http://127.0.0.1:9119/api/workbench/files?filename=hermes-s02-upload-P7gA.txt&purpose=uploads&source=upload",
+    "status": 201,
+    "resourceType": "fetch",
+    "timestamp": 1776755563292,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "POST",
+    "url": "http://127.0.0.1:9119/api/workbench/runs",
+    "status": 202,
+    "resourceType": "fetch",
+    "timestamp": 1776755598947,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/runs/run_5380c511cece46b2a5d92e56b91ec2bf/events",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755606257,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755606286,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions/run_5380c511cece46b2a5d92e56b91ec2bf/messages",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755606297,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755606298,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "POST",
+    "url": "http://127.0.0.1:9119/api/workbench/runs",
+    "status": 202,
+    "resourceType": "fetch",
+    "timestamp": 1776755652292,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/runs/run_96eec8ffb7eb410cb110a4c96cfe849f/events",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755656453,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755656480,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755656496,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions/run_5380c511cece46b2a5d92e56b91ec2bf/messages",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755656500,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/",
+    "status": 200,
+    "resourceType": "document",
+    "timestamp": 1776755704511,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-C1lP4esh.css",
+    "status": 304,
+    "resourceType": "stylesheet",
+    "timestamp": 1776755704511,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-7sXGqoof.js",
+    "status": 304,
+    "resourceType": "script",
+    "timestamp": 1776755704511,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Collapse-Bold.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755704512,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/RulesCompressed-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755704512,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Mondwest-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755704512,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/ds-assets/filler-bg0.jpg",
+    "status": 200,
+    "resourceType": "image",
+    "timestamp": 1776755704647,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/bootstrap",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755704693,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/plugins",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755704694,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/themes",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755704694,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/dashboard-plugins/example/dist/index.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776755704703,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755704703,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions/run_5380c511cece46b2a5d92e56b91ec2bf/messages",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755704718,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755704718,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files/file_37a035d78dfb4c7bac2219cb/content",
+    "status": 401,
+    "resourceType": "document",
+    "timestamp": 1776755775226,
+    "failed": false,
+    "pageId": 1,
+    "responseBody": "{\"detail\":\"Unauthorized\"}"
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-C1lP4esh.css",
+    "status": 200,
+    "resourceType": "stylesheet",
+    "timestamp": 1776755906516,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/",
+    "status": 200,
+    "resourceType": "document",
+    "timestamp": 1776755906516,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Collapse-Bold.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755906535,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/RulesCompressed-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755906535,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Mondwest-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755906535,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-DbGxROc3.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776755906535,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/bootstrap",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755906624,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/ds-assets/filler-bg0.jpg",
+    "status": 200,
+    "resourceType": "image",
+    "timestamp": 1776755906624,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/themes",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755906629,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/plugins",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755906629,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755906678,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/dashboard-plugins/example/dist/index.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776755906678,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755906678,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions/run_5380c511cece46b2a5d92e56b91ec2bf/messages",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755906678,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/",
+    "status": 200,
+    "resourceType": "document",
+    "timestamp": 1776755913690,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-DbGxROc3.js",
+    "status": 304,
+    "resourceType": "script",
+    "timestamp": 1776755913690,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-C1lP4esh.css",
+    "status": 200,
+    "resourceType": "stylesheet",
+    "timestamp": 1776755913690,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/ds-assets/filler-bg0.jpg",
+    "status": 200,
+    "resourceType": "image",
+    "timestamp": 1776755913781,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Mondwest-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755913829,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Collapse-Bold.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755913829,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/bootstrap",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755913829,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/plugins",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755913829,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/themes",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755913829,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/dashboard-plugins/example/dist/index.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776755913829,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755913830,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755913832,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/RulesCompressed-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776755913833,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions/run_5380c511cece46b2a5d92e56b91ec2bf/messages",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755913837,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files/file_37a035d78dfb4c7bac2219cb/content",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776755948209,
+    "failed": false,
+    "pageId": 1
+  }
+]

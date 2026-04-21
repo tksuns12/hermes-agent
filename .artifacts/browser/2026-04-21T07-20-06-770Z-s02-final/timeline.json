@@ -1,0 +1,71 @@
+{
+  "entries": [
+    {
+      "id": 1,
+      "tool": "browser_navigate",
+      "status": "error",
+      "durationMs": 6,
+      "beforeUrl": "about:blank",
+      "afterUrl": "about:blank",
+      "line": "#1 | browser_navigate | error | 6ms | screenshot=false, url=\"http://127.0.0.1:9119/\" | page.goto: net::ERR_CONNECTION_REFUSED at http://127.0.0.1:9119/\nCall log:\n\u001b[2m  - navigating to \"http://127.0.0.1:9119/\", waiting until \"domcontentloaded\"\u001b[22m\n"
+    },
+    {
+      "id": 2,
+      "tool": "browser_navigate",
+      "status": "success",
+      "durationMs": 1117,
+      "beforeUrl": "chrome-error://chromewebdata/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#2 | browser_navigate | success | 1117ms | screenshot=true, url=\"http://127.0.0.1:9119/\" | URL changed to http://127.0.0.1:9119/; title changed to Hermes Agent - Dashboard; landmarks 0→9; buttons 2→6"
+    },
+    {
+      "id": 3,
+      "tool": "browser_type",
+      "status": "success",
+      "durationMs": 121,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#3 | browser_type | success | 121ms | clearFirst=true, selector=\"textarea, textbox[aria-label='Type your prompt for this t...\", text=\"Read the attached file and summarize its contents in one ...\" | PASS (value_equals_expected, value_contains_expected) | focus changed"
+    },
+    {
+      "id": 4,
+      "tool": "browser_click",
+      "status": "success",
+      "durationMs": 567,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#4 | browser_click | success | 567ms | selector=\"button:has-text('Send')\" | SOFT-FAIL (no observable state change) | focus changed; visible text changed"
+    },
+    {
+      "id": 5,
+      "tool": "browser_type",
+      "status": "success",
+      "durationMs": 119,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#5 | browser_type | success | 119ms | clearFirst=true, selector=\"textarea\", text=\"Using available tools if needed, create a small UTF-8 tex...\" | PASS (value_equals_expected, value_contains_expected) | focus changed"
+    },
+    {
+      "id": 6,
+      "tool": "browser_click",
+      "status": "success",
+      "durationMs": 581,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#6 | browser_click | success | 581ms | selector=\"button:has-text('Send')\" | SOFT-FAIL (no observable state change) | focus changed; visible text changed"
+    },
+    {
+      "id": 7,
+      "tool": "browser_click",
+      "status": "success",
+      "durationMs": 321,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/api/workbench/files/file_37a035d78dfb4c7bac2219cb/content",
+      "line": "#7 | browser_click | success | 321ms | selector=\"aside a[href='/api/workbench/files/file_37a035d78dfb4c7ba...\" | PASS (url_changed, target_state_changed) | URL changed to http://127.0.0.1:9119/api/workbench/files/file_37a035d78dfb4c7bac2219cb/content; title changed to ; landmarks 9→0; buttons 8→0 | Warnings: JS: Failed to load resource: the server responded with a status of 401 (Unauthorized); Network: GET document 401\nUse browser_get_console_logs/browser_get_network_logs for full diagnostics."
+    }
+  ],
+  "retained": 7,
+  "totalRecorded": 7,
+  "bounded": false,
+  "summary": "Timeline: 7 browser actions recorded."
+}
