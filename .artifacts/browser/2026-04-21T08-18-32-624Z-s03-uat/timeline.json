@@ -1,0 +1,44 @@
+{
+  "entries": [
+    {
+      "id": 1,
+      "tool": "browser_navigate",
+      "status": "success",
+      "durationMs": 1098,
+      "beforeUrl": "about:blank",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#1 | browser_navigate | success | 1098ms | screenshot=true, url=\"http://127.0.0.1:9119/\" | URL changed to http://127.0.0.1:9119/; title changed to Hermes Agent - Dashboard; landmarks 0→9; buttons 0→6"
+    },
+    {
+      "id": 2,
+      "tool": "browser_set_checked",
+      "status": "success",
+      "durationMs": 111,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#2 | browser_set_checked | success | 111ms | checked=true, selector=\"input[type='checkbox']\" | PASS (checked_state_matches) | No meaningful browser-state change detected"
+    },
+    {
+      "id": 3,
+      "tool": "browser_batch",
+      "status": "success",
+      "durationMs": 731,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#3 | browser_batch | success | 731ms | finalSummaryOnly=false, steps=[4], stopOnFailure=true | visible text changed"
+    },
+    {
+      "id": 4,
+      "tool": "browser_click",
+      "status": "success",
+      "durationMs": 254,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#4 | browser_click | success | 254ms | selector=\"button:has-text('Reload tenant context')\" | SOFT-FAIL (no observable state change) | buttons 7→9; inputs 2→3; visible text changed"
+    }
+  ],
+  "retained": 4,
+  "totalRecorded": 4,
+  "bounded": false,
+  "summary": "Timeline: 4 browser actions recorded."
+}

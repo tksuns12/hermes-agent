@@ -1,0 +1,326 @@
+[
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/",
+    "status": 200,
+    "resourceType": "document",
+    "timestamp": 1776759379091,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-3pwHx_Bs.css",
+    "status": 200,
+    "resourceType": "stylesheet",
+    "timestamp": 1776759379097,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-Cba9HW7v.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776759379108,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/ds-assets/filler-bg0.jpg",
+    "status": 200,
+    "resourceType": "image",
+    "timestamp": 1776759379210,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Mondwest-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776759379214,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Collapse-Bold.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776759379214,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/bootstrap",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759379258,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/plugins",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759379258,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/themes",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759379258,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759379314,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/dashboard-plugins/example/dist/index.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776759379315,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/RulesCompressed-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776759379315,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759379363,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "POST",
+    "url": "http://127.0.0.1:9119/api/workbench/files?filename=s03-upload.txt&purpose=uploads&source=upload",
+    "status": 201,
+    "resourceType": "fetch",
+    "timestamp": 1776759415841,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "POST",
+    "url": "http://127.0.0.1:9119/api/workbench/runs",
+    "status": 202,
+    "resourceType": "fetch",
+    "timestamp": 1776759440184,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/runs/run_5b05bb0954cc41f095938c55243b4f6d/events",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759446699,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759446737,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions/run_5b05bb0954cc41f095938c55243b4f6d/messages",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759446745,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759446745,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/",
+    "status": 200,
+    "resourceType": "document",
+    "timestamp": 1776759462512,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-3pwHx_Bs.css",
+    "status": 304,
+    "resourceType": "stylesheet",
+    "timestamp": 1776759462512,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/assets/index-Cba9HW7v.js",
+    "status": 304,
+    "resourceType": "script",
+    "timestamp": 1776759462512,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Collapse-Bold.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776759462512,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/RulesCompressed-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776759462512,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/fonts/Mondwest-Regular.woff2",
+    "status": 200,
+    "resourceType": "font",
+    "timestamp": 1776759462512,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/ds-assets/filler-bg0.jpg",
+    "status": 200,
+    "resourceType": "image",
+    "timestamp": 1776759462628,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/bootstrap",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759462628,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/plugins",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759462630,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/dashboard/themes",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759462678,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/dashboard-plugins/example/dist/index.js",
+    "status": 200,
+    "resourceType": "script",
+    "timestamp": 1776759462681,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/bootstrap",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759471860,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759471860,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759471862,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions?limit=50&offset=0",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759471884,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/sessions/run_5b05bb0954cc41f095938c55243b4f6d/messages",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759471888,
+    "failed": false,
+    "pageId": 1
+  },
+  {
+    "method": "GET",
+    "url": "http://127.0.0.1:9119/api/workbench/files",
+    "status": 200,
+    "resourceType": "fetch",
+    "timestamp": 1776759471888,
+    "failed": false,
+    "pageId": 1
+  }
+]

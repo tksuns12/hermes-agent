@@ -1,0 +1,2 @@
+S03 tenant-scoped upload proof file.
+If this file appears in the workbench, it must remain scoped to the resolved tenant.

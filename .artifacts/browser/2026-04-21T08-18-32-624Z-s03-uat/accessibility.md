@@ -1,0 +1,66 @@
+- banner:
+  - text: Hermes Agent
+  - link "Workbench":
+    - /url: /
+  - link "Status":
+    - /url: /status
+  - link "Sessions":
+    - /url: /sessions
+  - link "Analytics":
+    - /url: /analytics
+  - link "Logs":
+    - /url: /logs
+  - link "Cron":
+    - /url: /cron
+  - link "Skills":
+    - /url: /skills
+  - link "Example":
+    - /url: /example
+  - link "Config":
+    - /url: /config
+  - link "Keys":
+    - /url: /env
+  - button "Switch theme": Hermes Teal
+  - button "Switch to Chinese": 🇬🇧 EN
+  - text: Web UI
+- main:
+  - heading "Workbench" [level=2]
+  - text: "tenant: Cinder Quartz 3584 resolved source: cookie"
+  - paragraph: Tenant ID cinder-quartz-3584 · bootstrap_request_id=wb_0bdf3fbefe31
+  - complementary:
+    - text: Sessions
+    - button "Refresh sessions"
+    - button "Please reply with a short sentence confirming this workbench... 4 msgs · just now":
+      - paragraph: Please reply with a short sentence confirming this workbench...
+      - paragraph: 4 msgs · just now
+  - text: Untitled · run_5b05bb0954cc41f095938c55243b4f6d User just now
+  - paragraph: Please reply with a short sentence confirming this workbench session is tenant-scoped and can access the uploaded proof file. [input_file:s03-upload.txt (text/plain, 122 bytes)] S03 tenant-scoped upload proof file. If this file appears in the workbench, it must remain scoped to the resolved tenant.
+  - paragraph: "[local_path:/home/tksuns/.hermes/users/cinder-quartz-3584/api_server/files/file_334a94330b954e6aaa983f4c_s03-upload.txt]"
+  - text: Assistant just now
+  - button "Expand tool call read_file": read_file chatcmpl-tool-9c58cd447653d93c
+  - text: Tool just now
+  - paragraph: "{\"content\": \" 1|S03 tenant-scoped upload proof file.\\n 2|If this file appears in the workbench, it must remain scoped to the resolved tenant.\\n 3|\", \"total_lines\": 2, \"file_size\": 122, \"truncated\": false, \"is_binary\": false, \"is_image\": false}"
+  - text: Assistant just now
+  - paragraph: This workbench session is tenant-scoped and can access the uploaded proof file.
+  - textbox "Type your prompt for this tenant-scoped workbench..."
+  - text: Text-only run
+  - button "Send" [disabled]
+  - complementary:
+    - text: Workspace Files
+    - button "Refresh files"
+    - button "Upload"
+    - text: files_request_id=wb_0c9182744e18
+    - checkbox "s03-upload.txt file_334a94330b954e6aaa983f4c · 122 B · upload"
+    - paragraph: s03-upload.txt
+    - paragraph: file_334a94330b954e6aaa983f4c · 122 B · upload
+    - button "Download file"
+    - text: Attached to next run (0)
+    - paragraph: Select retained files to attach.
+    - text: Generated outputs (0)
+    - paragraph:
+      - text: Generated files from
+      - code: run.completed.files
+      - text: will appear here.
+    - text: Activity (0)
+    - paragraph: Stream/tool activity will appear here.
+- contentinfo: Hermes Agent Nous Research
