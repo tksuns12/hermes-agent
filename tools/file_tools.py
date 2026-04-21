@@ -72,6 +72,17 @@ _BLOCKED_DEVICE_PATHS = frozenset({
 })
 
 
+def _resolve_path(filepath: str) -> Path:
+    """Resolve a path relative to TERMINAL_CWD (the worktree base directory)
+    instead of the main repository root.
+    """
+    p = Path(filepath).expanduser()
+    if not p.is_absolute():
+        base = os.environ.get("TERMINAL_CWD", os.getcwd())
+        p = Path(base) / p
+    return p.resolve()
+
+
 def _is_blocked_device(filepath: str) -> bool:
     """Return True if the path would hang the process (infinite output or blocking input).
 
@@ -93,27 +104,29 @@ def _is_blocked_device(filepath: str) -> bool:
 
 # Paths that file tools should refuse to write to without going through the
 # terminal tool's approval system.  These match prefixes after os.path.realpath.
-_SENSITIVE_PATH_PREFIXES = ("/etc/", "/boot/", "/usr/lib/systemd/")
+_SENSITIVE_PATH_PREFIXES = (
+    "/etc/", "/boot/", "/usr/lib/systemd/",
+    "/private/etc/", "/private/var/",
+)
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
 
 def _check_sensitive_path(filepath: str) -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
-        resolved = os.path.realpath(os.path.expanduser(filepath))
+        resolved = str(_resolve_path(filepath))
     except (OSError, ValueError):
         resolved = filepath
+    normalized = os.path.normpath(os.path.expanduser(filepath))
+    _err = (
+        f"Refusing to write to sensitive system path: {filepath}\n"
+        "Use the terminal tool with sudo if you need to modify system files."
+    )
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix):
-            return (
-                f"Refusing to write to sensitive system path: {filepath}\n"
-                "Use the terminal tool with sudo if you need to modify system files."
-            )
-    if resolved in _SENSITIVE_EXACT_PATHS:
-        return (
-            f"Refusing to write to sensitive system path: {filepath}\n"
-            "Use the terminal tool with sudo if you need to modify system files."
-        )
+        if resolved.startswith(prefix) or normalized.startswith(prefix):
+            return _err
+    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+        return _err
     return None
 
 
@@ -146,6 +159,58 @@ _file_ops_cache: dict = {}
 #                      by the same task don't trigger false warnings.
 _read_tracker_lock = threading.Lock()
 _read_tracker: dict = {}
+
+# Per-task bounds for the containers inside each _read_tracker[task_id].
+# A CLI session uses one stable task_id for its lifetime; without these
+# caps, a 10k-read session would accumulate ~1.5MB of dict/set state that
+# is never referenced again (only the most recent reads matter for dedup,
+# loop detection, and external-edit warnings).  Hard caps bound the
+# accretion to a few hundred KB regardless of session length.
+_READ_HISTORY_CAP = 500       # set; used only by get_read_files_summary
+_DEDUP_CAP = 1000             # dict; skip-identical-reread guard
+_READ_TIMESTAMPS_CAP = 1000   # dict; external-edit detection for write/patch
+
+
+def _cap_read_tracker_data(task_data: dict) -> None:
+    """Enforce size caps on the per-task read-tracker sub-containers.
+
+    Must be called with ``_read_tracker_lock`` held.  Eviction policy:
+
+      * ``read_history`` (set): pop arbitrary entries on overflow.  This
+        is fine because the set only feeds diagnostic summaries; losing
+        old entries just trims the summary's tail.
+      * ``dedup`` / ``read_timestamps`` (dict): pop oldest by insertion
+        order (Python 3.7+ dicts).  Evicted entries lose their dedup
+        skip on a future re-read (the file gets re-sent once) and
+        external-edit mtime comparison (the write/patch falls back to
+        a non-mtime check).  Both are graceful degradations, not bugs.
+    """
+    rh = task_data.get("read_history")
+    if rh is not None and len(rh) > _READ_HISTORY_CAP:
+        excess = len(rh) - _READ_HISTORY_CAP
+        for _ in range(excess):
+            try:
+                rh.pop()
+            except KeyError:
+                break
+
+    dedup = task_data.get("dedup")
+    if dedup is not None and len(dedup) > _DEDUP_CAP:
+        excess = len(dedup) - _DEDUP_CAP
+        for _ in range(excess):
+            try:
+                dedup.pop(next(iter(dedup)))
+            except (StopIteration, KeyError):
+                break
+
+    ts = task_data.get("read_timestamps")
+    if ts is not None and len(ts) > _READ_TIMESTAMPS_CAP:
+        excess = len(ts) - _READ_TIMESTAMPS_CAP
+        for _ in range(excess):
+            try:
+                ts.pop(next(iter(ts)))
+            except (StopIteration, KeyError):
+                break
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
@@ -227,6 +292,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "container_disk": config.get("container_disk", 51200),
                     "container_persistent": config.get("container_persistent", True),
                     "docker_volumes": config.get("docker_volumes", []),
+                    "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                    "docker_forward_env": config.get("docker_forward_env", []),
                 }
 
             ssh_config = None
@@ -298,7 +365,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 ),
             })
 
-        _resolved = Path(path).expanduser().resolve()
+        _resolved = _resolve_path(path)
 
         # ── Binary file guard ─────────────────────────────────────────
         # Block binary files by extension (no I/O).
@@ -431,6 +498,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             except OSError:
                 pass  # Can't stat — skip tracking for this entry
 
+            # Bound the per-task containers so a long CLI session doesn't
+            # accumulate megabytes of dict/set state.  See _cap_read_tracker_data.
+            _cap_read_tracker_data(task_data)
+
         if count >= 4:
             # Hard block: stop returning content to break the loop
             return json.dumps({
@@ -539,7 +610,7 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
     """
     runtime_key, _, _ = resolve_runtime_key(task_id)
     try:
-        resolved = str(Path(filepath).expanduser().resolve())
+        resolved = str(_resolve_path(filepath))
         current_mtime = os.path.getmtime(resolved)
     except (OSError, ValueError):
         return
@@ -547,6 +618,7 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
         task_data = _read_tracker.get(runtime_key)
         if task_data is not None:
             task_data.setdefault("read_timestamps", {})[resolved] = current_mtime
+            _cap_read_tracker_data(task_data)
 
 
 def _check_file_staleness(filepath: str, task_id: str) -> str | None:
@@ -558,7 +630,7 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     """
     runtime_key, _, _ = resolve_runtime_key(task_id)
     try:
-        resolved = str(Path(filepath).expanduser().resolve())
+        resolved = str(_resolve_path(filepath))
     except (OSError, ValueError):
         return None
     with _read_tracker_lock:
@@ -733,12 +805,6 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         return tool_error(str(e))
 
 
-FILE_TOOLS = [
-    {"name": "read_file", "function": read_file_tool},
-    {"name": "write_file", "function": write_file_tool},
-    {"name": "patch", "function": patch_tool},
-    {"name": "search_files", "function": search_tool}
-]
 
 
 # ---------------------------------------------------------------------------

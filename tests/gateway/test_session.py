@@ -283,6 +283,19 @@ class TestBuildSessionContextPrompt:
         assert "Local" in prompt
         assert "machine running this agent" in prompt
 
+    def test_local_delivery_path_uses_display_hermes_home(self):
+        config = GatewayConfig()
+        source = SessionSource(
+            platform=Platform.LOCAL, chat_id="cli",
+            chat_name="CLI terminal", chat_type="dm",
+        )
+        ctx = build_session_context(source, config)
+
+        with patch("hermes_constants.display_hermes_home", return_value="~/.hermes/profiles/coder"):
+            prompt = build_session_context_prompt(ctx)
+
+        assert "~/.hermes/profiles/coder/cron/output/" in prompt
+
     def test_whatsapp_prompt(self):
         config = GatewayConfig(
             platforms={
@@ -550,6 +563,51 @@ class TestLoadTranscriptPreferLongerSource:
         assert len(result) == 2
         # Should be the SQLite version (equal count → prefers SQLite)
         assert result[0]["content"] == "db-q"
+
+
+class TestSessionStoreSwitchSession:
+    """Regression coverage for gateway /resume session switching semantics."""
+
+    def test_switch_session_reopens_target_session_in_db(self, tmp_path):
+        from hermes_state import SessionDB
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+            user_name="tester",
+        )
+        current_entry = store.get_or_create_session(source)
+        current_session_id = current_entry.session_id
+        tenant = "user-1"
+
+        target_session_id = "old_session_abc"
+        db.create_session(target_session_id, source="feishu", user_id=tenant)
+        db.end_session(target_session_id, end_reason="user_exit", user_id=tenant)
+        target_session = db.get_session(target_session_id, user_id=tenant)
+        assert target_session is not None
+        assert target_session["ended_at"] is not None
+
+        switched = store.switch_session(current_entry.session_key, target_session_id)
+
+        assert switched is not None
+        assert switched.session_id == target_session_id
+        current_session = db.get_session(current_session_id, user_id=tenant)
+        assert current_session is not None
+        assert current_session["end_reason"] == "session_switch"
+        resumed = db.get_session(target_session_id, user_id=tenant)
+        assert resumed is not None
+        assert resumed["ended_at"] is None
+        assert resumed["end_reason"] is None
+        db.close()
 
 
 class TestWhatsAppDMSessionKeyConsistency:
@@ -1043,4 +1101,3 @@ class TestTenantScopedTranscripts:
         assert "alice" in str(alice_path)
         assert store.load_transcript(default_entry.session_id)[0]["content"] == "hi"
         assert store.load_transcript(alice_entry.session_id)[0]["content"] == "hello"
-
