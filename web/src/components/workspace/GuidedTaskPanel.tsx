@@ -14,7 +14,7 @@ export interface GuidedTaskPanelProps {
   selectedFiles: WorkbenchFileMetadata[];
   runPending: boolean;
   mismatchActive: boolean;
-  onRunGuided: (prompt: string) => Promise<boolean> | boolean;
+  onRunGuided: (prompt: string, options?: { requireOutcomeEnvelope?: boolean }) => Promise<boolean> | boolean;
 }
 
 function toGuidedFiles(files: WorkbenchFileMetadata[]): GuidedTaskFile[] {
@@ -60,7 +60,7 @@ export function GuidedTaskPanel({
     });
 
     if (!prompt.ok || !prompt.prompt) return;
-    await onRunGuided(prompt.prompt);
+    await onRunGuided(prompt.prompt, { requireOutcomeEnvelope: true });
   };
 
   return (

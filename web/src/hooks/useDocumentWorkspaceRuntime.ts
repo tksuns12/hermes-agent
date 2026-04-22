@@ -410,6 +410,7 @@ export function useDocumentWorkspaceRuntime() {
 
   const [generatedFiles, setGeneratedFiles] = useState<WorkspaceGeneratedFile[]>([]);
   const [runOutcome, setRunOutcome] = useState<WorkspaceRunOutcome | null>(null);
+  const [outcomeEnvelopeRequired, setOutcomeEnvelopeRequired] = useState(false);
   const [activityEntries, setActivityEntries] = useState<WorkspaceActivityEntry[]>([]);
 
   const activityIdRef = useRef(0);
@@ -758,16 +759,32 @@ export function useDocumentWorkspaceRuntime() {
       if (!content) continue;
 
       const parsed = parseDocumentOutcomeEnvelope(content);
-      const sourceRunId = getMostRecentGeneratedSourceRunId(retainedFiles);
-      setRunOutcome({
-        ...parsed.outcome,
-        sourceRunId,
+      if (!outcomeEnvelopeRequired && !parsed.foundEnvelope) {
+        setRunOutcome(null);
+        return;
+      }
+
+      const nextSourceRunId = getMostRecentGeneratedSourceRunId(retainedFiles);
+      setRunOutcome((current) => {
+        const sameOutcomeAsCurrent =
+          current !== null &&
+          current.status === parsed.outcome.status &&
+          current.explanation === parsed.outcome.explanation &&
+          current.parseIssue === parsed.outcome.parseIssue &&
+          current.nextSteps.length === parsed.outcome.nextSteps.length &&
+          current.nextSteps.every((step, stepIndex) => step === parsed.outcome.nextSteps[stepIndex]);
+
+        return {
+          ...parsed.outcome,
+          sourceRunId:
+            nextSourceRunId ?? (sameOutcomeAsCurrent ? current?.sourceRunId : undefined),
+        };
       });
       return;
     }
 
     setRunOutcome(null);
-  }, [messages, retainedFiles, runPending]);
+  }, [messages, outcomeEnvelopeRequired, retainedFiles, runPending]);
 
   useEffect(() => {
     return () => {
@@ -881,6 +898,7 @@ export function useDocumentWorkspaceRuntime() {
       rawPrompt: string,
       options?: {
         clearComposer?: boolean;
+        requireOutcomeEnvelope?: boolean;
       },
     ) => {
       const prompt = rawPrompt.trim();
@@ -900,6 +918,7 @@ export function useDocumentWorkspaceRuntime() {
       setRunRequestId(null);
       setStreamRequestId(null);
       setRunOutcome(null);
+      setOutcomeEnvelopeRequired(options?.requireOutcomeEnvelope === true);
       malformedStreamWarningShownRef.current = false;
 
       const baseSessionId = selectedSessionId;
@@ -1001,17 +1020,21 @@ export function useDocumentWorkspaceRuntime() {
                       setMessages((prev) => ensureAssistantOutput(prev, displayOutput));
                     }
 
-                    setRunOutcome({
-                      ...parsedOutcome.outcome,
-                      sourceRunId: evt.run_id || undefined,
-                    });
+                    if (outcomeEnvelopeRequired || parsedOutcome.foundEnvelope) {
+                      setRunOutcome({
+                        ...parsedOutcome.outcome,
+                        sourceRunId: evt.run_id || undefined,
+                      });
 
-                    if (parsedOutcome.outcome.isFallback) {
-                      appendActivity(
-                        "run",
-                        "error",
-                        `Structured outcome envelope ${parsedOutcome.outcome.parseIssue ?? "unknown_issue"}; defaulted to unsupported boundary state.`,
-                      );
+                      if (parsedOutcome.outcome.isFallback) {
+                        appendActivity(
+                          "run",
+                          "error",
+                          `Structured outcome envelope ${parsedOutcome.outcome.parseIssue ?? "unknown_issue"}; defaulted to unsupported boundary state.`,
+                        );
+                      }
+                    } else {
+                      setRunOutcome(null);
                     }
                   }
 
@@ -1112,6 +1135,7 @@ export function useDocumentWorkspaceRuntime() {
       loadMessages,
       loadSessions,
       mismatchActive,
+      outcomeEnvelopeRequired,
       runPending,
       selectedFileIds,
       selectedSessionId,

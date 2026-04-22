@@ -444,6 +444,7 @@ describe("EndUserWorkspacePage runtime", () => {
 
     expect(promptPart?.text).toContain('Run the guided task "Summarize DOCX"');
     expect(promptPart?.text).toContain("meeting-notes.docx");
+    expect(promptPart?.text).toContain("docx-summary-report.md");
     expect(turn.content).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: "input_file", file_id: "file-docx" }),
@@ -485,7 +486,7 @@ describe("EndUserWorkspacePage runtime", () => {
     expect(screen.getByText(/only accepts \.docx files/i)).toBeTruthy();
 
     fireEvent.change(screen.getByLabelText(/guided task/i), {
-      target: { value: "xlsx-summary" },
+      target: { value: "xlsx-anomalies" },
     });
 
     await waitFor(() => {
@@ -506,8 +507,9 @@ describe("EndUserWorkspacePage runtime", () => {
     }>)[0];
     const promptPart = turn.content.find((part) => part.type === "input_text");
 
-    expect(promptPart?.text).toContain('Run the guided task "Summarize XLSX"');
+    expect(promptPart?.text).toContain('Run the guided task "Find XLSX anomalies"');
     expect(promptPart?.text).toContain("finance-q1.xlsx");
+    expect(promptPart?.text).toContain("xlsx-anomalies-export.csv");
     expect(turn.content).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: "input_file", file_id: "file-xlsx-1" }),

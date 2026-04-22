@@ -103,7 +103,7 @@ export const guidedDocumentTasks: GuidedDocumentTask[] = [
     composePrompt: (context) =>
       buildPrompt(
         "Summarize DOCX",
-        "Create a clear summary with key points, decisions, and next steps from the attached DOCX file.",
+        "Create a clear summary with key points, decisions, and next steps from the attached DOCX file. Also generate a downloadable markdown artifact named docx-summary-report.md containing that summary.",
         context,
       ),
   },
@@ -166,7 +166,7 @@ export const guidedDocumentTasks: GuidedDocumentTask[] = [
     composePrompt: (context) =>
       buildPrompt(
         "Find XLSX anomalies",
-        "Identify anomalies, outliers, and suspicious value patterns in the attached XLSX files, then suggest likely root causes.",
+        "Identify anomalies, outliers, and suspicious value patterns in the attached XLSX files, then suggest likely root causes. Also generate a downloadable CSV artifact named xlsx-anomalies-export.csv listing anomaly rows and reason codes.",
         context,
       ),
   },

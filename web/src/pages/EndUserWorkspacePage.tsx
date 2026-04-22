@@ -264,7 +264,7 @@ export default function EndUserWorkspacePage() {
               selectedFiles={selectedFiles}
               runPending={runPending}
               mismatchActive={mismatchActive}
-              onRunGuided={(prompt) => submitPrompt(prompt)}
+              onRunGuided={(prompt, options) => submitPrompt(prompt, options)}
             />
 
             <div className="border border-border/70 bg-background/50 p-3">

@@ -136,4 +136,36 @@ describe("buildGuidedPrompt", () => {
     expect(result.prompt).toContain(DOCUMENT_OUTCOME_ENVELOPE_START);
     expect(result.prompt).toContain(DOCUMENT_OUTCOME_ENVELOPE_END);
   });
+
+  it("requests deterministic downloadable artifacts for representative DOCX and XLSX tasks", () => {
+    const docxTask = getGuidedTaskById("docx-summary");
+    const xlsxTask = getGuidedTaskById("xlsx-anomalies");
+    expect(docxTask).toBeTruthy();
+    expect(xlsxTask).toBeTruthy();
+
+    const docxPrompt = buildGuidedPrompt(docxTask!, {
+      selectedFiles: [file("f1", "board-update.docx")],
+    });
+    const xlsxPrompt = buildGuidedPrompt(xlsxTask!, {
+      selectedFiles: [file("f2", "weekly-metrics.xlsx")],
+    });
+
+    expect(docxPrompt.ok).toBe(true);
+    expect(docxPrompt.prompt).toContain("docx-summary-report.md");
+    expect(xlsxPrompt.ok).toBe(true);
+    expect(xlsxPrompt.prompt).toContain("xlsx-anomalies-export.csv");
+  });
+
+  it("keeps non-representative guided tasks lightweight", () => {
+    const task = getGuidedTaskById("xlsx-summary");
+    expect(task).toBeTruthy();
+
+    const result = buildGuidedPrompt(task!, {
+      selectedFiles: [file("f1", "finance.xlsx")],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.prompt).not.toContain("docx-summary-report.md");
+    expect(result.prompt).not.toContain("xlsx-anomalies-export.csv");
+  });
 });
