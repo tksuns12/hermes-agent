@@ -302,6 +302,7 @@ describe("EndUserWorkspacePage runtime", () => {
     render(<EndUserWorkspacePage />);
 
     await screen.findByText(/work with your files in a live ai run\./i);
+    await screen.findByText("brief.md");
     fireEvent.click(screen.getAllByRole("checkbox")[0]);
 
     const composer = screen.getByPlaceholderText(/ask hermes to analyze or transform/i);
@@ -330,6 +331,67 @@ describe("EndUserWorkspacePage runtime", () => {
     await screen.findByText(/workspace safety lock active/i);
     expect(screen.getByText(/stored=tenant-old/i)).toBeTruthy();
     expect((screen.getByRole("button", { name: /^run$/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("rehydrates retained generated files after a file refresh", async () => {
+    mockApi.getWorkbenchFiles
+      .mockResolvedValueOnce(filesResult())
+      .mockResolvedValueOnce({
+        files: [
+          ...filesResult().files,
+          {
+            id: "file-gen-retained",
+            object: "file",
+            filename: "retained-output.csv",
+            bytes: 640,
+            created_at: NOW,
+            purpose: "assistant_output",
+            mime_type: "text/csv",
+            source: "assistant_output",
+            download_url: "/api/workbench/files/file-gen-retained/content",
+          },
+        ],
+        requestId: "req-files-refresh",
+        tenantId: "tenant-alpha",
+        tenantLabel: "Tenant Alpha",
+        tenantSource: "browser_cookie",
+      });
+
+    render(<EndUserWorkspacePage />);
+
+    await screen.findByText("brief.md");
+    fireEvent.click(screen.getByRole("button", { name: /refresh files/i }));
+
+    await waitFor(() => {
+      expect(mockApi.getWorkbenchFiles).toHaveBeenCalledTimes(2);
+    });
+
+    await screen.findByText("retained-output.csv");
+    expect(screen.getByText(/generated outputs \(1\)/i)).toBeTruthy();
+    expect(screen.getByText(/files_request_id=req-files-refresh/i)).toBeTruthy();
+  });
+
+  it("surfaces run-start proxy failures with request-id detail", async () => {
+    mockApi.createWorkbenchRun.mockRejectedValue(
+      new Error(
+        'Run create failed {"detail":{"message":"upstream exploded","request_id":"req-run-5xx"}}',
+      ),
+    );
+
+    render(<EndUserWorkspacePage />);
+
+    await screen.findByText(/work with your files in a live ai run\./i);
+
+    fireEvent.change(
+      screen.getByPlaceholderText(/ask hermes to analyze or transform/i),
+      { target: { value: "Trigger upstream failure" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    await screen.findByText(/runtime error:/i);
+    expect((await screen.findAllByText(/upstream exploded \(request: req-run-5xx\)/i)).length)
+      .toBeGreaterThan(0);
+    expect(mockApi.streamWorkbenchRunEvents).not.toHaveBeenCalled();
   });
 
   it("surfaces stream failures with explicit runtime error state", async () => {

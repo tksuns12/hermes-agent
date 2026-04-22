@@ -1169,6 +1169,35 @@ class TestWebServerEndpoints:
         assert resp.status_code == 404
         assert "<!doctype html>" not in resp.text.lower()
 
+    def test_generic_unknown_api_route_fails_closed_with_json_detail(self):
+        resp = self.client.get("/api/not-a-real-route")
+
+        assert resp.status_code == 404
+        assert resp.headers.get("content-type", "").startswith("application/json")
+        assert "<!doctype html>" not in resp.text.lower()
+
+        detail = resp.json()["detail"]
+        assert detail["code"] == "api_route_not_found"
+        assert detail["path"] == "/api/not-a-real-route"
+
+    def test_root_and_workbench_paths_serve_spa_shell(self):
+        root = self.client.get("/")
+        workbench = self.client.get("/workbench")
+
+        for resp in (root, workbench):
+            assert resp.status_code == 200
+            assert resp.headers.get("content-type", "").startswith("text/html")
+            assert "<!doctype html>" in resp.text.lower()
+            assert "window.__HERMES_SESSION_TOKEN__" in resp.text
+
+    def test_unknown_spa_route_serves_index_html(self):
+        resp = self.client.get("/workspace/not-real")
+
+        assert resp.status_code == 200
+        assert resp.headers.get("content-type", "").startswith("text/html")
+        assert "<!doctype html>" in resp.text.lower()
+        assert "window.__HERMES_SESSION_TOKEN__" in resp.text
+
     def test_path_traversal_blocked(self):
         """Verify URL-encoded path traversal is blocked."""
         # %2e%2e = ..
