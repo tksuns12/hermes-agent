@@ -543,6 +543,7 @@ class OutputFileStore:
                 created_at REAL NOT NULL,
                 purpose TEXT NOT NULL,
                 source TEXT NOT NULL,
+                source_run_id TEXT,
                 PRIMARY KEY (user_id, file_id)
             )"""
         )
@@ -564,6 +565,10 @@ class OutputFileStore:
             self._conn.execute(
                 "ALTER TABLE output_files ADD COLUMN source TEXT NOT NULL DEFAULT 'upload'"
             )
+        if "source_run_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE output_files ADD COLUMN source_run_id TEXT"
+            )
         self._conn.commit()
 
     def _write_metadata_file(self, meta: Dict[str, Any], tenant: str, *, target_dir: Path | None = None) -> None:
@@ -581,6 +586,7 @@ class OutputFileStore:
                 "created_at": meta["created_at"],
                 "path": meta["path"],
                 "source": meta.get("source"),
+                "source_run_id": meta.get("source_run_id"),
             }
             metadata_path.write_text(json.dumps(metadata, default=str))
         except Exception:
@@ -598,6 +604,7 @@ class OutputFileStore:
         created_at: float,
         purpose: str,
         source: str,
+        source_run_id: str | None = None,
     ) -> Dict[str, Any]:
         stored_path = get_user_subpath(tenant, "api_server", "files", storage_name)
         return {
@@ -609,6 +616,7 @@ class OutputFileStore:
             "path": str(stored_path),
             "purpose": purpose,
             "source": source,
+            "source_run_id": source_run_id,
         }
 
     def store_bytes(
@@ -620,6 +628,7 @@ class OutputFileStore:
         purpose: str = "uploads",
         mime_type: str | None = None,
         source: str = "upload",
+        source_run_id: str | None = None,
     ) -> Dict[str, Any]:
         tenant = self._tenant(user_id)
         if not isinstance(data, (bytes, bytearray)):
@@ -642,8 +651,8 @@ class OutputFileStore:
         created_at = time.time()
         self._conn.execute(
             "INSERT OR REPLACE INTO output_files "
-            "(user_id, file_id, storage_name, filename, mime_type, size_bytes, created_at, purpose, source) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(user_id, file_id, storage_name, filename, mime_type, size_bytes, created_at, purpose, source, source_run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 tenant,
                 file_id,
@@ -654,6 +663,7 @@ class OutputFileStore:
                 created_at,
                 purpose or "uploads",
                 source or "upload",
+                source_run_id,
             ),
         )
         self._conn.commit()
@@ -667,6 +677,7 @@ class OutputFileStore:
             created_at=created_at,
             purpose=purpose or "uploads",
             source=source or "upload",
+            source_run_id=source_run_id,
         )
         self._write_metadata_file(meta, tenant, target_dir=target_dir)
         return meta
@@ -678,6 +689,7 @@ class OutputFileStore:
         user_id: str | None = None,
         purpose: str = "output",
         source: str = "output_file",
+        source_run_id: str | None = None,
     ) -> Dict[str, Any]:
         tenant = self._tenant(user_id)
         source_path = Path(os.path.expanduser(file_path)).resolve()
@@ -702,8 +714,8 @@ class OutputFileStore:
         created_at = time.time()
         self._conn.execute(
             "INSERT OR REPLACE INTO output_files "
-            "(user_id, file_id, storage_name, filename, mime_type, size_bytes, created_at, purpose, source) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(user_id, file_id, storage_name, filename, mime_type, size_bytes, created_at, purpose, source, source_run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 tenant,
                 file_id,
@@ -714,6 +726,7 @@ class OutputFileStore:
                 created_at,
                 purpose or "output",
                 source or "output_file",
+                source_run_id,
             ),
         )
         self._conn.commit()
@@ -727,6 +740,7 @@ class OutputFileStore:
             created_at=created_at,
             purpose=purpose or "output",
             source=source or "output_file",
+            source_run_id=source_run_id,
         )
         self._write_metadata_file(meta, tenant, target_dir=target_dir)
         return meta
@@ -734,7 +748,7 @@ class OutputFileStore:
     def list(self, user_id: str | None = None) -> List[Dict[str, Any]]:
         tenant = self._tenant(user_id)
         rows = self._conn.execute(
-            "SELECT file_id, storage_name, filename, mime_type, size_bytes, created_at, purpose, source "
+            "SELECT file_id, storage_name, filename, mime_type, size_bytes, created_at, purpose, source, source_run_id "
             "FROM output_files WHERE user_id = ? ORDER BY created_at DESC",
             (tenant,),
         ).fetchall()
@@ -754,6 +768,7 @@ class OutputFileStore:
                     created_at=row["created_at"],
                     purpose=row["purpose"],
                     source=row["source"],
+                    source_run_id=row["source_run_id"],
                 )
             )
         return results
@@ -761,7 +776,7 @@ class OutputFileStore:
     def get(self, file_id: str, user_id: str | None = None) -> Optional[Dict[str, Any]]:
         tenant = self._tenant(user_id)
         row = self._conn.execute(
-            "SELECT storage_name, filename, mime_type, size_bytes, created_at, purpose, source "
+            "SELECT storage_name, filename, mime_type, size_bytes, created_at, purpose, source, source_run_id "
             "FROM output_files WHERE user_id = ? AND file_id = ?",
             (tenant, file_id),
         ).fetchone()
@@ -780,6 +795,7 @@ class OutputFileStore:
             created_at=row["created_at"],
             purpose=row["purpose"],
             source=row["source"],
+            source_run_id=row["source_run_id"],
         )
 
     def delete(self, file_id: str, user_id: str | None = None) -> bool:
@@ -2592,7 +2608,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # Build output items first so the stored history can use the same
         # cleaned assistant text returned to the client.
         try:
-            output_items, cleaned_final_response = self._extract_output_items(result, user_id=tenant)
+            output_items, cleaned_final_response = self._extract_output_items(
+                result,
+                user_id=tenant,
+                source_run_id=response_id,
+            )
         except _OutputArtifactError as exc:
             logger.warning("[api_server] output artifact failure: %s", exc.message)
             return web.json_response(_openai_error(exc.message, code=exc.code), status=exc.status)
@@ -2767,6 +2787,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "purpose": meta.get("purpose", "uploads"),
             "mime_type": meta.get("mime_type"),
             "source": meta.get("source"),
+            "source_run_id": meta.get("source_run_id"),
             "download_url": f"/v1/files/{meta['file_id']}/content",
         }
 
@@ -3194,6 +3215,7 @@ class APIServerAdapter(BasePlatformAdapter):
         final_text: str,
         *,
         user_id: str | None = None,
+        source_run_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         """Extract downloadable files from assistant text and copy them into tenant storage."""
         text = final_text or ""
@@ -3265,6 +3287,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     user_id=user_id,
                     purpose="output",
                     source="assistant_output",
+                    source_run_id=source_run_id,
                 )
                 staged_ids.append(meta["file_id"])
                 file_obj = self._serialize_file(meta)
@@ -3274,6 +3297,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "filename": meta["filename"],
                     "mime_type": meta["mime_type"],
                     "size_bytes": meta["size_bytes"],
+                    "source_run_id": meta.get("source_run_id"),
                     "download_url": file_obj["download_url"],
                     "file": file_obj,
                 })
@@ -3316,6 +3340,7 @@ class APIServerAdapter(BasePlatformAdapter):
         result: Dict[str, Any],
         *,
         user_id: str | None = None,
+        source_run_id: str | None = None,
     ) -> tuple[List[Dict[str, Any]], str]:
         """
         Build the full output item array from the agent's messages.
@@ -3351,7 +3376,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final:
             final = result.get("error", "(No response generated)")
 
-        output_files, cleaned_final = self._store_output_artifacts(final, user_id=user_id)
+        output_files, cleaned_final = self._store_output_artifacts(
+            final,
+            user_id=user_id,
+            source_run_id=source_run_id,
+        )
         items.extend(output_files)
         items.append({
             "type": "message",
@@ -3741,7 +3770,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                output_files, cleaned_final_response = self._store_output_artifacts(final_response, user_id=tenant)
+                output_files, cleaned_final_response = self._store_output_artifacts(
+                    final_response,
+                    user_id=tenant,
+                    source_run_id=run_id,
+                )
                 q.put_nowait({
                     "event": "run.completed",
                     "run_id": run_id,

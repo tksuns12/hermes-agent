@@ -2290,11 +2290,13 @@ class TestOutputFiles:
             assert output[0]["type"] == "output_file"
             assert output[0]["filename"] == "report.txt"
             assert output[0]["download_url"] == f"/v1/files/{output[0]['file_id']}/content"
+            assert output[0]["source_run_id"] == data["id"]
             file_obj = output[0]["file"]
             assert file_obj["id"] == output[0]["file_id"]
             assert file_obj["object"] == "file"
             assert file_obj["purpose"] == "output"
             assert file_obj["source"] == "assistant_output"
+            assert file_obj["source_run_id"] == data["id"]
             assert file_obj["download_url"] == output[0]["download_url"]
             assert output[1]["type"] == "message"
             assert output[1]["content"][0]["text"] == "Here is the report."
@@ -2311,6 +2313,7 @@ class TestOutputFiles:
             meta_body = await meta_resp.json()
             assert meta_body["purpose"] == "output"
             assert meta_body["source"] == "assistant_output"
+            assert meta_body["source_run_id"] == data["id"]
 
             download = await cli.get(
                 output[0]["download_url"],
@@ -2342,6 +2345,8 @@ class TestOutputFiles:
 
             data = await resp.json()
             file_id = data["output"][0]["file_id"]
+            assert data["output"][0]["source_run_id"] == data["id"]
+            assert data["output"][0]["file"]["source_run_id"] == data["id"]
 
             denied = await cli.get(
                 f"/v1/files/{file_id}/content",
@@ -2401,7 +2406,9 @@ class TestIntegratedFileWorkflows:
             data = await resp.json()
             output = data["output"]
             assert output[0]["type"] == "output_file"
+            assert output[0]["source_run_id"] == data["id"]
             assert output[0]["file"]["id"] == output[0]["file_id"]
+            assert output[0]["file"]["source_run_id"] == data["id"]
             assert output[0]["file"]["download_url"] == output[0]["download_url"]
             assert "Analysis complete" in output[1]["content"][0]["text"]
             assert "File:" not in output[1]["content"][0]["text"]
@@ -2409,6 +2416,14 @@ class TestIntegratedFileWorkflows:
             user_msg = mock_run.call_args.kwargs["user_message"]
             assert "input.txt" in user_msg
             assert "hello upload" in user_msg
+
+            uploaded_meta = await cli.get(
+                f"/v1/files/{file_id}",
+                headers={"X-Hermes-User-Id": "alpha"},
+            )
+            assert uploaded_meta.status == 200
+            uploaded_meta_body = await uploaded_meta.json()
+            assert uploaded_meta_body["source_run_id"] is None
 
             download = await cli.get(output[0]["download_url"], headers={"X-Hermes-User-Id": "alpha"})
             assert download.status == 200
@@ -3177,6 +3192,69 @@ class TestRunsEndpoint:
                 assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in call_kwargs["user_message"]
                 assert "tenant scoped workbook" not in call_kwargs["user_message"]
                 assert mock_create_agent.call_args.kwargs["user_id"] == "owner"
+
+    @pytest.mark.asyncio
+    async def test_run_events_stage_output_files_with_source_run_id(self, adapter, tmp_path):
+        artifact = tmp_path / "run-report.txt"
+        artifact.write_text("run output")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create_agent:
+                fake_agent = MagicMock()
+                fake_agent.run_conversation.return_value = {
+                    "final_response": f"Done.\n📎 File: {artifact}",
+                    "messages": [{"role": "assistant", "content": f"Done.\n📎 File: {artifact}"}],
+                    "api_calls": 1,
+                }
+                fake_agent.session_prompt_tokens = 0
+                fake_agent.session_completion_tokens = 0
+                fake_agent.session_total_tokens = 0
+                mock_create_agent.return_value = fake_agent
+
+                start = await cli.post(
+                    "/v1/runs",
+                    headers={"X-Hermes-User-Id": "runner"},
+                    json={"input": "generate artifact"},
+                )
+                assert start.status == 202
+                run_id = (await start.json())["run_id"]
+
+                events_resp = await cli.get(
+                    f"/v1/runs/{run_id}/events",
+                    headers={"X-Hermes-User-Id": "runner"},
+                )
+                assert events_resp.status == 200
+                raw_sse = await events_resp.text()
+
+            data_events = []
+            for line in raw_sse.splitlines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[len("data: "):].strip()
+                if not payload:
+                    continue
+                data_events.append(json.loads(payload))
+
+            completed_events = [evt for evt in data_events if evt.get("event") == "run.completed"]
+            assert len(completed_events) == 1
+            completed = completed_events[0]
+            assert completed["run_id"] == run_id
+            assert len(completed["files"]) == 1
+
+            output_file = completed["files"][0]
+            assert output_file["type"] == "output_file"
+            assert output_file["source_run_id"] == run_id
+            assert output_file["file"]["source_run_id"] == run_id
+            assert output_file["download_url"].startswith("/v1/files/")
+
+            meta_resp = await cli.get(
+                f"/v1/files/{output_file['file_id']}",
+                headers={"X-Hermes-User-Id": "runner"},
+            )
+            assert meta_resp.status == 200
+            meta = await meta_resp.json()
+            assert meta["source_run_id"] == run_id
 
     @pytest.mark.asyncio
     async def test_runs_reject_missing_or_foreign_input_file(self, adapter):
