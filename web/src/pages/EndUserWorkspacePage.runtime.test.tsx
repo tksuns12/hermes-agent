@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import EndUserWorkspacePage from "./EndUserWorkspacePage";
 
 const mockApi = vi.hoisted(() => ({
@@ -177,6 +177,40 @@ function filesResult(tenantId = "tenant-alpha") {
         source: "upload",
         download_url: "/api/workbench/files/file-1/content",
       },
+      {
+        id: "file-docx",
+        object: "file",
+        filename: "meeting-notes.docx",
+        bytes: 2624,
+        created_at: NOW,
+        purpose: "uploads",
+        mime_type:
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        source: "upload",
+        download_url: "/api/workbench/files/file-docx/content",
+      },
+      {
+        id: "file-xlsx-1",
+        object: "file",
+        filename: "finance-q1.xlsx",
+        bytes: 3610,
+        created_at: NOW,
+        purpose: "uploads",
+        mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        source: "upload",
+        download_url: "/api/workbench/files/file-xlsx-1/content",
+      },
+      {
+        id: "file-xlsx-2",
+        object: "file",
+        filename: "finance-q2.xlsx",
+        bytes: 3720,
+        created_at: NOW,
+        purpose: "uploads",
+        mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        source: "upload",
+        download_url: "/api/workbench/files/file-xlsx-2/content",
+      },
     ],
     requestId: "req-files",
     tenantId,
@@ -247,6 +281,22 @@ function configureHappyPathMocks() {
   );
 }
 
+function toggleFileSelectionByName(filename: string) {
+  const fileLabel = screen.getByText(filename).closest("label");
+  expect(fileLabel).toBeTruthy();
+  const checkbox = within(fileLabel as HTMLElement).getByRole("checkbox");
+  fireEvent.click(checkbox);
+}
+
+function latestRunPayload() {
+  const lastCall = mockApi.createWorkbenchRun.mock.calls.at(-1);
+  expect(lastCall).toBeTruthy();
+  return lastCall?.[0] as {
+    session_id?: string;
+    input: unknown;
+  };
+}
+
 beforeEach(() => {
   installLocalStorageShim();
   vi.clearAllMocks();
@@ -271,8 +321,7 @@ describe("EndUserWorkspacePage runtime", () => {
     const uploadEntries = await screen.findAllByText("upload.txt");
     expect(uploadEntries.length).toBeGreaterThan(0);
 
-    const firstCheckbox = screen.getAllByRole("checkbox")[0];
-    fireEvent.click(firstCheckbox);
+    toggleFileSelectionByName("brief.md");
 
     fireEvent.change(
       screen.getByPlaceholderText(/ask hermes to analyze or transform/i),
@@ -303,7 +352,7 @@ describe("EndUserWorkspacePage runtime", () => {
 
     await screen.findByText(/work with your files in a live ai run\./i);
     await screen.findByText("brief.md");
-    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    toggleFileSelectionByName("brief.md");
 
     const composer = screen.getByPlaceholderText(/ask hermes to analyze or transform/i);
     fireEvent.change(composer, { target: { value: "   " } });
@@ -312,6 +361,112 @@ describe("EndUserWorkspacePage runtime", () => {
     expect((runButton as HTMLButtonElement).disabled).toBe(true);
     expect(mockApi.createWorkbenchRun).not.toHaveBeenCalled();
     expect(screen.getByText(/attached to next run \(1\)/i)).toBeTruthy();
+  });
+
+  it("submits guided DOCX runs with selected-file context and keeps freeform fallback visible", async () => {
+    render(<EndUserWorkspacePage />);
+
+    await screen.findByText("meeting-notes.docx");
+    expect(screen.getByText(/freeform fallback/i)).toBeTruthy();
+
+    toggleFileSelectionByName("meeting-notes.docx");
+
+    fireEvent.change(screen.getByLabelText(/guided task/i), {
+      target: { value: "docx-summary" },
+    });
+    fireEvent.change(screen.getByLabelText(/summary focus/i), {
+      target: { value: "Emphasize executive decisions" },
+    });
+
+    expect(screen.getByText(/Selected files for this task \(1\)/i)).toBeTruthy();
+    expect(screen.getAllByText("meeting-notes.docx").length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole("button", { name: /run guided task/i }));
+
+    await waitFor(() => {
+      expect(mockApi.createWorkbenchRun).toHaveBeenCalledTimes(1);
+    });
+
+    const runPayload = latestRunPayload();
+    expect(runPayload.session_id).toBe("sess-1");
+
+    const turn = (runPayload.input as Array<{
+      content: Array<{ type: string; text?: string; file_id?: string }>;
+    }>)[0];
+    const promptPart = turn.content.find((part) => part.type === "input_text");
+
+    expect(promptPart?.text).toContain('Run the guided task "Summarize DOCX"');
+    expect(promptPart?.text).toContain("meeting-notes.docx");
+    expect(turn.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "input_file", file_id: "file-docx" }),
+      ]),
+    );
+
+    await screen.findByText(/Run completed/i);
+  });
+
+  it("keeps freeform composer available when guided local validation blocks submit", async () => {
+    render(<EndUserWorkspacePage />);
+
+    await screen.findByText(/work with your files in a live ai run\./i);
+    expect(screen.getByText(/select at least 1 \.docx file/i)).toBeTruthy();
+
+    const guidedRunButton = screen.getByRole("button", { name: /run guided task/i });
+    expect((guidedRunButton as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.change(
+      screen.getByPlaceholderText(/ask hermes to analyze or transform/i),
+      { target: { value: "Fallback freeform run" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    await waitFor(() => {
+      expect(mockApi.createWorkbenchRun).toHaveBeenCalledTimes(1);
+    });
+
+    const runPayload = latestRunPayload();
+    expect(typeof runPayload.input).toBe("string");
+  });
+
+  it("recovers guided eligibility after task/file switches and submits XLSX runs", async () => {
+    render(<EndUserWorkspacePage />);
+
+    await screen.findByText("finance-q1.xlsx");
+
+    toggleFileSelectionByName("finance-q1.xlsx");
+    expect(screen.getByText(/only accepts \.docx files/i)).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText(/guided task/i), {
+      target: { value: "xlsx-summary" },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/selection is eligible for this guided task/i)).toBeTruthy();
+    });
+
+    const guidedRunButton = screen.getByRole("button", { name: /run guided task/i });
+    expect((guidedRunButton as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(guidedRunButton);
+
+    await waitFor(() => {
+      expect(mockApi.createWorkbenchRun).toHaveBeenCalledTimes(1);
+    });
+
+    const runPayload = latestRunPayload();
+    const turn = (runPayload.input as Array<{
+      content: Array<{ type: string; text?: string; file_id?: string }>;
+    }>)[0];
+    const promptPart = turn.content.find((part) => part.type === "input_text");
+
+    expect(promptPart?.text).toContain('Run the guided task "Summarize XLSX"');
+    expect(promptPart?.text).toContain("finance-q1.xlsx");
+    expect(turn.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "input_file", file_id: "file-xlsx-1" }),
+      ]),
+    );
+    expect(screen.getByPlaceholderText(/ask hermes to analyze or transform/i)).toBeTruthy();
   });
 
   it("shows tenant mismatch warning when stored tenant drifts", async () => {

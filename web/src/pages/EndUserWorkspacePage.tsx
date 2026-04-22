@@ -3,6 +3,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Toast } from "@/components/Toast";
 import { DocumentRail } from "@/components/workspace/DocumentRail";
+import { GuidedTaskPanel } from "@/components/workspace/GuidedTaskPanel";
 import { RunComposer } from "@/components/workspace/RunComposer";
 import { useDocumentWorkspaceRuntime } from "@/hooks/useDocumentWorkspaceRuntime";
 import { timeAgo } from "@/lib/utils";
@@ -47,6 +48,7 @@ export default function EndUserWorkspacePage() {
     runError,
     runRequestId,
     streamRequestId,
+    submitPrompt,
     submitComposer,
     mismatchActive,
     tenantMismatchWarning,
@@ -254,18 +256,30 @@ export default function EndUserWorkspacePage() {
               )}
             </div>
 
-            <RunComposer
-              value={composer}
-              onChange={setComposer}
-              onSubmit={submitComposer}
-              pending={runPending}
-              disabled={mismatchActive}
+            <GuidedTaskPanel
+              selectedFiles={selectedFiles}
+              runPending={runPending}
               mismatchActive={mismatchActive}
-              selectedFileCount={selectedFileIds.length}
-              placeholder="Ask Hermes to analyze or transform your uploaded documents..."
-              submitLabel="Run"
-              pendingLabel="Running..."
+              onRunGuided={(prompt) => submitPrompt(prompt)}
             />
+
+            <div className="border border-border/70 bg-background/50 p-3">
+              <p className="mb-2 text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+                Freeform fallback
+              </p>
+              <RunComposer
+                value={composer}
+                onChange={setComposer}
+                onSubmit={submitComposer}
+                pending={runPending}
+                disabled={mismatchActive}
+                mismatchActive={mismatchActive}
+                selectedFileCount={selectedFileIds.length}
+                placeholder="Ask Hermes to analyze or transform your uploaded documents..."
+                submitLabel="Run"
+                pendingLabel="Running..."
+              />
+            </div>
 
             <p className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
               <Sparkles className="h-3.5 w-3.5" />
