@@ -15,6 +15,11 @@ import type {
   WorkbenchRunOutputFile,
 } from "@/lib/api";
 import { useToast } from "@/hooks/useToast";
+import {
+  parseDocumentOutcomeEnvelope,
+  type DocumentOutcomeParseIssue,
+  type DocumentOutcomeStatus,
+} from "@/features/end-user/documentOutcomeContract";
 
 export type WorkspaceActivityKind =
   | "run"
@@ -57,7 +62,17 @@ export interface WorkspaceGeneratedFile {
   filename: string;
   sizeBytes?: number;
   mimeType?: string;
+  sourceRunId?: string;
   downloadUrl: string;
+}
+
+export interface WorkspaceRunOutcome {
+  status: DocumentOutcomeStatus;
+  explanation: string;
+  nextSteps: string[];
+  isFallback: boolean;
+  parseIssue?: DocumentOutcomeParseIssue;
+  sourceRunId?: string;
 }
 
 interface LastSeenTenantRecord {
@@ -214,6 +229,8 @@ function normalizeGeneratedFiles(
             ? item.file.bytes
             : undefined,
       mimeType: item.mime_type || item.file?.mime_type,
+      sourceRunId:
+        item.source_run_id?.trim() || item.file?.source_run_id?.trim() || undefined,
       downloadUrl: getWorkbenchFileDownloadUrl(id),
     });
   }
@@ -228,11 +245,43 @@ function mergeGeneratedFiles(
   if (incoming.length === 0) return existing;
 
   const byId = new Map(existing.map((file) => [file.id, file]));
-  for (const file of incoming) {
-    byId.set(file.id, file);
+  for (const incomingFile of incoming) {
+    const existingFile = byId.get(incomingFile.id);
+    byId.set(incomingFile.id, {
+      ...existingFile,
+      ...incomingFile,
+      sourceRunId: incomingFile.sourceRunId ?? existingFile?.sourceRunId,
+      sizeBytes: incomingFile.sizeBytes ?? existingFile?.sizeBytes,
+      mimeType: incomingFile.mimeType ?? existingFile?.mimeType,
+    });
   }
 
   return Array.from(byId.values()).sort((a, b) => a.filename.localeCompare(b.filename));
+}
+
+function getMostRecentGeneratedSourceRunId(
+  retainedFiles: WorkbenchFileMetadata[],
+): string | undefined {
+  let bestCreatedAt = Number.NEGATIVE_INFINITY;
+  let sourceRunId: string | undefined;
+
+  for (const file of retainedFiles) {
+    if (file.source !== "assistant_output") continue;
+    const candidateRunId = file.source_run_id?.trim();
+    if (!candidateRunId) continue;
+
+    const createdAt =
+      typeof file.created_at === "number" && Number.isFinite(file.created_at)
+        ? file.created_at
+        : Number.NEGATIVE_INFINITY;
+
+    if (createdAt >= bestCreatedAt) {
+      bestCreatedAt = createdAt;
+      sourceRunId = candidateRunId;
+    }
+  }
+
+  return sourceRunId;
 }
 
 function readLastSeenTenantRecord(): LastSeenTenantRecord | null {
@@ -360,6 +409,7 @@ export function useDocumentWorkspaceRuntime() {
     useState<TenantMismatchWarning | null>(null);
 
   const [generatedFiles, setGeneratedFiles] = useState<WorkspaceGeneratedFile[]>([]);
+  const [runOutcome, setRunOutcome] = useState<WorkspaceRunOutcome | null>(null);
   const [activityEntries, setActivityEntries] = useState<WorkspaceActivityEntry[]>([]);
 
   const activityIdRef = useRef(0);
@@ -425,6 +475,7 @@ export function useDocumentWorkspaceRuntime() {
     setSelectedFileIds([]);
 
     setGeneratedFiles([]);
+    setRunOutcome(null);
     setActivityEntries([]);
 
     setSessionsLoading(false);
@@ -684,12 +735,39 @@ export function useDocumentWorkspaceRuntime() {
         filename: file.filename,
         sizeBytes: file.bytes,
         mimeType: file.mime_type,
+        sourceRunId: file.source_run_id,
         downloadUrl: getWorkbenchFileDownloadUrl(file.id),
       } satisfies WorkspaceGeneratedFile));
 
     if (derived.length === 0) return;
     setGeneratedFiles((current) => mergeGeneratedFiles(current, derived));
   }, [retainedFiles]);
+
+  useEffect(() => {
+    if (runPending) return;
+    if (messages.length === 0) {
+      setRunOutcome(null);
+      return;
+    }
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== "assistant") continue;
+
+      const content = typeof message.content === "string" ? message.content.trim() : "";
+      if (!content) continue;
+
+      const parsed = parseDocumentOutcomeEnvelope(content);
+      const sourceRunId = getMostRecentGeneratedSourceRunId(retainedFiles);
+      setRunOutcome({
+        ...parsed.outcome,
+        sourceRunId,
+      });
+      return;
+    }
+
+    setRunOutcome(null);
+  }, [messages, retainedFiles, runPending]);
 
   useEffect(() => {
     return () => {
@@ -821,6 +899,7 @@ export function useDocumentWorkspaceRuntime() {
       setRunError(null);
       setRunRequestId(null);
       setStreamRequestId(null);
+      setRunOutcome(null);
       malformedStreamWarningShownRef.current = false;
 
       const baseSessionId = selectedSessionId;
@@ -913,9 +992,29 @@ export function useDocumentWorkspaceRuntime() {
                   break;
                 }
                 case "run.completed": {
-                  if (typeof evt.output === "string" && evt.output.trim()) {
-                    setMessages((prev) => ensureAssistantOutput(prev, evt.output ?? ""));
+                  if (typeof evt.output === "string") {
+                    const parsedOutcome = parseDocumentOutcomeEnvelope(evt.output);
+                    const displayOutput =
+                      parsedOutcome.strippedOutput || parsedOutcome.outcome.explanation;
+
+                    if (displayOutput.trim()) {
+                      setMessages((prev) => ensureAssistantOutput(prev, displayOutput));
+                    }
+
+                    setRunOutcome({
+                      ...parsedOutcome.outcome,
+                      sourceRunId: evt.run_id || undefined,
+                    });
+
+                    if (parsedOutcome.outcome.isFallback) {
+                      appendActivity(
+                        "run",
+                        "error",
+                        `Structured outcome envelope ${parsedOutcome.outcome.parseIssue ?? "unknown_issue"}; defaulted to unsupported boundary state.`,
+                      );
+                    }
                   }
+
                   const outputFiles = normalizeGeneratedFiles(evt.files);
                   if (outputFiles.length > 0) {
                     setGeneratedFiles((prev) => mergeGeneratedFiles(prev, outputFiles));
@@ -932,6 +1031,7 @@ export function useDocumentWorkspaceRuntime() {
                     typeof evt.error === "string" && evt.error.trim()
                       ? evt.error
                       : "Run failed.";
+                  setRunOutcome(null);
                   setRunError(`Run failed: ${detail}`);
                   appendActivity("run", "error", `Run failed: ${detail}`);
                   break;
@@ -1073,6 +1173,7 @@ export function useDocumentWorkspaceRuntime() {
     handleDownloadFile,
 
     generatedFiles,
+    runOutcome,
 
     composer,
     setComposer,

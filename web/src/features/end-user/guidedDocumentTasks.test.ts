@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  DOCUMENT_OUTCOME_ENVELOPE_END,
+  DOCUMENT_OUTCOME_ENVELOPE_START,
+  OFFICE_OUTCOME_ENVELOPE_INSTRUCTION,
+} from "./documentOutcomeContract";
+import {
   HONEST_OFFICE_BOUNDARY_INSTRUCTION,
   buildGuidedPrompt,
   evaluateGuidedTaskEligibility,
@@ -113,7 +118,7 @@ describe("buildGuidedPrompt", () => {
     expect(result.error).toMatch(/only accepts \.xlsx/i);
   });
 
-  it("composes plain prompt text with honest Office-boundary instructions", () => {
+  it("composes plain prompt text with honest Office-boundary and structured outcome instructions", () => {
     const task = getGuidedTaskById("docx-action-items");
     expect(task).toBeTruthy();
 
@@ -127,5 +132,8 @@ describe("buildGuidedPrompt", () => {
     expect(result.prompt).toContain("notes.docx");
     expect(result.prompt).toContain("Highlight blocker ownership");
     expect(result.prompt).toContain(HONEST_OFFICE_BOUNDARY_INSTRUCTION);
+    expect(result.prompt).toContain(OFFICE_OUTCOME_ENVELOPE_INSTRUCTION);
+    expect(result.prompt).toContain(DOCUMENT_OUTCOME_ENVELOPE_START);
+    expect(result.prompt).toContain(DOCUMENT_OUTCOME_ENVELOPE_END);
   });
 });

@@ -1,3 +1,5 @@
+import { OFFICE_OUTCOME_ENVELOPE_INSTRUCTION } from "./documentOutcomeContract";
+
 export type GuidedOfficeExtension = "docx" | "xlsx";
 
 export interface GuidedTaskFile {
@@ -76,6 +78,7 @@ function buildPrompt(
     instruction,
     detail ? `User focus detail: ${detail}.` : null,
     HONEST_OFFICE_BOUNDARY_INSTRUCTION,
+    OFFICE_OUTCOME_ENVELOPE_INSTRUCTION,
     "Return concise, actionable output and reference which attached file supports each conclusion.",
   ];
 
@@ -266,6 +269,10 @@ export function validateGuidedTaskCatalog(tasks: GuidedDocumentTask[]): string[]
 
     if (!samplePrompt.includes(HONEST_OFFICE_BOUNDARY_INSTRUCTION)) {
       errors.push(`Task ${task.id} prompt must include honest Office-boundary guidance.`);
+    }
+
+    if (!samplePrompt.includes(OFFICE_OUTCOME_ENVELOPE_INSTRUCTION)) {
+      errors.push(`Task ${task.id} prompt must include structured Office outcome guidance.`);
     }
   }
 

@@ -152,6 +152,10 @@ function normalizeWorkbenchFileMetadata(
         mime_type:
             typeof payload.mime_type === "string" ? payload.mime_type : undefined,
         source: typeof payload.source === "string" ? payload.source : undefined,
+        source_run_id:
+            typeof payload.source_run_id === "string" && payload.source_run_id.trim()
+                ? payload.source_run_id.trim()
+                : undefined,
         download_url:
             typeof payload.download_url === "string"
                 ? payload.download_url
@@ -877,6 +881,7 @@ export interface WorkbenchFileMetadata {
     purpose?: string;
     mime_type?: string;
     source?: string;
+    source_run_id?: string;
     download_url: string;
 }
 
@@ -925,6 +930,7 @@ export interface WorkbenchRunOutputFile {
     filename?: string;
     mime_type?: string;
     size_bytes?: number;
+    source_run_id?: string;
     download_url?: string;
     file?: {
         id?: string;
@@ -933,6 +939,7 @@ export interface WorkbenchRunOutputFile {
         mime_type?: string;
         purpose?: string;
         source?: string;
+        source_run_id?: string;
     };
 }
 
