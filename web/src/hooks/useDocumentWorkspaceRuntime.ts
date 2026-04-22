@@ -798,209 +798,230 @@ export function useDocumentWorkspaceRuntime() {
     [appendActivity, ensureTenantMetaAligned, mismatchActive, showToast],
   );
 
-  const submitComposer = useCallback(async () => {
-    const prompt = composer.trim();
-    if (!prompt) {
-      setRunError("Prompt cannot be empty.");
-      showToast("Prompt cannot be empty.", "error");
-      return;
-    }
-
-    if (runPending || bootstrapLoading || !bootstrap || mismatchActive) return;
-
-    setComposer("");
-    setRunPending(true);
-    setRunError(null);
-    setRunRequestId(null);
-    setStreamRequestId(null);
-    malformedStreamWarningShownRef.current = false;
-
-    const baseSessionId = selectedSessionId;
-
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content: prompt, timestamp: Date.now() / 1000 },
-      { role: "assistant", content: "" },
-    ]);
-
-    appendActivity(
-      "run",
-      "info",
-      `Run started${selectedFileIds.length > 0 ? ` with ${selectedFileIds.length} attached file(s)` : ""}.`,
-    );
-
-    try {
-      const payload = buildWorkbenchRunPayload({
-        prompt,
-        sessionId: baseSessionId,
-        selectedFileIds,
-      });
-
-      const runStart = await withTimeout(
-        api.createWorkbenchRun(payload),
-        "run_start",
-        REQUEST_TIMEOUT_MS,
-      );
-      setRunRequestId(runStart.requestId ?? null);
-
-      if (!ensureTenantMetaAligned("run_start", runStart)) {
-        return;
+  const submitPrompt = useCallback(
+    async (
+      rawPrompt: string,
+      options?: {
+        clearComposer?: boolean;
+      },
+    ) => {
+      const prompt = rawPrompt.trim();
+      if (!prompt) {
+        setRunError("Prompt cannot be empty.");
+        showToast("Prompt cannot be empty.", "error");
+        return false;
       }
 
-      appendActivity("run", "info", `Upstream run started: ${runStart.runId}`, runStart.requestId);
+      if (runPending || bootstrapLoading || !bootstrap || mismatchActive) return false;
 
-      if (runStart.sessionId && runStart.sessionId !== selectedSessionId) {
-        setSelectedSessionId(runStart.sessionId);
+      if (options?.clearComposer) {
+        setComposer("");
       }
+      setRunPending(true);
+      setRunError(null);
+      setRunRequestId(null);
+      setStreamRequestId(null);
+      malformedStreamWarningShownRef.current = false;
 
-      const streamAbortController = new AbortController();
-      streamAbortRef.current = streamAbortController;
+      const baseSessionId = selectedSessionId;
 
-      const streamMeta = await withTimeout(
-        api.streamWorkbenchRunEvents(
-          runStart.runId,
-          (evt: WorkbenchRunEvent) => {
-            if (!evt || typeof evt !== "object" || typeof evt.event !== "string") {
-              if (!malformedStreamWarningShownRef.current) {
-                malformedStreamWarningShownRef.current = true;
-                appendActivity(
-                  "stream",
-                  "error",
-                  "Malformed stream payload ignored; workspace state was not mutated.",
-                );
-              }
-              return;
-            }
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: prompt, timestamp: Date.now() / 1000 },
+        { role: "assistant", content: "" },
+      ]);
 
-            switch (evt.event) {
-              case "message.delta":
-                if (typeof evt.delta === "string" && evt.delta.length > 0) {
-                  setMessages((prev) => appendAssistantDelta(prev, evt.delta ?? ""));
-                }
-                break;
-              case "reasoning.available":
-                if (evt.text) {
-                  appendActivity("reasoning", "info", evt.text);
-                }
-                break;
-              case "tool.started":
-                appendActivity("tool", "info", `Tool started: ${evt.tool ?? "unknown"}`);
-                break;
-              case "tool.completed": {
-                const hadError = evt.error === true;
-                const durationSuffix =
-                  typeof evt.duration === "number" && Number.isFinite(evt.duration)
-                    ? ` (${evt.duration.toFixed(2)}s)`
-                    : "";
-                appendActivity(
-                  "tool",
-                  hadError ? "error" : "success",
-                  `Tool ${hadError ? "failed" : "completed"}: ${evt.tool ?? "unknown"}${durationSuffix}`,
-                );
-                break;
-              }
-              case "run.completed": {
-                if (typeof evt.output === "string" && evt.output.trim()) {
-                  setMessages((prev) => ensureAssistantOutput(prev, evt.output ?? ""));
-                }
-                const outputFiles = normalizeGeneratedFiles(evt.files);
-                if (outputFiles.length > 0) {
-                  setGeneratedFiles((prev) => mergeGeneratedFiles(prev, outputFiles));
-                }
-                appendActivity(
-                  "run",
-                  "success",
-                  `Run completed${outputFiles.length > 0 ? ` with ${outputFiles.length} generated file(s)` : ""}.`,
-                );
-                break;
-              }
-              case "run.failed": {
-                const detail =
-                  typeof evt.error === "string" && evt.error.trim()
-                    ? evt.error
-                    : "Run failed.";
-                setRunError(`Run failed: ${detail}`);
-                appendActivity("run", "error", `Run failed: ${detail}`);
-                break;
-              }
-              default:
-                if (!isTenantMismatchFlow(evt.event)) {
-                  // Unknown stream events are ignored to keep parser + UI resilient.
-                }
-                break;
-            }
-          },
-          streamAbortController.signal,
-        ),
-        "run_stream",
-        STREAM_TIMEOUT_MS,
-        () => streamAbortController.abort(),
+      appendActivity(
+        "run",
+        "info",
+        `Run started${selectedFileIds.length > 0 ? ` with ${selectedFileIds.length} attached file(s)` : ""}.`,
       );
 
-      streamAbortRef.current = null;
-      setStreamRequestId(streamMeta.requestId ?? null);
+      try {
+        const payload = buildWorkbenchRunPayload({
+          prompt,
+          sessionId: baseSessionId,
+          selectedFileIds,
+        });
 
-      if (!ensureTenantMetaAligned("run_stream", streamMeta)) {
-        return;
-      }
+        const runStart = await withTimeout(
+          api.createWorkbenchRun(payload),
+          "run_start",
+          REQUEST_TIMEOUT_MS,
+        );
+        setRunRequestId(runStart.requestId ?? null);
 
-      const nextSessionId = streamMeta.sessionId ?? runStart.sessionId ?? baseSessionId ?? null;
-
-      await Promise.all([loadSessions(), loadFiles()]);
-      if (nextSessionId) {
-        setSelectedSessionId(nextSessionId);
-        await loadMessages(nextSessionId);
-      }
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") {
-        appendActivity("stream", "info", "Run stream aborted due to tenant safety guard.");
-        return;
-      }
-
-      const detail = formatApiError(error);
-      const withPhase =
-        error instanceof RuntimeTimeoutError
-          ? `Run ${error.phase.replace("_", " ")} timed out after ${Math.round(error.timeoutMs / 1000)}s.`
-          : detail;
-
-      setRunError(withPhase);
-      appendActivity("run", "error", `Run error: ${withPhase}`);
-
-      setMessages((prev) => {
-        const next = [...prev];
-        for (let i = next.length - 1; i >= 0; i--) {
-          if (next[i].role === "assistant" && !next[i].content?.trim()) {
-            next[i] = {
-              ...next[i],
-              role: "system",
-              content: `⚠️ ${withPhase}`,
-            };
-            return next;
-          }
+        if (!ensureTenantMetaAligned("run_start", runStart)) {
+          return false;
         }
-        return [...next, { role: "system", content: `⚠️ ${withPhase}` }];
-      });
 
-      showToast(`Run failed: ${withPhase}`, "error");
-    } finally {
-      streamAbortRef.current = null;
-      setRunPending(false);
-    }
-  }, [
-    appendActivity,
-    bootstrap,
-    bootstrapLoading,
-    composer,
-    ensureTenantMetaAligned,
-    loadFiles,
-    loadMessages,
-    loadSessions,
-    mismatchActive,
-    runPending,
-    selectedFileIds,
-    selectedSessionId,
-    showToast,
-  ]);
+        appendActivity(
+          "run",
+          "info",
+          `Upstream run started: ${runStart.runId}`,
+          runStart.requestId,
+        );
+
+        if (runStart.sessionId && runStart.sessionId !== selectedSessionId) {
+          setSelectedSessionId(runStart.sessionId);
+        }
+
+        const streamAbortController = new AbortController();
+        streamAbortRef.current = streamAbortController;
+
+        const streamMeta = await withTimeout(
+          api.streamWorkbenchRunEvents(
+            runStart.runId,
+            (evt: WorkbenchRunEvent) => {
+              if (!evt || typeof evt !== "object" || typeof evt.event !== "string") {
+                if (!malformedStreamWarningShownRef.current) {
+                  malformedStreamWarningShownRef.current = true;
+                  appendActivity(
+                    "stream",
+                    "error",
+                    "Malformed stream payload ignored; workspace state was not mutated.",
+                  );
+                }
+                return;
+              }
+
+              switch (evt.event) {
+                case "message.delta":
+                  if (typeof evt.delta === "string" && evt.delta.length > 0) {
+                    setMessages((prev) => appendAssistantDelta(prev, evt.delta ?? ""));
+                  }
+                  break;
+                case "reasoning.available":
+                  if (evt.text) {
+                    appendActivity("reasoning", "info", evt.text);
+                  }
+                  break;
+                case "tool.started":
+                  appendActivity("tool", "info", `Tool started: ${evt.tool ?? "unknown"}`);
+                  break;
+                case "tool.completed": {
+                  const hadError = evt.error === true;
+                  const durationSuffix =
+                    typeof evt.duration === "number" && Number.isFinite(evt.duration)
+                      ? ` (${evt.duration.toFixed(2)}s)`
+                      : "";
+                  appendActivity(
+                    "tool",
+                    hadError ? "error" : "success",
+                    `Tool ${hadError ? "failed" : "completed"}: ${evt.tool ?? "unknown"}${durationSuffix}`,
+                  );
+                  break;
+                }
+                case "run.completed": {
+                  if (typeof evt.output === "string" && evt.output.trim()) {
+                    setMessages((prev) => ensureAssistantOutput(prev, evt.output ?? ""));
+                  }
+                  const outputFiles = normalizeGeneratedFiles(evt.files);
+                  if (outputFiles.length > 0) {
+                    setGeneratedFiles((prev) => mergeGeneratedFiles(prev, outputFiles));
+                  }
+                  appendActivity(
+                    "run",
+                    "success",
+                    `Run completed${outputFiles.length > 0 ? ` with ${outputFiles.length} generated file(s)` : ""}.`,
+                  );
+                  break;
+                }
+                case "run.failed": {
+                  const detail =
+                    typeof evt.error === "string" && evt.error.trim()
+                      ? evt.error
+                      : "Run failed.";
+                  setRunError(`Run failed: ${detail}`);
+                  appendActivity("run", "error", `Run failed: ${detail}`);
+                  break;
+                }
+                default:
+                  if (!isTenantMismatchFlow(evt.event)) {
+                    // Unknown stream events are ignored to keep parser + UI resilient.
+                  }
+                  break;
+              }
+            },
+            streamAbortController.signal,
+          ),
+          "run_stream",
+          STREAM_TIMEOUT_MS,
+          () => streamAbortController.abort(),
+        );
+
+        streamAbortRef.current = null;
+        setStreamRequestId(streamMeta.requestId ?? null);
+
+        if (!ensureTenantMetaAligned("run_stream", streamMeta)) {
+          return false;
+        }
+
+        const nextSessionId = streamMeta.sessionId ?? runStart.sessionId ?? baseSessionId ?? null;
+
+        await Promise.all([loadSessions(), loadFiles()]);
+        if (nextSessionId) {
+          setSelectedSessionId(nextSessionId);
+          await loadMessages(nextSessionId);
+        }
+
+        return true;
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          appendActivity("stream", "info", "Run stream aborted due to tenant safety guard.");
+          return false;
+        }
+
+        const detail = formatApiError(error);
+        const withPhase =
+          error instanceof RuntimeTimeoutError
+            ? `Run ${error.phase.replace("_", " ")} timed out after ${Math.round(error.timeoutMs / 1000)}s.`
+            : detail;
+
+        setRunError(withPhase);
+        appendActivity("run", "error", `Run error: ${withPhase}`);
+
+        setMessages((prev) => {
+          const next = [...prev];
+          for (let i = next.length - 1; i >= 0; i--) {
+            if (next[i].role === "assistant" && !next[i].content?.trim()) {
+              next[i] = {
+                ...next[i],
+                role: "system",
+                content: `⚠️ ${withPhase}`,
+              };
+              return next;
+            }
+          }
+          return [...next, { role: "system", content: `⚠️ ${withPhase}` }];
+        });
+
+        showToast(`Run failed: ${withPhase}`, "error");
+        return false;
+      } finally {
+        streamAbortRef.current = null;
+        setRunPending(false);
+      }
+    },
+    [
+      appendActivity,
+      bootstrap,
+      bootstrapLoading,
+      ensureTenantMetaAligned,
+      loadFiles,
+      loadMessages,
+      loadSessions,
+      mismatchActive,
+      runPending,
+      selectedFileIds,
+      selectedSessionId,
+      showToast,
+    ],
+  );
+
+  const submitComposer = useCallback(async () => {
+    await submitPrompt(composer, { clearComposer: true });
+  }, [composer, submitPrompt]);
 
   const handleMismatchRecovery = useCallback(async () => {
     clearTenantScopedState();
@@ -1059,6 +1080,7 @@ export function useDocumentWorkspaceRuntime() {
     runError,
     runRequestId,
     streamRequestId,
+    submitPrompt,
     submitComposer,
 
     mismatchActive,
