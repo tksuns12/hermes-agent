@@ -46,6 +46,9 @@ export interface GuidedPromptBuildResult {
 export const HONEST_OFFICE_BOUNDARY_INSTRUCTION =
   "Inspect only the attached Office files, never invent missing content, and clearly state uncertainty when evidence is incomplete.";
 
+const DOCX_SUMMARY_OUTPUT_PATH = "/tmp/hermes-docx-summary-report.md";
+const XLSX_ANOMALIES_OUTPUT_PATH = "/tmp/hermes-xlsx-anomalies-export.csv";
+
 function getDetailText(detail: string | undefined): string | null {
   const normalized = detail?.trim();
   return normalized ? normalized : null;
@@ -103,7 +106,7 @@ export const guidedDocumentTasks: GuidedDocumentTask[] = [
     composePrompt: (context) =>
       buildPrompt(
         "Summarize DOCX",
-        "Create a clear summary with key points, decisions, and next steps from the attached DOCX file. Also generate a downloadable markdown artifact named docx-summary-report.md containing that summary.",
+        `Create a clear summary with key points, decisions, and next steps from the attached DOCX file. Also generate a downloadable markdown artifact named docx-summary-report.md containing that summary. Write the artifact to ${DOCX_SUMMARY_OUTPUT_PATH}, overwrite any previous file at that path with the current report, append a standalone line exactly FILE: ${DOCX_SUMMARY_OUTPUT_PATH}, and do not mention local filesystem paths anywhere else in the response. If you cannot both produce the summary and save the markdown artifact, do not claim success; instead use partial_success, unsupported, or no_output in the required outcome envelope and explain why.`,
         context,
       ),
   },
@@ -166,7 +169,7 @@ export const guidedDocumentTasks: GuidedDocumentTask[] = [
     composePrompt: (context) =>
       buildPrompt(
         "Find XLSX anomalies",
-        "Identify anomalies, outliers, and suspicious value patterns in the attached XLSX files, then suggest likely root causes. Also generate a downloadable CSV artifact named xlsx-anomalies-export.csv listing anomaly rows and reason codes.",
+        `Identify anomalies, outliers, and suspicious value patterns in the attached XLSX files, then suggest likely root causes. Also generate a downloadable CSV artifact named xlsx-anomalies-export.csv listing anomaly rows and reason codes. Even if you find no anomalies, still create the CSV artifact with a header row and a single no_anomalies_found row so a successful run always includes a download. Write the artifact to ${XLSX_ANOMALIES_OUTPUT_PATH}, overwrite any previous file at that path with the current CSV export, append a standalone line exactly FILE: ${XLSX_ANOMALIES_OUTPUT_PATH}, and do not mention local filesystem paths anywhere else in the response. If you cannot both produce the anomaly analysis and save the CSV artifact, do not claim success; instead use partial_success, unsupported, or no_output in the required outcome envelope and explain why.`,
         context,
       ),
   },

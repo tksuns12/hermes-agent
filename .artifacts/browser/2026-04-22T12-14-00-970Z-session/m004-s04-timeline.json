@@ -1,0 +1,53 @@
+{
+  "entries": [
+    {
+      "id": 1,
+      "tool": "browser_navigate",
+      "status": "success",
+      "durationMs": 1246,
+      "beforeUrl": "about:blank",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#1 | browser_navigate | success | 1246ms | screenshot=true, url=\"http://127.0.0.1:9119/\" | URL changed to http://127.0.0.1:9119/; title changed to Hermes Agent - Dashboard; landmarks 0→6; buttons 0→5"
+    },
+    {
+      "id": 2,
+      "tool": "browser_set_checked",
+      "status": "success",
+      "durationMs": 109,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#2 | browser_set_checked | success | 109ms | checked=true, selector=\"aside input[type='checkbox']\" | PASS (checked_state_matches) | No meaningful browser-state change detected"
+    },
+    {
+      "id": 3,
+      "tool": "browser_select_option",
+      "status": "success",
+      "durationMs": 5129,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#3 | browser_select_option | success | 5129ms | option=\"xlsx-anomalies\", selector=\"select\" | PASS (selected_values_include_option) | No meaningful browser-state change detected"
+    },
+    {
+      "id": 4,
+      "tool": "browser_type",
+      "status": "success",
+      "durationMs": 135,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#4 | browser_type | success | 135ms | clearFirst=true, selector=\"#guided-detail-input\", text=\"Prioritize abrupt week-over-week swings and duplicate out...\" | PASS (value_equals_expected, value_contains_expected) | focus changed"
+    },
+    {
+      "id": 5,
+      "tool": "browser_click",
+      "status": "success",
+      "durationMs": 242,
+      "beforeUrl": "http://127.0.0.1:9119/",
+      "afterUrl": "http://127.0.0.1:9119/",
+      "line": "#5 | browser_click | success | 242ms | selector=\"button\" | SOFT-FAIL (no observable state change) | visible text changed"
+    }
+  ],
+  "retained": 5,
+  "totalRecorded": 5,
+  "bounded": false,
+  "summary": "Timeline: 5 browser actions recorded."
+}

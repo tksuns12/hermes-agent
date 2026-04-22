@@ -152,8 +152,12 @@ describe("buildGuidedPrompt", () => {
 
     expect(docxPrompt.ok).toBe(true);
     expect(docxPrompt.prompt).toContain("docx-summary-report.md");
+    expect(docxPrompt.prompt).toContain("FILE: /tmp/hermes-docx-summary-report.md");
+    expect(docxPrompt.prompt).toContain("do not claim success");
     expect(xlsxPrompt.ok).toBe(true);
     expect(xlsxPrompt.prompt).toContain("xlsx-anomalies-export.csv");
+    expect(xlsxPrompt.prompt).toContain("FILE: /tmp/hermes-xlsx-anomalies-export.csv");
+    expect(xlsxPrompt.prompt).toContain("do not claim success");
   });
 
   it("keeps non-representative guided tasks lightweight", () => {

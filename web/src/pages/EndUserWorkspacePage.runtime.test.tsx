@@ -445,6 +445,8 @@ describe("EndUserWorkspacePage runtime", () => {
     expect(promptPart?.text).toContain('Run the guided task "Summarize DOCX"');
     expect(promptPart?.text).toContain("meeting-notes.docx");
     expect(promptPart?.text).toContain("docx-summary-report.md");
+    expect(promptPart?.text).toContain("FILE: /tmp/hermes-docx-summary-report.md");
+    expect(promptPart?.text).toContain("do not claim success");
     expect(turn.content).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: "input_file", file_id: "file-docx" }),
@@ -510,6 +512,8 @@ describe("EndUserWorkspacePage runtime", () => {
     expect(promptPart?.text).toContain('Run the guided task "Find XLSX anomalies"');
     expect(promptPart?.text).toContain("finance-q1.xlsx");
     expect(promptPart?.text).toContain("xlsx-anomalies-export.csv");
+    expect(promptPart?.text).toContain("FILE: /tmp/hermes-xlsx-anomalies-export.csv");
+    expect(promptPart?.text).toContain("do not claim success");
     expect(turn.content).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: "input_file", file_id: "file-xlsx-1" }),

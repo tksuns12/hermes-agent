@@ -75,7 +75,12 @@ LIVE_CASES: tuple[LiveOfficeCase, ...] = (
         task_label="Summarize DOCX",
         task_instruction=(
             "Create a clear summary with key points, decisions, and next steps from the attached DOCX file. "
-            "Also generate a downloadable markdown artifact named docx-summary-report.md containing that summary."
+            "Also generate a downloadable markdown artifact named docx-summary-report.md containing that summary. "
+            "Write the artifact to /tmp/hermes-docx-summary-report.md, overwrite any previous file at that "
+            "path with the current report, append a standalone line exactly FILE: /tmp/hermes-docx-summary-report.md, "
+            "and do not mention local filesystem paths anywhere else in the response. If you cannot both produce "
+            "the summary and save the markdown artifact, do not claim success; instead use partial_success, "
+            "unsupported, or no_output in the required outcome envelope and explain why."
         ),
         detail="Highlight risks, owners, and due dates.",
     ),
@@ -88,7 +93,14 @@ LIVE_CASES: tuple[LiveOfficeCase, ...] = (
         task_instruction=(
             "Identify anomalies, outliers, and suspicious value patterns in the attached XLSX files, then "
             "suggest likely root causes. Also generate a downloadable CSV artifact named "
-            "xlsx-anomalies-export.csv listing anomaly rows and reason codes."
+            "xlsx-anomalies-export.csv listing anomaly rows and reason codes. Even if you find no anomalies, "
+            "still create the CSV artifact with a header row and a single no_anomalies_found row so a "
+            "successful run always includes a download. Write the artifact to "
+            "/tmp/hermes-xlsx-anomalies-export.csv, overwrite any previous file at that path with the current "
+            "CSV export, append a standalone line exactly FILE: /tmp/hermes-xlsx-anomalies-export.csv, and do "
+            "not mention local filesystem paths anywhere else in the response. If you cannot both produce the "
+            "anomaly analysis and save the CSV artifact, do not claim success; instead use partial_success, "
+            "unsupported, or no_output in the required outcome envelope and explain why."
         ),
         detail="Prioritize abrupt week-over-week swings and duplicate outliers.",
     ),
@@ -267,12 +279,60 @@ def _parse_sse_events(raw_sse: str) -> list[JSONObject]:
 
 
 def _await_terminal_event(client: httpx.Client, *, tenant: str, run_id: str) -> JSONObject:
+    timeout = httpx.Timeout(
+        connect=5.0,
+        read=RUN_EVENTS_TIMEOUT_SECONDS,
+        write=RUN_EVENTS_TIMEOUT_SECONDS,
+        pool=RUN_EVENTS_TIMEOUT_SECONDS,
+    )
+
     try:
-        stream = client.get(
+        with client.stream(
+            "GET",
             f"/v1/runs/{run_id}/events",
             headers=_headers(tenant),
-            timeout=httpx.Timeout(RUN_EVENTS_TIMEOUT_SECONDS, connect=5.0),
-        )
+            timeout=timeout,
+        ) as stream:
+            if stream.status_code != 200:
+                payload = _json_object(stream, phase="stream_open")
+                _phase_fail(
+                    "stream_open",
+                    f"Run events endpoint returned status={stream.status_code} for run_id={run_id}. payload={payload}",
+                )
+
+            saw_data_event = False
+            for line in stream.iter_lines():
+                stripped = line.strip()
+                if not stripped.startswith("data:"):
+                    continue
+                saw_data_event = True
+                payload_text = stripped[len("data:") :].strip()
+                if not payload_text:
+                    continue
+
+                try:
+                    payload = json.loads(payload_text)
+                except json.JSONDecodeError as exc:
+                    _phase_fail(
+                        "stream_malformed",
+                        f"Could not parse SSE data line as JSON: {payload_text[:320]!r} ({exc})",
+                    )
+
+                if not isinstance(payload, dict):
+                    _phase_fail(
+                        "stream_malformed",
+                        f"SSE data payload must be an object, got {type(payload)!r}: {payload!r}",
+                    )
+
+                event = cast(JSONObject, payload)
+                if event.get("event") in {"run.completed", "run.failed"}:
+                    return event
+
+            if not saw_data_event:
+                _phase_fail(
+                    "stream_malformed",
+                    f"Run events stream contained no data events for run_id={run_id}.",
+                )
     except httpx.TimeoutException:
         _phase_fail(
             "stream_timeout",
@@ -281,32 +341,10 @@ def _await_terminal_event(client: httpx.Client, *, tenant: str, run_id: str) -> 
     except Exception as exc:
         _phase_fail("stream_open", f"Could not open run events stream for run_id={run_id}: {exc}")
 
-    if stream.status_code != 200:
-        payload = _json_object(stream, phase="stream_open")
-        _phase_fail(
-            "stream_open",
-            f"Run events endpoint returned status={stream.status_code} for run_id={run_id}. payload={payload}",
-        )
-
-    events = _parse_sse_events(stream.text)
-    if not events:
-        _phase_fail(
-            "stream_malformed",
-            f"Run events stream contained no data events for run_id={run_id}.",
-        )
-
-    terminal_events = [
-        event
-        for event in events
-        if event.get("event") in {"run.completed", "run.failed"}
-    ]
-    if not terminal_events:
-        _phase_fail(
-            "stream_malformed",
-            f"Run events stream had no terminal event (run.completed/run.failed) for run_id={run_id}.",
-        )
-
-    return terminal_events[-1]
+    _phase_fail(
+        "stream_malformed",
+        f"Run events stream had no terminal event (run.completed/run.failed) for run_id={run_id}.",
+    )
 
 
 def _extract_outcome_boundary(output: str) -> tuple[JSONObject | None, str | None]:
