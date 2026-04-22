@@ -2065,6 +2065,39 @@ class TestMultipartUploads:
             assert await download.read() == b"\x89PNG\r\n"
 
     @pytest.mark.asyncio
+    async def test_multipart_upload_accepts_office_uploads(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for filename, payload in (
+                ("quarterly-plan.docx", b"docx-bytes"),
+                ("budget.xlsx", b"xlsx-bytes"),
+            ):
+                form = FormData()
+                form.add_field(
+                    "file",
+                    payload,
+                    filename=filename,
+                    content_type="application/octet-stream",
+                )
+
+                resp = await cli.post(
+                    "/v1/files",
+                    data=form,
+                    headers={"X-Hermes-User-Id": "tenant-office"},
+                )
+                assert resp.status == 201
+                body = await resp.json()
+                assert body["filename"] == filename
+                assert "path" not in body
+
+                download = await cli.get(
+                    f"/v1/files/{body['id']}/content",
+                    headers={"X-Hermes-User-Id": "tenant-office"},
+                )
+                assert download.status == 200
+                assert await download.read() == payload
+
+    @pytest.mark.asyncio
     async def test_invalid_request_rejects_unsupported_upload_type(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3103,7 +3136,7 @@ class TestRunsEndpoint:
             created = await cli.post(
                 "/v1/files",
                 headers={"X-Hermes-User-Id": "owner"},
-                json={"filename": "report.txt", "content": "tenant scoped file"},
+                json={"filename": "report.xlsx", "content": "tenant scoped workbook"},
             )
             assert created.status == 201
             file_id = (await created.json())["id"]
@@ -3140,8 +3173,9 @@ class TestRunsEndpoint:
 
                 call_kwargs = fake_agent.run_conversation.call_args.kwargs
                 assert "summarize this" in call_kwargs["user_message"]
-                assert "report.txt" in call_kwargs["user_message"]
-                assert "tenant scoped file" in call_kwargs["user_message"]
+                assert "[input_file:report.xlsx" in call_kwargs["user_message"]
+                assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in call_kwargs["user_message"]
+                assert "tenant scoped workbook" not in call_kwargs["user_message"]
                 assert mock_create_agent.call_args.kwargs["user_id"] == "owner"
 
     @pytest.mark.asyncio

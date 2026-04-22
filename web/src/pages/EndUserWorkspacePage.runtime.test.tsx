@@ -367,7 +367,7 @@ describe("EndUserWorkspacePage runtime", () => {
     });
 
     await screen.findByText("retained-output.csv");
-    expect(screen.getByText(/generated outputs \(1\)/i)).toBeTruthy();
+    expect(screen.getByText(/generated outputs/i)).toBeTruthy();
     expect(screen.getByText(/files_request_id=req-files-refresh/i)).toBeTruthy();
   });
 

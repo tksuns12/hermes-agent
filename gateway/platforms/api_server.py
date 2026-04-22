@@ -68,13 +68,19 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 
 SUPPORTED_UPLOAD_MIME_PREFIXES = ("image/", "text/")
-SUPPORTED_UPLOAD_MIME_TYPES = {"application/pdf"}
+SUPPORTED_UPLOAD_MIME_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 SUPPORTED_UPLOAD_EXTENSIONS = {
     ".txt",
     ".md",
     ".markdown",
     ".rtf",
     ".pdf",
+    ".docx",
+    ".xlsx",
     ".png",
     ".jpg",
     ".jpeg",
