@@ -894,7 +894,7 @@ class TestWebServerEndpoints:
         tenant_id = tenant["id"]
         browser_id = bootstrap.cookies.get("hermes_browser_id")
 
-        captured_queries = []
+        captured_calls = []
 
         class _FakeRawResponse:
             def __init__(self, status, body, headers=None):
@@ -913,7 +913,13 @@ class TestWebServerEndpoints:
 
         def _mock_urlopen(req, timeout=0):
             parsed = urllib.parse.urlparse(req.full_url)
-            captured_queries.append(urllib.parse.parse_qs(parsed.query))
+            captured_calls.append(
+                {
+                    "path": parsed.path,
+                    "query": urllib.parse.parse_qs(parsed.query),
+                    "request_id": req.get_header("X-hermes-workbench-request-id"),
+                }
+            )
 
             if parsed.path.endswith("/content"):
                 return _FakeRawResponse(
@@ -976,8 +982,49 @@ class TestWebServerEndpoints:
             fallback=False,
         )
 
-        assert captured_queries[0]["user_id"] == [tenant_id]
-        assert captured_queries[1]["user_id"] == [tenant_id]
+        assert len(captured_calls) == 2
+        assert captured_calls[0]["path"].endswith("/v1/files/file_demo_123")
+        assert captured_calls[0]["query"]["user_id"] == [tenant_id]
+        assert captured_calls[0]["request_id"]
+        assert captured_calls[1]["path"].endswith("/v1/files/file_demo_123/content")
+        assert captured_calls[1]["query"]["user_id"] == [tenant_id]
+        assert captured_calls[1]["request_id"]
+
+    def test_workbench_file_content_proxy_handles_upstream_denial(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant = bootstrap.json()["tenant"]
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        def _mock_urlopen(req, timeout=0):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                404,
+                "not found",
+                hdrs={},
+                fp=io.BytesIO(b'{"error":{"message":"File not found: file_foreign"}}'),
+            )
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", _mock_urlopen)
+
+        denied = self.client.get(
+            "/api/workbench/files/file_foreign/content",
+            cookies={"hermes_browser_id": browser_id},
+        )
+        assert denied.status_code == 404
+        detail = denied.json()["detail"]
+        assert detail["code"] == "proxy_upstream_rejected"
+        assert detail["phase"] == "file.content"
+        assert detail["request_id"]
+        assert denied.headers.get("X-Workbench-Request-Id") == detail["request_id"]
+        _assert_workbench_tenant_headers(
+            denied,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
 
     def test_workbench_files_validation_rejects_missing_fields_and_bad_ids(self):
         bootstrap = self.client.get("/api/workbench/bootstrap")
