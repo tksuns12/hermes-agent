@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import { Routes, Route, NavLink, Navigate } from "react-router-dom";
+import { useMemo, type ReactNode } from "react";
+import { Routes, Route, NavLink, Navigate, Outlet } from "react-router-dom";
 import {
   Activity,
   BarChart3,
@@ -26,6 +26,7 @@ import { Cell, Grid, SelectionSwitcher, Typography } from "@nous-research/ui";
 import { cn } from "@/lib/utils";
 import { Backdrop } from "@/components/Backdrop";
 import WorkbenchPage from "@/pages/WorkbenchPage";
+import EndUserWorkspacePage from "@/pages/EndUserWorkspacePage";
 import StatusPage from "@/pages/StatusPage";
 import ConfigPage from "@/pages/ConfigPage";
 import EnvPage from "@/pages/EnvPage";
@@ -41,7 +42,7 @@ import { usePlugins } from "@/plugins";
 import type { RegisteredPlugin } from "@/plugins";
 
 const BUILTIN_NAV: NavItem[] = [
-  { path: "/", label: "Workbench", icon: Sparkles },
+  { path: "/workbench", label: "Workbench", icon: Sparkles },
   { path: "/status", labelKey: "status", label: "Status", icon: Activity },
   {
     path: "/sessions",
@@ -125,17 +126,39 @@ function buildNavItems(
   return items;
 }
 
-export default function App() {
-  const { t } = useI18n();
-  const { plugins } = usePlugins();
-
-  const navItems = useMemo(
-    () => buildNavItems(BUILTIN_NAV, plugins),
-    [plugins],
-  );
-
+function EndUserShell({ children }: { children: ReactNode }) {
   return (
-    <div className="text-midground font-mondwest bg-black min-h-screen flex flex-col uppercase antialiased overflow-x-hidden">
+    <div
+      data-testid="end-user-shell"
+      className="text-midground font-mondwest bg-black min-h-screen flex flex-col uppercase antialiased overflow-x-hidden"
+    >
+      <SelectionSwitcher />
+      <Backdrop />
+      <main className="relative z-2 mx-auto w-full max-w-[1200px] flex-1 px-3 sm:px-6 py-6 sm:py-10">
+        {children}
+      </main>
+    </div>
+  );
+}
+
+function OperatorShell({
+  navItems,
+  nav,
+  webUiLabel,
+  footerName,
+  footerOrg,
+}: {
+  nav: Record<string, string>;
+  navItems: NavItem[];
+  webUiLabel: string;
+  footerName: string;
+  footerOrg: string;
+}) {
+  return (
+    <div
+      data-testid="operator-shell"
+      className="text-midground font-mondwest bg-black min-h-screen flex flex-col uppercase antialiased overflow-x-hidden"
+    >
       <SelectionSwitcher />
       <Backdrop />
 
@@ -169,7 +192,7 @@ export default function App() {
                 <Cell key={path} className="relative !p-0">
                   <NavLink
                     to={path}
-                    end={path === "/"}
+                    end={path === "/workbench"}
                     className={({ isActive }) =>
                       cn(
                         "group relative flex h-full w-full items-center gap-1.5",
@@ -187,11 +210,7 @@ export default function App() {
                       <>
                         <Icon className="h-3.5 w-3.5 shrink-0" />
                         <span className="hidden sm:inline">
-                          {labelKey
-                            ? ((t.app.nav as Record<string, string>)[
-                                labelKey
-                              ] ?? label)
-                            : label}
+                          {labelKey ? nav[labelKey] ?? label : label}
                         </span>
 
                         <span
@@ -222,7 +241,7 @@ export default function App() {
                 mondwest
                 className="hidden sm:inline text-[0.7rem] tracking-[0.15em] opacity-50"
               >
-                {t.app.webUi}
+                {webUiLabel}
               </Typography>
             </Cell>
           </Grid>
@@ -230,28 +249,7 @@ export default function App() {
       </header>
 
       <main className="relative z-2 mx-auto w-full max-w-[1600px] flex-1 px-3 sm:px-6 pt-16 sm:pt-20 pb-4 sm:pb-8">
-        <Routes>
-          <Route path="/" element={<WorkbenchPage />} />
-          <Route path="/workbench" element={<Navigate to="/" replace />} />
-          <Route path="/status" element={<StatusPage />} />
-          <Route path="/sessions" element={<SessionsPage />} />
-          <Route path="/analytics" element={<AnalyticsPage />} />
-          <Route path="/logs" element={<LogsPage />} />
-          <Route path="/cron" element={<CronPage />} />
-          <Route path="/skills" element={<SkillsPage />} />
-          <Route path="/config" element={<ConfigPage />} />
-          <Route path="/env" element={<EnvPage />} />
-
-          {plugins.map(({ manifest, component: PluginComponent }) => (
-            <Route
-              key={manifest.name}
-              path={manifest.tab.path}
-              element={<PluginComponent />}
-            />
-          ))}
-
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        <Outlet />
       </main>
 
       <footer className="relative z-2 border-t border-current/20">
@@ -261,7 +259,7 @@ export default function App() {
               mondwest
               className="text-[0.7rem] sm:text-[0.8rem] tracking-[0.12em] opacity-60"
             >
-              {t.app.footer.name}
+              {footerName}
             </Typography>
           </Cell>
           <Cell className="flex items-center justify-end !px-3 sm:!px-6 !py-3">
@@ -270,12 +268,67 @@ export default function App() {
               className="text-[0.6rem] sm:text-[0.7rem] tracking-[0.15em] text-midground"
               style={{ mixBlendMode: "plus-lighter" }}
             >
-              {t.app.footer.org}
+              {footerOrg}
             </Typography>
           </Cell>
         </Grid>
       </footer>
     </div>
+  );
+}
+
+export default function App() {
+  const { t } = useI18n();
+  const { plugins } = usePlugins();
+
+  const navItems = useMemo(
+    () => buildNavItems(BUILTIN_NAV, plugins),
+    [plugins],
+  );
+
+  return (
+    <Routes>
+      <Route
+        path="/"
+        element={
+          <EndUserShell>
+            <EndUserWorkspacePage />
+          </EndUserShell>
+        }
+      />
+
+      <Route
+        element={
+          <OperatorShell
+            nav={t.app.nav as Record<string, string>}
+            navItems={navItems}
+            webUiLabel={t.app.webUi}
+            footerName={t.app.footer.name}
+            footerOrg={t.app.footer.org}
+          />
+        }
+      >
+        <Route path="/workbench" element={<WorkbenchPage />} />
+        <Route path="/status" element={<StatusPage />} />
+        <Route path="/sessions" element={<SessionsPage />} />
+        <Route path="/analytics" element={<AnalyticsPage />} />
+        <Route path="/logs" element={<LogsPage />} />
+        <Route path="/cron" element={<CronPage />} />
+        <Route path="/skills" element={<SkillsPage />} />
+        <Route path="/config" element={<ConfigPage />} />
+        <Route path="/env" element={<EnvPage />} />
+
+        {plugins.map(({ manifest, component: PluginComponent }) => (
+          <Route
+            key={manifest.name}
+            path={manifest.tab.path}
+            element={<PluginComponent />}
+          />
+        ))}
+      </Route>
+
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   );
 }
 

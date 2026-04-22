@@ -96,3 +96,6 @@ coverage/
 
 # ── GSD baseline (auto-generated) ──
 .mcp.json
+
+# Graphify
+graphify-out/
