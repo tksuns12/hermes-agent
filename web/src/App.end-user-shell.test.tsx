@@ -49,6 +49,14 @@ vi.mock("@/pages/WorkbenchPage", () => ({
   default: () => <div data-testid="workbench-page">Mock workbench content</div>,
 }));
 
+vi.mock("@/pages/EndUserWorkspacePage", () => ({
+  default: () => (
+    <section data-testid="end-user-home">
+      <h1>Work with your files in a live AI run.</h1>
+    </section>
+  ),
+}));
+
 vi.mock("@/components/Backdrop", () => ({
   Backdrop: () => <div data-testid="mock-backdrop" />,
 }));

@@ -58,8 +58,16 @@ function parseWorkbenchSSEChunk(chunk: string): WorkbenchRunEvent | null {
     if (dataLines.length === 0) return null;
     const payload = dataLines.join("\n");
     const parsed = safeJSONParse(payload);
-    if (!parsed || typeof parsed !== "object") return null;
-    return parsed as WorkbenchRunEvent;
+    if (!isRecord(parsed)) return null;
+
+    const event = typeof parsed.event === "string" ? parsed.event.trim() : "";
+    const runId = typeof parsed.run_id === "string" ? parsed.run_id.trim() : "";
+
+    if (!event || !runId) {
+        return null;
+    }
+
+    return parsed as unknown as WorkbenchRunEvent;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
