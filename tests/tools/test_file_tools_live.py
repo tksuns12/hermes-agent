@@ -372,9 +372,11 @@ class TestExpandPath:
     def test_absolute_unchanged(self, ops):
         assert ops._expand_path("/tmp/test.txt") == "/tmp/test.txt"
 
-    def test_relative_anchored_to_tenant(self, ops, monkeypatch, tmp_path):
+    def test_relative_anchored_to_tenant(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
         from hermes_constants import get_user_home
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+        ops = ShellFileOperations(env, cwd=str(tmp_path))
         expected = str(get_user_home(None) / "relative/path.txt")
         assert ops._expand_path("relative/path.txt") == expected
 

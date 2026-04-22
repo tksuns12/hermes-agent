@@ -4,7 +4,7 @@ import builtins
 import importlib
 import sys
 
-from tools.registry import registry
+from tools.registry import registry, reset_global_registry
 
 
 def test_memory_tool_imports_without_fcntl(monkeypatch, tmp_path):
@@ -15,7 +15,7 @@ def test_memory_tool_imports_without_fcntl(monkeypatch, tmp_path):
             raise ImportError("simulated missing fcntl")
         return original_import(name, globals, locals, fromlist, level)
 
-    registry.deregister("memory")
+    reset_global_registry()
     monkeypatch.delitem(sys.modules, "tools.memory_tool", raising=False)
     monkeypatch.setattr(builtins, "__import__", fake_import)
 

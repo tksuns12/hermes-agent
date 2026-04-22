@@ -878,6 +878,22 @@ class InsightsEngine:
         # Overview
         lines.append(f"**Sessions:** {o['total_sessions']} | **Messages:** {o['total_messages']:,} | **Tool calls:** {o['total_tool_calls']:,}")
         lines.append(f"**Tokens:** {o['total_tokens']:,} (in: {o['total_input_tokens']:,} / out: {o['total_output_tokens']:,})")
+        actual_cost = o.get("actual_cost", 0) or 0
+        estimated_cost = o.get("estimated_cost", 0) or 0
+        unknown_cost_sessions = o.get("unknown_cost_sessions", 0) or 0
+        included_cost_sessions = o.get("included_cost_sessions", 0) or 0
+        if actual_cost > 0:
+            lines.append(f"**Est. cost:** ${actual_cost:.2f}")
+        elif estimated_cost > 0:
+            cost_line = f"**Est. cost:** ~${estimated_cost:.2f}"
+            notes = []
+            if unknown_cost_sessions > 0:
+                notes.append(f"{unknown_cost_sessions} session{'s' if unknown_cost_sessions != 1 else ''} unpriced")
+            if included_cost_sessions > 0:
+                notes.append(f"{included_cost_sessions} included")
+            if notes:
+                cost_line += f" ({', '.join(notes)})"
+            lines.append(cost_line)
         if o["total_hours"] > 0:
             lines.append(f"**Active time:** ~{_format_duration(o['total_hours'] * 3600)} | **Avg session:** ~{_format_duration(o['avg_session_duration'])}")
         lines.append("")

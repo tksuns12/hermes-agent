@@ -52,8 +52,7 @@ def _run_handle_function_call(
 def test_result_unchanged_when_no_hook_registered(monkeypatch):
     # Real invoke_hook with no plugins loaded returns [].
     monkeypatch.setenv("HERMES_HOME", "/tmp/hermes_no_plugins")
-    # Force a fresh plugin manager so no stale plugins pollute state.
-    plugins_mod._plugin_manager = plugins_mod.PluginManager()
+    plugins_mod.reset_plugins()
 
     out = _run_handle_function_call(monkeypatch)
     assert out == '{"output": "original"}'
@@ -166,6 +165,10 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
     plugin_dir = plugins_dir / "transform_result_canon"
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.yaml").write_text("name: transform_result_canon\n", encoding="utf-8")
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - transform_result_canon\n",
+        encoding="utf-8",
+    )
     (plugin_dir / "__init__.py").write_text(
         "def register(ctx):\n"
         '    ctx.register_hook("transform_tool_result", '
@@ -173,7 +176,7 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
         encoding="utf-8",
     )
 
-    plugins_mod.discover_plugins()
+    plugins_mod.discover_plugins(force_reload=True)
 
     out = _run_handle_function_call(
         monkeypatch,

@@ -18,6 +18,7 @@ import ast
 import importlib
 import json
 import logging
+import sys
 import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
@@ -53,7 +54,11 @@ def _module_registers_tools(module_path: Path) -> bool:
     return any(_is_registry_register_call(stmt) for stmt in tree.body)
 
 
-def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
+def discover_builtin_tools(
+    tools_dir: Optional[Path] = None,
+    *,
+    force_reload: bool = False,
+) -> List[str]:
     """Import built-in self-registering tool modules and return their module names."""
     tools_path = Path(tools_dir) if tools_dir is not None else Path(__file__).resolve().parent
     module_names = [
@@ -66,7 +71,10 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
     imported: List[str] = []
     for mod_name in module_names:
         try:
-            importlib.import_module(mod_name)
+            if force_reload and mod_name in sys.modules:
+                importlib.reload(sys.modules[mod_name])
+            else:
+                importlib.import_module(mod_name)
             imported.append(mod_name)
         except Exception as e:
             logger.warning("Could not import tool module %s: %s", mod_name, e)
@@ -108,6 +116,18 @@ class ToolRegistry:
         # reading tool metadata, so keep mutations serialized and readers on
         # stable snapshots.
         self._lock = threading.RLock()
+
+    def reset(self) -> None:
+        """Clear all registered tools, checks, and aliases.
+
+        Intended for test isolation and rare full reinitialization paths.
+        Callers that need built-in tools available again should re-import the
+        relevant self-registering tool modules after reset.
+        """
+        with self._lock:
+            self._tools.clear()
+            self._toolset_checks.clear()
+            self._toolset_aliases.clear()
 
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
@@ -435,6 +455,15 @@ class ToolRegistry:
 
 # Module-level singleton
 registry = ToolRegistry()
+
+
+def reset_global_registry() -> ToolRegistry:
+    """Reset the module-level registry singleton and return it.
+
+    Prefer this helper in tests over mutating ``registry`` internals directly.
+    """
+    registry.reset()
+    return registry
 
 
 # ---------------------------------------------------------------------------

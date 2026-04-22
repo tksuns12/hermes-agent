@@ -123,8 +123,9 @@ class TestReadTrackerCaps:
             p.write_text(f"content {i}\n" * 10)
             ft.read_file_tool(path=str(p), task_id="long-session")
 
+        runtime_key, _, _ = ft.resolve_runtime_key("long-session")
         with ft._read_tracker_lock:
-            td = ft._read_tracker["long-session"]
+            td = ft._read_tracker[runtime_key]
             assert len(td["read_history"]) <= 3
             assert len(td["dedup"]) <= 3
             assert len(td["read_timestamps"]) <= 3

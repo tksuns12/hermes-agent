@@ -212,7 +212,7 @@ class TestMarkResumePending:
 
         # Reload from disk
         store2 = _make_store(tmp_path)
-        store2._ensure_loaded()
+        store2._ensure_loaded("u1")
         reloaded = store2._entries[entry.session_key]
         assert reloaded.resume_pending is True
         assert reloaded.resume_reason == "restart_timeout"

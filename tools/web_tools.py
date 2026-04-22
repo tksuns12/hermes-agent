@@ -125,6 +125,17 @@ _firecrawl_client = None
 _firecrawl_client_config = None
 
 
+def reset_cached_clients() -> None:
+    """Clear process-local backend client singletons for test hermeticity."""
+    global _firecrawl_client, _firecrawl_client_config
+    global _parallel_client, _async_parallel_client, _exa_client
+    _firecrawl_client = None
+    _firecrawl_client_config = None
+    _parallel_client = None
+    _async_parallel_client = None
+    _exa_client = None
+
+
 def _get_direct_firecrawl_config() -> Optional[tuple[Dict[str, str], tuple[str, Optional[str], Optional[str]]]]:
     """Return explicit direct Firecrawl kwargs + cache key, or None when unset."""
     api_key = os.getenv("FIRECRAWL_API_KEY", "").strip()

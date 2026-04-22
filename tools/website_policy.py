@@ -201,9 +201,11 @@ def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str, Any]
 
 def invalidate_cache() -> None:
     """Force the next ``check_website_access`` call to re-read config."""
-    global _cached_policy
+    global _cached_policy, _cached_policy_path, _cached_policy_time
     with _cache_lock:
         _cached_policy = None
+        _cached_policy_path = None
+        _cached_policy_time = 0.0
 
 
 def _match_host_against_rule(host: str, pattern: str) -> bool:

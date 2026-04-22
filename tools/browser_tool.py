@@ -2337,9 +2337,26 @@ def cleanup_all_browsers() -> None:
     for task_id in task_ids:
         cleanup_browser(task_id)
 
-    # Reset cached lookups so they are re-evaluated on next use.
+    reset_cached_state()
+
+
+def reset_cached_state() -> None:
+    """Clear process-local browser caches/singletons for test hermeticity."""
+    global _cached_cloud_provider, _cloud_provider_resolved
+    global _cached_allow_private_urls, _allow_private_urls_resolved
     global _cached_agent_browser, _agent_browser_resolved
     global _cached_command_timeout, _command_timeout_resolved
+
+    with _cleanup_lock:
+        _active_sessions.clear()
+        _recording_sessions.clear()
+        _session_last_activity.clear()
+
+    _last_screenshot_cleanup_by_dir.clear()
+    _cached_cloud_provider = None
+    _cloud_provider_resolved = False
+    _cached_allow_private_urls = None
+    _allow_private_urls_resolved = False
     _cached_agent_browser = None
     _agent_browser_resolved = False
     _discover_homebrew_node_dirs.cache_clear()

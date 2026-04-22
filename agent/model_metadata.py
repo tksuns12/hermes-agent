@@ -75,6 +75,21 @@ _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
 
+
+def reset_model_metadata_caches() -> None:
+    """Clear process-global model metadata caches.
+
+    Tests and long-lived runtimes can call this to guarantee a cold-start
+    metadata lookup without reaching into module globals directly.
+    """
+    global _model_metadata_cache, _model_metadata_cache_time
+    global _endpoint_model_metadata_cache, _endpoint_model_metadata_cache_time
+
+    _model_metadata_cache = {}
+    _model_metadata_cache_time = 0
+    _endpoint_model_metadata_cache = {}
+    _endpoint_model_metadata_cache_time = {}
+
 # Descending tiers for context length probing when the model is unknown.
 # We start at 128K (a safe default for most modern models) and step down
 # on context-length errors until one works.
@@ -168,6 +183,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     "Qwen/Qwen3.5-35B-A3B": 131072,
     "deepseek-ai/DeepSeek-V3.2": 65536,
     "moonshotai/Kimi-K2.5": 262144,
+    "moonshotai/Kimi-K2.6": 262144,
     "moonshotai/Kimi-K2-Thinking": 262144,
     "MiniMaxAI/MiniMax-M2.5": 204800,
     "XiaomiMiMo/MiMo-V2-Flash": 256000,

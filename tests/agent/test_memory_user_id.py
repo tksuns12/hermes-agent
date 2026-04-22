@@ -374,6 +374,8 @@ class TestAIAgentDefaultTenantMemory:
 
         AIAgent(
             api_key="test-key",
+            base_url="https://example.com/v1",
+            model="gpt-4.1-mini",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=False,

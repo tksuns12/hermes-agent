@@ -184,7 +184,7 @@ class TestPruneBasics:
         store._entries["fresh"] = _entry("fresh", age_days=1)
 
         save_calls = []
-        store._save = lambda: save_calls.append(1)
+        store._save = lambda *_args, **_kwargs: save_calls.append(1)
 
         store.prune_old_entries(max_age_days=90)
         assert save_calls == [1]
@@ -237,13 +237,15 @@ class TestPrunePersistsToDisk:
         store._loaded = True
         store._save()
 
+        sessions_file = store._sessions_dir_for_tenant("default") / "sessions.json"
+
         # Verify pre-prune state on disk.
-        saved_pre = json.loads((tmp_path / "sessions.json").read_text())
+        saved_pre = json.loads(sessions_file.read_text())
         assert set(saved_pre.keys()) == {"stale", "fresh"}
 
         # Prune and check disk.
         store.prune_old_entries(max_age_days=90)
-        saved_post = json.loads((tmp_path / "sessions.json").read_text())
+        saved_post = json.loads(sessions_file.read_text())
         assert set(saved_post.keys()) == {"fresh"}
 
 

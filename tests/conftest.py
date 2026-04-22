@@ -224,6 +224,34 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
+    # Some large modules cache get_hermes_home() into module globals at import
+    # time. Tests often import those modules at file scope before this autouse
+    # fixture runs, so rebind the cached paths here to keep the suite hermetic.
+    try:
+        current_home = fake_hermes_home
+        cached_modules = {
+            "gateway.run": {
+                "_hermes_home": current_home,
+                "_env_path": current_home / ".env",
+                "_config_path": current_home / "config.yaml",
+            },
+            "cli": {
+                "_hermes_home": current_home,
+            },
+            "run_agent": {
+                "_hermes_home": current_home,
+            },
+        }
+        for module_name, attrs in cached_modules.items():
+            module = sys.modules.get(module_name)
+            if module is None:
+                continue
+            for attr_name, attr_value in attrs.items():
+                if hasattr(module, attr_name):
+                    monkeypatch.setattr(module, attr_name, attr_value, raising=False)
+    except Exception:
+        pass
+
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
     monkeypatch.setenv("TZ", "UTC")
@@ -246,6 +274,44 @@ def _hermetic_environment(tmp_path, monkeypatch):
     try:
         import hermes_cli.plugins as _plugins_mod
         monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
+    except Exception:
+        pass
+
+    # 6. Reset global tool registry singleton so tests that import
+    #    self-registering tool modules or mutate the shared registry don't
+    #    leak tools/aliases across the worker process.
+    try:
+        import tools.registry as _tools_registry
+        _tools_registry.reset_global_registry()
+        _tools_registry.discover_builtin_tools(force_reload=True)
+    except Exception:
+        pass
+
+    # 8. Reset module-level tool/config caches that otherwise survive across
+    #    tests in the same worker process. These modules historically relied
+    #    on ad hoc per-test invalidation, which is easy to miss and can cause
+    #    pass-in-isolation failures.
+    try:
+        import tools.website_policy as _website_policy
+        _website_policy.invalidate_cache()
+    except Exception:
+        pass
+
+    try:
+        import tools.web_tools as _web_tools
+        _web_tools.reset_cached_clients()
+    except Exception:
+        pass
+
+    try:
+        import tools.browser_tool as _browser_tool
+        _browser_tool.reset_cached_state()
+    except Exception:
+        pass
+
+    try:
+        import tools.approval as _approval
+        _approval.reset_state()
     except Exception:
         pass
 

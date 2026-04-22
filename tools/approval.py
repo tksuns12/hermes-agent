@@ -320,14 +320,32 @@ def disable_session_yolo(session_key: str) -> None:
 
 
 def clear_session(session_key: str) -> None:
-    """Remove all approval and yolo state for a given session."""
+    """Remove all approval and yolo state for a given session.
+
+    Signals any blocked gateway approval threads before dropping queued entries
+    so teardown/reset paths cannot strand waiting agent work.
+    """
     if not session_key:
         return
     with _lock:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
-        _gateway_queues.pop(session_key, None)
+        _gateway_notify_cbs.pop(session_key, None)
+        entries = _gateway_queues.pop(session_key, [])
+        for entry in entries:
+            entry.event.set()
+
+
+def reset_state() -> None:
+    """Clear all process-local approval state for test hermeticity."""
+    with _lock:
+        _pending.clear()
+        _session_approved.clear()
+        _session_yolo.clear()
+        _permanent_approved.clear()
+        _gateway_notify_cbs.clear()
+        _gateway_queues.clear()
 
 
 def is_session_yolo_enabled(session_key: str) -> bool:

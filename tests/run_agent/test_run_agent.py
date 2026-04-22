@@ -1774,6 +1774,9 @@ class TestTenantHandleIsolation:
         ):
             return AIAgent(
                 api_key="test-key-1234567890",
+                base_url="https://api.openai.com/v1",
+                provider="openai",
+                model="gpt-4o-mini",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,

@@ -3,6 +3,7 @@
 import io
 import os
 import json
+import logging
 import tempfile
 import urllib.error
 import urllib.parse
@@ -1104,7 +1105,8 @@ class TestWebServerEndpoints:
     def test_workbench_unknown_api_route_fails_closed_with_correlation(self, caplog):
         caplog.clear()
 
-        resp = self.client.get("/api/workbench/not-a-real-route")
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.web_server"):
+            resp = self.client.get("/api/workbench/not-a-real-route")
 
         assert resp.status_code == 404
         assert resp.headers.get("content-type", "").startswith("application/json")

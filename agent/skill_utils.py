@@ -149,6 +149,7 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     resolved_platform = (
         platform
         or os.getenv("HERMES_PLATFORM")
+        or os.getenv("HERMES_SESSION_PLATFORM")
         or get_session_env("HERMES_SESSION_PLATFORM")
     )
     if resolved_platform:

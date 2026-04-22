@@ -1857,6 +1857,8 @@ def _normalize_custom_provider_entry(
     if not isinstance(entry, dict):
         return None
 
+    normalized_entry = dict(entry)
+
     # Accept camelCase aliases commonly used in hand-written configs.
     _CAMEL_ALIASES: Dict[str, str] = {
         "apiKey": "api_key",
@@ -1873,14 +1875,14 @@ def _normalize_custom_provider_entry(
         "context_length", "rate_limit_delay",
     }
     for camel, snake in _CAMEL_ALIASES.items():
-        if camel in entry and snake not in entry:
+        if camel in normalized_entry and snake not in normalized_entry:
             logger.warning(
                 "providers.%s: camelCase key '%s' auto-mapped to '%s' "
                 "(use snake_case to avoid this warning)",
                 provider_key or "?", camel, snake,
             )
-            entry[snake] = entry[camel]
-    unknown = set(entry.keys()) - _KNOWN_KEYS - set(_CAMEL_ALIASES.keys())
+            normalized_entry[snake] = normalized_entry[camel]
+    unknown = set(normalized_entry.keys()) - _KNOWN_KEYS - set(_CAMEL_ALIASES.keys())
     if unknown:
         logger.warning(
             "providers.%s: unknown config keys ignored: %s",
@@ -1891,7 +1893,7 @@ def _normalize_custom_provider_entry(
 
     base_url = ""
     for url_key in ("base_url", "url", "api"):
-        raw_url = entry.get(url_key)
+        raw_url = normalized_entry.get(url_key)
         if isinstance(raw_url, str) and raw_url.strip():
             candidate = raw_url.strip()
             parsed = urlparse(candidate)
@@ -1908,7 +1910,7 @@ def _normalize_custom_provider_entry(
         return None
 
     name = ""
-    raw_name = entry.get("name")
+    raw_name = normalized_entry.get("name")
     if isinstance(raw_name, str) and raw_name.strip():
         name = raw_name.strip()
     elif provider_key.strip():
@@ -1925,31 +1927,31 @@ def _normalize_custom_provider_entry(
     if provider_key:
         normalized["provider_key"] = provider_key
 
-    api_key = entry.get("api_key")
+    api_key = normalized_entry.get("api_key")
     if isinstance(api_key, str) and api_key.strip():
         normalized["api_key"] = api_key.strip()
 
-    key_env = entry.get("key_env")
+    key_env = normalized_entry.get("key_env")
     if isinstance(key_env, str) and key_env.strip():
         normalized["key_env"] = key_env.strip()
 
-    api_mode = entry.get("api_mode") or entry.get("transport")
+    api_mode = normalized_entry.get("api_mode") or normalized_entry.get("transport")
     if isinstance(api_mode, str) and api_mode.strip():
         normalized["api_mode"] = api_mode.strip()
 
-    model_name = entry.get("model") or entry.get("default_model")
+    model_name = normalized_entry.get("model") or normalized_entry.get("default_model")
     if isinstance(model_name, str) and model_name.strip():
         normalized["model"] = model_name.strip()
 
-    models = entry.get("models")
+    models = normalized_entry.get("models")
     if isinstance(models, dict) and models:
         normalized["models"] = models
 
-    context_length = entry.get("context_length")
+    context_length = normalized_entry.get("context_length")
     if isinstance(context_length, int) and context_length > 0:
         normalized["context_length"] = context_length
 
-    rate_limit_delay = entry.get("rate_limit_delay")
+    rate_limit_delay = normalized_entry.get("rate_limit_delay")
     if isinstance(rate_limit_delay, (int, float)) and rate_limit_delay >= 0:
         normalized["rate_limit_delay"] = rate_limit_delay
 
@@ -1961,9 +1963,21 @@ def providers_dict_to_custom_providers(providers_dict: Any) -> List[Dict[str, An
     if not isinstance(providers_dict, dict):
         return []
 
+    from urllib.parse import urlparse
+
     custom_providers: List[Dict[str, Any]] = []
     for key, entry in providers_dict.items():
-        normalized = _normalize_custom_provider_entry(entry, provider_key=str(key))
+        normalized_source = dict(entry) if isinstance(entry, dict) else entry
+        if isinstance(normalized_source, dict):
+            for url_key in ("api", "url", "base_url"):
+                raw_url = normalized_source.get(url_key)
+                if isinstance(raw_url, str) and raw_url.strip():
+                    candidate = raw_url.strip()
+                    parsed = urlparse(candidate)
+                    if parsed.scheme and parsed.netloc:
+                        normalized_source["base_url"] = candidate
+                        break
+        normalized = _normalize_custom_provider_entry(normalized_source, provider_key=str(key))
         if normalized is not None:
             custom_providers.append(normalized)
 

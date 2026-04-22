@@ -97,12 +97,15 @@ def _discord_request(
         raise DiscordAPIError(e.code, error_body) from e
 
 
-class DiscordAPIError(Exception):
-    """Raised when a Discord API call fails."""
-    def __init__(self, status: int, body: str):
-        self.status = status
-        self.body = body
-        super().__init__(f"Discord API error {status}: {body}")
+try:
+    DiscordAPIError
+except NameError:
+    class DiscordAPIError(Exception):
+        """Raised when a Discord API call fails."""
+        def __init__(self, status: int, body: str):
+            self.status = status
+            self.body = body
+            super().__init__(f"Discord API error {status}: {body}")
 
 
 # ---------------------------------------------------------------------------

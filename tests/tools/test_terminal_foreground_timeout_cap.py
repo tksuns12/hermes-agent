@@ -28,6 +28,13 @@ def _make_env_config(**overrides):
     return config
 
 
+def _runtime_cache(mock_env):
+    from tools.terminal_tool import resolve_runtime_key
+
+    runtime_key, _tenant, _effective_task_id = resolve_runtime_key("default")
+    return {runtime_key: mock_env}, {runtime_key: 0}
+
+
 class TestForegroundTimeoutCap:
     """FOREGROUND_MAX_TIMEOUT rejects foreground commands that exceed it."""
 
@@ -86,8 +93,9 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "usage", "returncode": 0}
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            active_envs, last_activity = _runtime_cache(mock_env)
+            with patch("tools.terminal_tool._active_environments", active_envs), \
+                 patch("tools.terminal_tool._last_activity", last_activity), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(command="pnpm dev --help"))
 
@@ -105,8 +113,9 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            active_envs, last_activity = _runtime_cache(mock_env)
+            with patch("tools.terminal_tool._active_environments", active_envs), \
+                 patch("tools.terminal_tool._last_activity", last_activity), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(
                     command="echo hello",
@@ -133,8 +142,9 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            active_envs, last_activity = _runtime_cache(mock_env)
+            with patch("tools.terminal_tool._active_environments", active_envs), \
+                 patch("tools.terminal_tool._last_activity", last_activity), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(command="make build"))
 
@@ -186,8 +196,9 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            active_envs, last_activity = _runtime_cache(mock_env)
+            with patch("tools.terminal_tool._active_environments", active_envs), \
+                 patch("tools.terminal_tool._last_activity", last_activity), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(command="echo hello"))
 
@@ -205,8 +216,9 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            active_envs, last_activity = _runtime_cache(mock_env)
+            with patch("tools.terminal_tool._active_environments", active_envs), \
+                 patch("tools.terminal_tool._last_activity", last_activity), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(
                     command="echo hello",

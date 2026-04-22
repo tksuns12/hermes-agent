@@ -13,6 +13,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytest.importorskip("mcp")
+
+from tools.registry import reset_global_registry
+
+
+@pytest.fixture(autouse=True)
+def _reset_global_tool_registry():
+    reset_global_registry()
+    yield
+    reset_global_registry()
+
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -288,7 +288,7 @@ class TestResponsesMultimodalHTTP:
             assert mock_run.captured["user_message"] == expected
 
     @pytest.mark.asyncio
-    async def test_input_file_returns_400(self, adapter):
+    async def test_input_file_returns_404_when_file_missing(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
@@ -303,6 +303,6 @@ class TestResponsesMultimodalHTTP:
                     ],
                 },
             )
-            assert resp.status == 400
+            assert resp.status == 404
             body = await resp.json()
-        assert body["error"]["code"] == "unsupported_content_type"
+        assert body["error"]["code"] == "file_not_found"

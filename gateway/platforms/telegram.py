@@ -249,8 +249,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
-        # Approval button state: message_id → session_key
+        # Approval button state: callback approval_id → session_key
         self._approval_state: Dict[int, str] = {}
+        self._approval_state_lock = asyncio.Lock()
 
     @staticmethod
     def _is_callback_user_authorized(user_id: str) -> bool:
@@ -260,6 +261,28 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or user_id in allowed_ids
+
+    @staticmethod
+    def _parse_exec_approval_callback_data(data: str) -> Optional[tuple[str, int]]:
+        """Parse exec-approval callback data into a normalized (choice, approval_id) pair."""
+        if not data.startswith("ea:"):
+            return None
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            return None
+        choice = parts[1].strip().lower()
+        if choice not in {"once", "session", "always", "deny"}:
+            return None
+        approval_id_raw = parts[2].strip()
+        if not approval_id_raw:
+            return None
+        try:
+            approval_id = int(approval_id_raw)
+        except ValueError:
+            return None
+        if approval_id < 1:
+            return None
+        return choice, approval_id
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1276,8 +1299,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._bot.send_message(**kwargs)
 
-            # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            # Store session_key keyed by approval_id for the callback handler.
+            # Guard updates so concurrent send/callback handling cannot observe
+            # partially-updated state on the same adapter instance.
+            async with self._approval_state_lock:
+                self._approval_state[approval_id] = session_key
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1598,58 +1624,57 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
-            parts = data.split(":", 2)
-            if len(parts) == 3:
-                choice = parts[1]  # once, session, always, deny
-                try:
-                    approval_id = int(parts[2])
-                except (ValueError, IndexError):
-                    await query.answer(text="Invalid approval data.")
-                    return
+            parsed_approval = self._parse_exec_approval_callback_data(data)
+            if not parsed_approval:
+                await query.answer(text="Invalid approval data.")
+                return
 
-                # Only authorized users may click approval buttons.
-                caller_id = str(getattr(query.from_user, "id", ""))
-                if not self._is_callback_user_authorized(caller_id):
-                    await query.answer(text="⛔ You are not authorized to approve commands.")
-                    return
+            choice, approval_id = parsed_approval
 
+            # Only authorized users may click approval buttons.
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(caller_id):
+                await query.answer(text="⛔ You are not authorized to approve commands.")
+                return
+
+            async with self._approval_state_lock:
                 session_key = self._approval_state.pop(approval_id, None)
-                if not session_key:
-                    await query.answer(text="This approval has already been resolved.")
-                    return
+            if not session_key:
+                await query.answer(text="This approval has already been resolved.")
+                return
 
-                # Map choice to human-readable label
-                label_map = {
-                    "once": "✅ Approved once",
-                    "session": "✅ Approved for session",
-                    "always": "✅ Approved permanently",
-                    "deny": "❌ Denied",
-                }
-                user_display = getattr(query.from_user, "first_name", "User")
-                label = label_map.get(choice, "Resolved")
+            # Map choice to human-readable label
+            label_map = {
+                "once": "✅ Approved once",
+                "session": "✅ Approved for session",
+                "always": "✅ Approved permanently",
+                "deny": "❌ Denied",
+            }
+            user_display = getattr(query.from_user, "first_name", "User")
+            label = label_map.get(choice, "Resolved")
 
-                await query.answer(text=label)
+            await query.answer(text=label)
 
-                # Edit message to show decision, remove buttons
-                try:
-                    await query.edit_message_text(
-                        text=f"{label} by {user_display}",
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=None,
-                    )
-                except Exception:
-                    pass  # non-fatal if edit fails
+            # Edit message to show decision, remove buttons
+            try:
+                await query.edit_message_text(
+                    text=f"{label} by {user_display}",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass  # non-fatal if edit fails
 
-                # Resolve the approval — unblocks the agent thread
-                try:
-                    from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
-                    logger.info(
-                        "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                        count, session_key, choice, user_display,
-                    )
-                except Exception as exc:
-                    logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
+            # Resolve the approval — unblocks the agent thread
+            try:
+                from tools.approval import resolve_gateway_approval
+                count = resolve_gateway_approval(session_key, choice)
+                logger.info(
+                    "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                    count, session_key, choice, user_display,
+                )
+            except Exception as exc:
+                logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
             return
 
         # --- Update prompt callbacks ---

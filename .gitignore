@@ -92,3 +92,7 @@ vendor/
 *.log
 coverage/
 .cache/
+.ant-colony/
+
+# ── GSD baseline (auto-generated) ──
+.mcp.json

@@ -943,10 +943,12 @@ class SessionStore:
 
         Returns True if the session existed and was marked.
         """
+        tenant = self._session_key_to_tenant.get(session_key, DEFAULT_TENANT)
         with self._lock:
-            self._ensure_loaded_locked()
-            if session_key in self._entries:
-                entry = self._entries[session_key]
+            self._ensure_loaded_locked(tenant)
+            entries = self._get_entries_for_tenant(tenant)
+            if session_key in entries:
+                entry = entries[session_key]
                 # Never override an explicit ``suspended`` — that is a hard
                 # forced-wipe signal (from /stop or stuck-loop escalation).
                 if entry.suspended:
@@ -954,7 +956,8 @@ class SessionStore:
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.last_resume_marked_at = _now()
-                self._save()
+                self._entries[session_key] = entry
+                self._save(tenant)
                 return True
         return False
 
@@ -967,15 +970,18 @@ class SessionStore:
 
         Returns True if a flag was cleared.
         """
+        tenant = self._session_key_to_tenant.get(session_key, DEFAULT_TENANT)
         with self._lock:
-            self._ensure_loaded_locked()
-            entry = self._entries.get(session_key)
+            self._ensure_loaded_locked(tenant)
+            entries = self._get_entries_for_tenant(tenant)
+            entry = entries.get(session_key)
             if entry is None or not entry.resume_pending:
                 return False
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
-            self._save()
+            self._entries[session_key] = entry
+            self._save(tenant)
             return True
 
     def prune_old_entries(self, max_age_days: int) -> int:
@@ -1023,10 +1029,20 @@ class SessionStore:
                         )
                 if entry.updated_at < cutoff:
                     removed_keys.append(key)
+
+            tenants_to_save: set[str] = set()
             for key in removed_keys:
-                self._entries.pop(key, None)
-            if removed_keys:
-                self._save()
+                entry = self._entries.pop(key, None)
+                tenant = self._session_key_to_tenant.pop(key, DEFAULT_TENANT)
+                tenants_to_save.add(tenant)
+                tenant_entries = self._entries_by_tenant.get(tenant)
+                if tenant_entries is not None:
+                    tenant_entries.pop(key, None)
+                if entry is not None:
+                    self._session_id_to_tenant.pop(entry.session_id, None)
+
+            for tenant in tenants_to_save:
+                self._save(tenant)
 
         if removed_keys:
             logger.info(

@@ -1085,17 +1085,49 @@ class GatewayRunner:
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
         # fall back to the provider's first catalog model so the API call
         # doesn't fail with "model must be a non-empty string".
-        if not model and runtime_kwargs.get("provider"):
+        #
+        # However, gateway tests may monkeypatch only the runtime provider to
+        # exercise provider-specific retry logic. In that case, inheriting a
+        # stale config model from an unrelated provider (for example a low-
+        # context Workers AI Gemma model) causes AIAgent construction to fail
+        # before the provider-specific path is reached. If the resolved runtime
+        # is Anthropic, prefer Anthropic's default model unless the configured
+        # model already looks like a Claude slug.
+        _runtime_provider = (runtime_kwargs.get("provider") or "").strip().lower()
+        _configured_model = (model or "").strip()
+        _configured_model_lower = _configured_model.lower()
+        _configured_model_looks_anthropic = _configured_model_lower.startswith("claude")
+        _should_swap_model_for_provider = (
+            _runtime_provider == "anthropic"
+            and (
+                not _configured_model
+                or not _configured_model_looks_anthropic
+            )
+        )
+        if (not model and runtime_kwargs.get("provider")) or _should_swap_model_for_provider:
             try:
                 from hermes_cli.models import get_default_model_for_provider
-                model = get_default_model_for_provider(runtime_kwargs["provider"])
-                if model:
-                    logger.info(
-                        "No model configured — defaulting to %s for provider %s",
-                        model, runtime_kwargs["provider"],
-                    )
+                _fallback_model = get_default_model_for_provider(runtime_kwargs["provider"])
+                if _fallback_model:
+                    if _should_swap_model_for_provider and _configured_model:
+                        logger.info(
+                            "Configured model %s does not match Anthropic runtime; defaulting to %s",
+                            _configured_model,
+                            _fallback_model,
+                        )
+                    else:
+                        logger.info(
+                            "No model configured — defaulting to %s for provider %s",
+                            _fallback_model,
+                            runtime_kwargs["provider"],
+                        )
+                    model = _fallback_model
             except Exception:
                 pass
+
+        if _runtime_provider == "anthropic" and not _configured_model_looks_anthropic and model:
+            runtime_kwargs = dict(runtime_kwargs)
+            runtime_kwargs.setdefault("model_context_validation_source", "gateway_provider_default")
 
         return model, runtime_kwargs
 

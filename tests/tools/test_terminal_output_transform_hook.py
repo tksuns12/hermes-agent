@@ -48,8 +48,9 @@ def _run_terminal(
         "_check_all_guards",
         lambda *_args, **_kwargs: approval or {"approved": True},
     )
-    monkeypatch.setitem(terminal_tool_module._active_environments, "default", mock_env)
-    monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    runtime_key, _tenant, _effective_task_id = terminal_tool_module.resolve_runtime_key("default")
+    monkeypatch.setitem(terminal_tool_module._active_environments, runtime_key, mock_env)
+    monkeypatch.setitem(terminal_tool_module._last_activity, runtime_key, 0.0)
 
     if invoke_hook is not _UNSET:
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
@@ -59,6 +60,8 @@ def _run_terminal(
 
 
 def test_terminal_output_unchanged_when_transform_hook_not_registered(monkeypatch, tmp_path):
+    plugins_mod.reset_plugins()
+
     result, _mock_env = _run_terminal(monkeypatch, tmp_path, output="plain output")
 
     assert result["output"] == "plain output"
@@ -67,6 +70,8 @@ def test_terminal_output_unchanged_when_transform_hook_not_registered(monkeypatc
 
 
 def test_terminal_output_unchanged_for_none_hook_result(monkeypatch, tmp_path):
+    plugins_mod.reset_plugins()
+
     result, _mock_env = _run_terminal(
         monkeypatch,
         tmp_path,
@@ -78,6 +83,8 @@ def test_terminal_output_unchanged_for_none_hook_result(monkeypatch, tmp_path):
 
 
 def test_terminal_output_ignores_invalid_hook_results(monkeypatch, tmp_path):
+    plugins_mod.reset_plugins()
+
     result, _mock_env = _run_terminal(
         monkeypatch,
         tmp_path,
@@ -89,6 +96,8 @@ def test_terminal_output_ignores_invalid_hook_results(monkeypatch, tmp_path):
 
 
 def test_terminal_output_uses_first_valid_string_from_hooks(monkeypatch, tmp_path):
+    plugins_mod.reset_plugins()
+
     result, _mock_env = _run_terminal(
         monkeypatch,
         tmp_path,
@@ -100,6 +109,8 @@ def test_terminal_output_uses_first_valid_string_from_hooks(monkeypatch, tmp_pat
 
 
 def test_terminal_output_transform_still_truncates_long_replacement(monkeypatch, tmp_path):
+    plugins_mod.reset_plugins()
+
     transformed_output = "PLUGIN-HEAD\n" + ("A" * 60000) + "\nPLUGIN-TAIL"
     result, _mock_env = _run_terminal(
         monkeypatch,
@@ -115,6 +126,8 @@ def test_terminal_output_transform_still_truncates_long_replacement(monkeypatch,
 
 
 def test_terminal_output_transform_still_runs_strip_and_redact(monkeypatch, tmp_path):
+    plugins_mod.reset_plugins()
+
     # Ensure redaction is active regardless of host HERMES_REDACT_SECRETS state
     # or collection-time import order (the module snapshots env at import).
     monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
@@ -134,6 +147,8 @@ def test_terminal_output_transform_still_runs_strip_and_redact(monkeypatch, tmp_
 
 
 def test_terminal_output_transform_hook_exception_falls_back(monkeypatch, tmp_path):
+    plugins_mod.reset_plugins()
+
     def _raise(*_args, **_kwargs):
         raise RuntimeError("boom")
 
@@ -150,6 +165,8 @@ def test_terminal_output_transform_hook_exception_falls_back(monkeypatch, tmp_pa
 
 
 def test_terminal_output_transform_does_not_change_approval_or_exit_code_meaning(monkeypatch, tmp_path):
+    plugins_mod.reset_plugins()
+
     approval = {
         "approved": True,
         "user_approved": True,
@@ -173,11 +190,17 @@ def test_terminal_output_transform_does_not_change_approval_or_exit_code_meaning
 
 
 def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp_path):
+    plugins_mod.reset_plugins()
+
     hermes_home = Path(os.environ["HERMES_HOME"])
     plugins_dir = hermes_home / "plugins"
     plugin_dir = plugins_dir / "terminal_transform"
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.yaml").write_text("name: terminal_transform\n", encoding="utf-8")
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - terminal_transform\n",
+        encoding="utf-8",
+    )
     (plugin_dir / "__init__.py").write_text(
         "def register(ctx):\n"
         '    ctx.register_hook("transform_terminal_output", '
@@ -185,7 +208,7 @@ def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp
         encoding="utf-8",
     )
 
-    plugins_mod.discover_plugins()
+    plugins_mod.discover_plugins(force_reload=True)
 
     long_output = "X" * 60000
     result, _mock_env = _run_terminal(

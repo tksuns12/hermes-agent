@@ -451,6 +451,25 @@ class PluginManager:
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
 
+    def reset(self, preserve_cli_ref: bool = True) -> None:
+        """Clear all loaded/discovered plugin state so discovery can run fresh.
+
+        This is primarily useful for tests and any runtime that needs to
+        re-scan plugin directories after changing ``HERMES_HOME`` or plugin
+        files. By default, the CLI reference is preserved so an already-bound
+        CLI can continue receiving plugin registrations after rediscovery.
+        """
+        cli_ref = self._cli_ref if preserve_cli_ref else None
+        self._plugins.clear()
+        self._hooks.clear()
+        self._plugin_tool_names.clear()
+        self._cli_commands.clear()
+        self._context_engine = None
+        self._plugin_commands.clear()
+        self._plugin_skills.clear()
+        self._discovered = False
+        self._cli_ref = cli_ref
+
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
@@ -820,17 +839,40 @@ def get_plugin_manager() -> PluginManager:
     return _plugin_manager
 
 
-def discover_plugins() -> None:
-    """Discover and load all plugins (idempotent)."""
-    get_plugin_manager().discover_and_load()
+def reset_plugins(preserve_cli_ref: bool = True) -> PluginManager:
+    """Reset the global plugin manager so subsequent discovery starts clean."""
+    manager = get_plugin_manager()
+    manager.reset(preserve_cli_ref=preserve_cli_ref)
+    return manager
+
+
+def discover_plugins(*, force_reload: bool = False) -> None:
+    """Discover and load all plugins.
+
+    By default this remains idempotent. ``force_reload=True`` clears any
+    previously discovered hooks/plugins first so callers can re-scan the
+    current plugin environment without inheriting stale global state.
+    """
+    manager = get_plugin_manager()
+    if force_reload:
+        manager.reset()
+    manager.discover_and_load()
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Invoke a lifecycle hook on all loaded plugins.
 
     Returns a list of non-``None`` return values from plugin callbacks.
+
+    This intentionally does **not** auto-discover plugins. Callers that need
+    plugin hooks must opt into discovery explicitly via ``discover_plugins()``.
+    That keeps hook invocation deterministic in tests and runtimes where no
+    plugin session has been initialized for the current process.
     """
-    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+    manager = get_plugin_manager()
+    if not manager._discovered or hook_name not in manager._hooks:
+        return []
+    return manager.invoke_hook(hook_name, **kwargs)
 
 
 

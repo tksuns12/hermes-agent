@@ -191,7 +191,7 @@ def _make_agent_cls(error_cls, recover_after=None):
     return _Agent
 
 
-def _run_with_agent(monkeypatch, agent_cls):
+def _run_with_agent(monkeypatch, agent_cls, *, configured_model="workers-ai/@cf/google/gemma-4-26b-a4b-it"):
     """Run _run_agent through the gateway with the given agent class."""
     _patch_agent_bootstrap(monkeypatch)
     monkeypatch.setattr(
@@ -207,6 +207,11 @@ def _run_with_agent(monkeypatch, agent_cls):
             "base_url": "https://api.anthropic.com",
             "api_key": "sk-ant-api03-test-key",
         },
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"model": {"default": configured_model}},
     )
     monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
 
@@ -248,10 +253,17 @@ def _run_with_agent(monkeypatch, agent_cls):
 # ---------------------------------------------------------------------------
 
 
+def test_anthropic_runtime_ignores_incompatible_config_model(monkeypatch):
+    """Anthropic runtime should not inherit a stale low-context non-Claude config model."""
+    agent_cls = _make_agent_cls(_RateLimitError, recover_after=1)
+    result = _run_with_agent(monkeypatch, agent_cls)
+    assert result["final_response"] == "Recovered"
+
+
 def test_429_rate_limit_is_retried_and_recovers(monkeypatch):
     """429 should be retried with backoff. First call fails, second succeeds."""
     agent_cls = _make_agent_cls(_RateLimitError, recover_after=1)
-    result = _run_with_agent(monkeypatch, agent_cls)
+    result = _run_with_agent(monkeypatch, agent_cls, configured_model="claude-sonnet-4-6")
     assert result["final_response"] == "Recovered"
 
 

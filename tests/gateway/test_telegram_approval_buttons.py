@@ -59,6 +59,12 @@ def _make_adapter(extra=None):
     return adapter
 
 
+@pytest.fixture(autouse=True)
+def _clear_telegram_allowed_users_env(monkeypatch):
+    """Keep callback authorization deterministic across the suite."""
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+
+
 # ===========================================================================
 # send_exec_approval — inline keyboard buttons
 # ===========================================================================
@@ -255,6 +261,96 @@ class TestTelegramApprovalCallback:
         # Should still ack with "already resolved" message
         query.answer.assert_called_once()
         assert "already been resolved" in query.answer.call_args[1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_approval_callback_data_is_rejected(self):
+        adapter = _make_adapter()
+
+        for callback_data in ("ea:bogus:1", "ea:once:not-an-int", "ea:once:", "ea:once:0"):
+            query = AsyncMock()
+            query.data = callback_data
+            query.message = MagicMock()
+            query.message.chat_id = 12345
+            query.from_user = MagicMock()
+            query.answer = AsyncMock()
+            query.edit_message_text = AsyncMock()
+
+            update = MagicMock()
+            update.callback_query = query
+            context = MagicMock()
+
+            with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+                await adapter._handle_callback_query(update, context)
+
+            mock_resolve.assert_not_called()
+            query.answer.assert_called_once()
+            assert "invalid approval data" in query.answer.call_args[1]["text"].lower()
+            query.edit_message_text.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_approval_callback_does_not_consume_state(self):
+        adapter = _make_adapter()
+        adapter._approval_state[7] = "session-7"
+
+        query = AsyncMock()
+        query.data = "ea:once:7"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.from_user.id = 222
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}):
+            with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+                await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_not_called()
+        query.answer.assert_called_once()
+        assert "not authorized" in query.answer.call_args[1]["text"].lower()
+        query.edit_message_text.assert_not_called()
+        assert adapter._approval_state[7] == "session-7"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_approval_callbacks_only_resolve_once(self):
+        adapter = _make_adapter()
+        adapter._approval_state[5] = "session-5"
+
+        def _make_query(first_name: str):
+            query = AsyncMock()
+            query.data = "ea:once:5"
+            query.message = MagicMock()
+            query.message.chat_id = 12345
+            query.from_user = MagicMock()
+            query.from_user.first_name = first_name
+            query.answer = AsyncMock()
+            query.edit_message_text = AsyncMock()
+            return query
+
+        query_one = _make_query("One")
+        query_two = _make_query("Two")
+
+        update_one = MagicMock()
+        update_one.callback_query = query_one
+        update_two = MagicMock()
+        update_two.callback_query = query_two
+        context = MagicMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await asyncio.gather(
+                adapter._handle_callback_query(update_one, context),
+                adapter._handle_callback_query(update_two, context),
+            )
+
+        mock_resolve.assert_called_once_with("session-5", "once")
+        assert 5 not in adapter._approval_state
+        answers = [query_one.answer.call_args[1]["text"], query_two.answer.call_args[1]["text"]]
+        assert any("approved once" in text.lower() for text in answers)
+        assert any("already been resolved" in text.lower() for text in answers)
 
     @pytest.mark.asyncio
     async def test_model_picker_callback_not_affected(self):

@@ -7,8 +7,19 @@ from argparse import Namespace
 from pathlib import Path
 
 import pytest
+from unittest.mock import patch
 
 import hermes_cli.doctor as doctor_mod
+
+
+_ORIGINAL_SHUTIL_WHICH = doctor_mod.shutil.which
+
+
+def _safe_which(cmd: str):
+    try:
+        return _ORIGINAL_SHUTIL_WHICH(cmd)
+    except AttributeError:
+        return None
 
 
 def _setup_doctor_env(monkeypatch, tmp_path, venv_name="venv"):
@@ -62,7 +73,7 @@ def _run_doctor(fix=False):
     import contextlib
 
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    with contextlib.redirect_stdout(buf), patch.object(doctor_mod.shutil, "which", side_effect=_safe_which):
         doctor_mod.run_doctor(Namespace(fix=fix))
     return buf.getvalue()
 

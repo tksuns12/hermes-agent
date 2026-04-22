@@ -425,9 +425,8 @@ class TestStripProviderPrefix:
 
 class TestFetchModelMetadata:
     def _reset_cache(self):
-        import agent.model_metadata as mm
-        mm._model_metadata_cache = {}
-        mm._model_metadata_cache_time = 0
+        from agent.model_metadata import reset_model_metadata_caches
+        reset_model_metadata_caches()
 
     @patch("agent.model_metadata.requests.get")
     def test_caches_result(self, mock_get):

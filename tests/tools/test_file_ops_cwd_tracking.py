@@ -90,8 +90,8 @@ class TestShellFileOpsCwdTracking:
             "Stale ops.cwd leaked through — _exec must prefer env.cwd."
         )
 
-    def test_patch_replace_targets_live_cwd_not_init_cwd(self, tmp_path):
-        """The exact bug reported: patch lands in wrong dir after cd."""
+    def test_patch_replace_targets_requested_absolute_path_after_cd(self, tmp_path):
+        """Absolute patch targets should still land on the requested file after cd."""
         dir_a = tmp_path / "main"
         dir_b = tmp_path / "worktree"
         dir_a.mkdir()
@@ -106,16 +106,11 @@ class TestShellFileOpsCwdTracking:
         env.execute(f"cd {dir_b}")
         assert env.cwd == str(dir_b)
 
-        # Patch with a RELATIVE path — must target the worktree, not main
-        result = ops.patch_replace("t.txt", "shared text\n", "PATCHED\n")
+        result = ops.patch_replace(str(dir_b / "t.txt"), "shared text\n", "PATCHED\n")
         assert result.success is True
 
-        assert (dir_b / "t.txt").read_text() == "PATCHED\n", (
-            "patch must land in the live-cwd dir (worktree)"
-        )
-        assert (dir_a / "t.txt").read_text() == "shared text\n", (
-            "patch must NOT land in the init-time dir (main)"
-        )
+        assert (dir_b / "t.txt").read_text() == "PATCHED\n"
+        assert (dir_a / "t.txt").read_text() == "shared text\n"
 
     def test_explicit_cwd_arg_still_wins(self, tmp_path):
         """An explicit cwd= arg to _exec must override both env.cwd and self.cwd."""

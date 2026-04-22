@@ -1832,6 +1832,15 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _normalize_chat_user_content(self, content: Any, tenant: str, *, file_counter: list[int] | None = None) -> str:
         """Normalize chat user content, resolving retained file references."""
         if isinstance(content, list):
+            if any(
+                isinstance(part, dict)
+                and str(part.get("type") or "").strip().lower() == "file"
+                for part in content
+            ):
+                raise ValueError(
+                    "unsupported_content_type:Inline image inputs are supported, "
+                    "but uploaded files and document inputs are not supported on this endpoint."
+                )
             counter = file_counter if file_counter is not None else [0]
             agent_content, _ = await self._normalize_response_content_parts(content, tenant, _file_counter=counter)
             return agent_content
