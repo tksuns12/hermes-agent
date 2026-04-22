@@ -847,6 +847,45 @@ class TestWebServerEndpoints:
         )
         assert captured_urls == [f"http://127.0.0.1:8642/v1/files?user_id={tenant_id}"]
 
+    def test_workbench_files_list_reports_incompatible_upstream_route(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        bootstrap = self.client.get("/api/workbench/bootstrap")
+        tenant = bootstrap.json()["tenant"]
+        browser_id = bootstrap.cookies.get("hermes_browser_id")
+
+        def _mock_urlopen(req, timeout=0):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                404,
+                "not found",
+                hdrs={},
+                fp=io.BytesIO(b'{"detail":"Not Found"}'),
+            )
+
+        monkeypatch.setattr(ws.urllib.request, "urlopen", _mock_urlopen)
+
+        listed = self.client.get(
+            "/api/workbench/files",
+            cookies={"hermes_browser_id": browser_id},
+        )
+
+        assert listed.status_code == 502
+        detail = listed.json()["detail"]
+        assert detail["code"] == "proxy_upstream_incompatible"
+        assert detail["phase"] == "file.list"
+        assert detail["expected_route"] == "GET /v1/files"
+        assert detail["upstream_url"] == "http://127.0.0.1:8642/v1/files?user_id=%s" % tenant["id"]
+        assert "stale or incompatible gateway process" in detail["message"]
+        assert listed.headers.get("X-Workbench-Request-Id") == detail["request_id"]
+        _assert_workbench_tenant_headers(
+            listed,
+            tenant_id=tenant["id"],
+            tenant_label=tenant["label"],
+            tenant_source="cookie",
+            fallback=False,
+        )
+
     def test_workbench_files_metadata_and_content_proxy(self, monkeypatch):
         import hermes_cli.web_server as ws
 

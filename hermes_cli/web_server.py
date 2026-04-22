@@ -488,11 +488,12 @@ def _apply_browser_identity_cookie(response: JSONResponse | StreamingResponse, r
 class _WorkbenchUpstreamHTTPError(Exception):
     """Normalized upstream HTTP error envelope for workbench proxy routes."""
 
-    def __init__(self, status_code: int, body: bytes, headers: Dict[str, str]):
+    def __init__(self, status_code: int, body: bytes, headers: Dict[str, str], url: str):
         super().__init__(f"upstream status={status_code}")
         self.status_code = status_code
         self.body = body
         self.headers = headers
+        self.url = url
 
 
 class _WorkbenchUpstreamMalformedResponseError(Exception):
@@ -639,7 +640,7 @@ def _upstream_request_raw(
             return resp.status, body, dict(resp.headers.items()), url
     except urllib.error.HTTPError as exc:
         body = exc.read() if hasattr(exc, "read") else b""
-        raise _WorkbenchUpstreamHTTPError(exc.code, body, dict((exc.headers or {}).items())) from exc
+        raise _WorkbenchUpstreamHTTPError(exc.code, body, dict((exc.headers or {}).items()), url) from exc
 
 
 def _upstream_request_json(
@@ -667,6 +668,43 @@ def _upstream_request_json(
     )
     parsed_payload = _decode_upstream_json_required(body) if strict else _decode_upstream_json(body)
     return status, parsed_payload, headers, url
+
+
+def _translate_upstream_incompatible_route(
+    *,
+    request_id: str,
+    phase: str,
+    tenant_id: str,
+    upstream_url: str,
+    expected_route: str,
+    resolved: Dict[str, Any] | None = None,
+) -> HTTPException:
+    """Translate missing required upstream routes into an actionable proxy error."""
+    detail = (
+        f"Workbench upstream at {upstream_url} is missing required route {expected_route}. "
+        "The dashboard is likely connected to a stale or incompatible gateway process."
+    )
+    _log.warning(
+        "workbench/proxy_incompatible request_id=%s phase=%s tenant=%s upstream=%s expected_route=%s",
+        request_id,
+        phase,
+        tenant_id,
+        upstream_url,
+        expected_route,
+    )
+    return HTTPException(
+        status_code=502,
+        detail={
+            "code": "proxy_upstream_incompatible",
+            "message": detail,
+            "request_id": request_id,
+            "phase": phase,
+            "upstream_status": 404,
+            "upstream_url": upstream_url,
+            "expected_route": expected_route,
+        },
+        headers=_workbench_proxy_headers(request_id, resolved),
+    )
 
 
 def _translate_upstream_error(
@@ -1269,7 +1307,7 @@ async def stream_workbench_run_events(request: Request, run_id: str):
     except urllib.error.HTTPError as exc:
         body = exc.read() if hasattr(exc, "read") else b""
         raise _translate_upstream_error(
-            _WorkbenchUpstreamHTTPError(exc.code, body, dict((exc.headers or {}).items())),
+            _WorkbenchUpstreamHTTPError(exc.code, body, dict((exc.headers or {}).items()), upstream_url),
             request_id=request_id,
             phase="run.events",
             tenant_id=tenant_id,
@@ -1365,6 +1403,15 @@ async def list_workbench_files(request: Request):
             lambda: _upstream_request_json("GET", path, request_id, strict=True),
         )
     except _WorkbenchUpstreamHTTPError as exc:
+        if exc.status_code == 404:
+            raise _translate_upstream_incompatible_route(
+                request_id=request_id,
+                phase="file.list",
+                tenant_id=tenant_id,
+                upstream_url=exc.url,
+                expected_route="GET /v1/files",
+                resolved=resolved,
+            )
         raise _translate_upstream_error(
             exc,
             request_id=request_id,
@@ -1508,6 +1555,15 @@ async def create_workbench_file(request: Request):
         upstream_payload = _decode_upstream_json_required(upstream_body)
         normalized_payload = _normalize_workbench_file_metadata(upstream_payload)
     except _WorkbenchUpstreamHTTPError as exc:
+        if exc.status_code == 404:
+            raise _translate_upstream_incompatible_route(
+                request_id=request_id,
+                phase="file.upload",
+                tenant_id=tenant_id,
+                upstream_url=exc.url,
+                expected_route="POST /v1/files",
+                resolved=resolved,
+            )
         raise _translate_upstream_error(
             exc,
             request_id=request_id,
