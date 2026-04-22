@@ -77,6 +77,18 @@ vi.mock("@/components/Toast", () => ({
 
 const NOW = Math.floor(Date.now() / 1000);
 
+function outcomeEnvelope(
+  status: "success" | "partial_success" | "unsupported" | "no_output",
+  explanation: string,
+  nextSteps: string[] = [],
+): string {
+  return `<hermes_office_outcome>${JSON.stringify({
+    status,
+    explanation,
+    next_steps: nextSteps,
+  })}</hermes_office_outcome>`;
+}
+
 function installLocalStorageShim() {
   const storage = new Map<string, string>();
   Object.defineProperty(window, "localStorage", {
@@ -267,6 +279,7 @@ function configureHappyPathMocks() {
             filename: "analysis.csv",
             size_bytes: 512,
             mime_type: "text/csv",
+            source_run_id: "run-1",
           },
         ],
       });
@@ -279,6 +292,14 @@ function configureHappyPathMocks() {
       };
     },
   );
+  mockApi.downloadWorkbenchFile.mockResolvedValue({
+    blob: new Blob(["download"], { type: "text/csv" }),
+    contentType: "text/csv",
+    requestId: "req-download",
+    tenantId: "tenant-alpha",
+    tenantLabel: "Tenant Alpha",
+    tenantSource: "browser_cookie",
+  });
 }
 
 function toggleFileSelectionByName(filename: string) {
@@ -299,13 +320,29 @@ function latestRunPayload() {
 
 beforeEach(() => {
   installLocalStorageShim();
+  Object.defineProperty(window.URL, "createObjectURL", {
+    configurable: true,
+    writable: true,
+    value: vi.fn(() => "blob:mock-download"),
+  });
+  Object.defineProperty(window.URL, "revokeObjectURL", {
+    configurable: true,
+    writable: true,
+    value: vi.fn(),
+  });
+  Object.defineProperty(HTMLAnchorElement.prototype, "click", {
+    configurable: true,
+    writable: true,
+    value: vi.fn(),
+  });
+
   vi.clearAllMocks();
   window.localStorage.removeItem("hermes.workbench.lastSeenTenant.v1");
   configureHappyPathMocks();
 });
 
 describe("EndUserWorkspacePage runtime", () => {
-  it("boots against real runtime signals, uploads files, and streams run outputs", async () => {
+  it("boots against real runtime signals, renders run-tied output cards, and downloads generated files", async () => {
     render(<EndUserWorkspacePage />);
 
     await screen.findByText(/work with your files in a live ai run\./i);
@@ -342,9 +379,19 @@ describe("EndUserWorkspacePage runtime", () => {
 
     await screen.findByText(/Run completed/i);
     await screen.findByText("analysis.csv");
+    await screen.findByText(/source_run_id=run-1/i);
     expect((await screen.findAllByText(/req-run/)).length).toBeGreaterThan(0);
     expect((await screen.findAllByText(/req-stream/)).length).toBeGreaterThan(0);
     await screen.findByText(/Malformed stream payload ignored/i);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /download generated file analysis\.csv/i }),
+    );
+
+    await waitFor(() => {
+      expect(mockApi.downloadWorkbenchFile).toHaveBeenCalledWith("gen-1");
+    });
+    await screen.findByText(/Downloaded analysis\.csv/i);
   });
 
   it("prevents empty prompts even when files are selected", async () => {
@@ -523,7 +570,116 @@ describe("EndUserWorkspacePage runtime", () => {
 
     await screen.findByText("retained-output.csv");
     expect(screen.getByText(/generated outputs/i)).toBeTruthy();
+    expect(screen.getByText(/source_run_id=unknown/i)).toBeTruthy();
     expect(screen.getByText(/files_request_id=req-files-refresh/i)).toBeTruthy();
+  });
+
+  it("shows an honest partial-success boundary panel alongside generated outputs", async () => {
+    const partialOutcome = outcomeEnvelope(
+      "partial_success",
+      "Generated output with formatting caveats.",
+      ["Review table formatting before sharing."],
+    );
+
+    mockApi.getWorkbenchSessionMessages.mockResolvedValue({
+      ...sessionMessagesResult(),
+      messages: [{ role: "assistant", content: `Here is your draft.\n${partialOutcome}` }],
+    });
+
+    mockApi.streamWorkbenchRunEvents.mockImplementation(
+      async (
+        _runId: string,
+        onEvent: (event: Record<string, unknown>) => void,
+      ) => {
+        onEvent({ event: "run.completed", run_id: "run-1", output: partialOutcome, files: [
+          {
+            file_id: "gen-partial",
+            filename: "draft.docx",
+            size_bytes: 1024,
+            mime_type:
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            source_run_id: "run-1",
+          },
+        ] });
+        return {
+          requestId: "req-stream-partial",
+          sessionId: "sess-1",
+          tenantId: "tenant-alpha",
+          tenantLabel: "Tenant Alpha",
+          tenantSource: "browser_cookie",
+        };
+      },
+    );
+
+    render(<EndUserWorkspacePage />);
+    await screen.findByText(/work with your files in a live ai run\./i);
+
+    fireEvent.change(
+      screen.getByPlaceholderText(/ask hermes to analyze or transform/i),
+      { target: { value: "Run partial" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    const partialBoundary = await screen.findByTestId("workspace-run-boundary");
+    expect(within(partialBoundary).getByText(/Partial output boundary/i)).toBeTruthy();
+    expect(within(partialBoundary).getByText(/status=partial_success/i)).toBeTruthy();
+    expect(within(partialBoundary).getByText(/source_run_id=run-1/i)).toBeTruthy();
+    expect(
+      within(partialBoundary).getByText(/Generated output with formatting caveats\./i),
+    ).toBeTruthy();
+    await screen.findByText("draft.docx");
+  });
+
+  it("shows no-output boundary state without fake generated-file download affordances", async () => {
+    const noOutputEnvelope = outcomeEnvelope(
+      "no_output",
+      "No output was intentionally generated for this request.",
+      ["Ask a follow-up with a narrower output format."],
+    );
+
+    mockApi.getWorkbenchSessionMessages.mockResolvedValue({
+      ...sessionMessagesResult(),
+      messages: [{ role: "assistant", content: noOutputEnvelope }],
+    });
+
+    mockApi.streamWorkbenchRunEvents.mockImplementation(
+      async (
+        _runId: string,
+        onEvent: (event: Record<string, unknown>) => void,
+      ) => {
+        onEvent({
+          event: "run.completed",
+          run_id: "run-1",
+          output: noOutputEnvelope,
+          files: [],
+        });
+        return {
+          requestId: "req-stream-no-output",
+          sessionId: "sess-1",
+          tenantId: "tenant-alpha",
+          tenantLabel: "Tenant Alpha",
+          tenantSource: "browser_cookie",
+        };
+      },
+    );
+
+    render(<EndUserWorkspacePage />);
+    await screen.findByText(/work with your files in a live ai run\./i);
+
+    fireEvent.change(
+      screen.getByPlaceholderText(/ask hermes to analyze or transform/i),
+      { target: { value: "Run no output" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    const noOutputBoundary = await screen.findByTestId("workspace-run-boundary");
+    expect(within(noOutputBoundary).getByText(/No output boundary/i)).toBeTruthy();
+    expect(within(noOutputBoundary).getByText(/status=no_output/i)).toBeTruthy();
+    expect(
+      within(noOutputBoundary).getByText(/No output was intentionally generated for this request\./i),
+    ).toBeTruthy();
+    await screen.findByText(/Generated outputs \(0\)/i);
+    expect(screen.queryByRole("button", { name: /download generated file/i })).toBeNull();
   });
 
   it("surfaces run-start proxy failures with request-id detail", async () => {

@@ -40,6 +40,7 @@ export default function WorkbenchPage() {
     toggleFileSelection,
     handleDownloadFile,
     generatedFiles,
+    runOutcome,
     composer,
     setComposer,
     runPending,
@@ -275,6 +276,7 @@ export default function WorkbenchPage() {
             selectedFiles={selectedFiles}
             selectedFileIds={selectedFileIds}
             generatedFiles={generatedFiles}
+            runOutcome={runOutcome}
             activityEntries={activityEntries}
             filesLoading={filesLoading}
             filesError={filesError}
@@ -282,6 +284,8 @@ export default function WorkbenchPage() {
             uploadPending={uploadPending}
             uploadError={uploadError}
             uploadRequestId={uploadRequestId}
+            runRequestId={runRequestId}
+            streamRequestId={streamRequestId}
             runPending={runPending}
             mismatchActive={mismatchActive}
             onRefreshFiles={loadFiles}

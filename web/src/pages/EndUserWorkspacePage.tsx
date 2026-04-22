@@ -41,6 +41,7 @@ export default function EndUserWorkspacePage() {
     toggleFileSelection,
     handleDownloadFile,
     generatedFiles,
+    runOutcome,
     activityEntries,
     composer,
     setComposer,
@@ -164,6 +165,7 @@ export default function EndUserWorkspacePage() {
             selectedFiles={selectedFiles}
             selectedFileIds={selectedFileIds}
             generatedFiles={generatedFiles}
+            runOutcome={runOutcome}
             activityEntries={activityEntries}
             filesLoading={filesLoading}
             filesError={filesError}
@@ -171,6 +173,8 @@ export default function EndUserWorkspacePage() {
             uploadPending={uploadPending}
             uploadError={uploadError}
             uploadRequestId={uploadRequestId}
+            runRequestId={runRequestId}
+            streamRequestId={streamRequestId}
             runPending={runPending}
             mismatchActive={mismatchActive}
             onRefreshFiles={loadFiles}
