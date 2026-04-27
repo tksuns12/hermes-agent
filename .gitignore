@@ -1,3 +1,4 @@
+.DS_Store
 /venv/
 /_pycache/
 *.pyc*
@@ -99,3 +100,4 @@ coverage/
 
 # Graphify
 graphify-out/
+models-dev-upstream/

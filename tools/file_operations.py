@@ -35,6 +35,13 @@ from pathlib import Path
 from hermes_constants import get_current_tenant, get_hermes_home, get_user_home, normalize_tenant
 from tools.binary_extensions import BINARY_EXTENSIONS
 
+from agent.file_safety import (
+    build_write_denied_paths,
+    build_write_denied_prefixes,
+    get_safe_write_root as _shared_get_safe_write_root,
+    is_write_denied as _shared_is_write_denied,
+)
+
 
 # ---------------------------------------------------------------------------
 # Write-path deny list — blocks writes to sensitive system/credential files
@@ -42,41 +49,9 @@ from tools.binary_extensions import BINARY_EXTENSIONS
 
 _HOME = str(Path.home())
 
-WRITE_DENIED_PATHS = {
-    os.path.realpath(p) for p in [
-        os.path.join(_HOME, ".ssh", "authorized_keys"),
-        os.path.join(_HOME, ".ssh", "id_rsa"),
-        os.path.join(_HOME, ".ssh", "id_ed25519"),
-        os.path.join(_HOME, ".ssh", "config"),
-        str(get_hermes_home() / ".env"),
-        os.path.join(_HOME, ".bashrc"),
-        os.path.join(_HOME, ".zshrc"),
-        os.path.join(_HOME, ".profile"),
-        os.path.join(_HOME, ".bash_profile"),
-        os.path.join(_HOME, ".zprofile"),
-        os.path.join(_HOME, ".netrc"),
-        os.path.join(_HOME, ".pgpass"),
-        os.path.join(_HOME, ".npmrc"),
-        os.path.join(_HOME, ".pypirc"),
-        "/etc/sudoers",
-        "/etc/passwd",
-        "/etc/shadow",
-    ]
-}
+WRITE_DENIED_PATHS = build_write_denied_paths(_HOME)
 
-WRITE_DENIED_PREFIXES = [
-    os.path.realpath(p) + os.sep for p in [
-        os.path.join(_HOME, ".ssh"),
-        os.path.join(_HOME, ".aws"),
-        os.path.join(_HOME, ".gnupg"),
-        os.path.join(_HOME, ".kube"),
-        "/etc/sudoers.d",
-        "/etc/systemd",
-        os.path.join(_HOME, ".docker"),
-        os.path.join(_HOME, ".azure"),
-        os.path.join(_HOME, ".config", "gh"),
-    ]
-]
+WRITE_DENIED_PREFIXES = build_write_denied_prefixes(_HOME)
 
 
 def _get_safe_write_root(user_id: str | None = None) -> Optional[str]:
@@ -165,9 +140,9 @@ def _is_write_denied(path: str, user_id: str | None = None) -> bool:
 
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Result Data Classes
-# =============================================================================
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ReadResult:
@@ -290,9 +265,9 @@ class ExecuteResult:
     exit_code: int = 0
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Abstract Interface
-# =============================================================================
+# ---------------------------------------------------------------------------
 
 class FileOperations(ABC):
     """Abstract interface for file operations across terminal backends."""
@@ -346,9 +321,9 @@ class FileOperations(ABC):
         ...
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Shell-based Implementation
-# =============================================================================
+# ---------------------------------------------------------------------------
 
 # Image extensions (subset of binary that we can return as base64)
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico'}
@@ -366,6 +341,45 @@ LINTERS = {
 MAX_LINES = 2000
 MAX_LINE_LENGTH = 2000
 MAX_FILE_SIZE = 50 * 1024  # 50KB
+DEFAULT_READ_OFFSET = 1
+DEFAULT_READ_LIMIT = 500
+DEFAULT_SEARCH_OFFSET = 0
+DEFAULT_SEARCH_LIMIT = 50
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    """Best-effort integer coercion for tool pagination inputs."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_read_pagination(offset: Any = DEFAULT_READ_OFFSET,
+                              limit: Any = DEFAULT_READ_LIMIT) -> tuple[int, int]:
+    """Return safe read_file pagination bounds.
+
+    Tool schemas declare minimum/maximum values, but not every caller or
+    provider enforces schemas before dispatch. Clamp here so invalid values
+    cannot leak into sed ranges like ``0,-1p``.
+
+    The upper bound on ``limit`` comes from ``tool_output.max_lines`` in
+    config.yaml (defaults to the module-level ``MAX_LINES`` constant).
+    """
+    from tools.tool_output_limits import get_max_lines
+    max_lines = get_max_lines()
+    normalized_offset = max(1, _coerce_int(offset, DEFAULT_READ_OFFSET))
+    normalized_limit = _coerce_int(limit, DEFAULT_READ_LIMIT)
+    normalized_limit = max(1, min(normalized_limit, max_lines))
+    return normalized_offset, normalized_limit
+
+
+def normalize_search_pagination(offset: Any = DEFAULT_SEARCH_OFFSET,
+                                limit: Any = DEFAULT_SEARCH_LIMIT) -> tuple[int, int]:
+    """Return safe search pagination bounds for shell head/tail pipelines."""
+    normalized_offset = max(0, _coerce_int(offset, DEFAULT_SEARCH_OFFSET))
+    normalized_limit = max(1, _coerce_int(limit, DEFAULT_SEARCH_LIMIT))
+    return normalized_offset, normalized_limit
 
 
 class ShellFileOperations(FileOperations):
@@ -477,12 +491,14 @@ class ShellFileOperations(FileOperations):
     
     def _add_line_numbers(self, content: str, start_line: int = 1) -> str:
         """Add line numbers to content in LINE_NUM|CONTENT format."""
+        from tools.tool_output_limits import get_max_line_length
+        max_line_length = get_max_line_length()
         lines = content.split('\n')
         numbered = []
         for i, line in enumerate(lines, start=start_line):
             # Truncate long lines
-            if len(line) > MAX_LINE_LENGTH:
-                line = line[:MAX_LINE_LENGTH] + "... [truncated]"
+            if len(line) > max_line_length:
+                line = line[:max_line_length] + "... [truncated]"
             numbered.append(f"{i:6d}|{line}")
         return '\n'.join(numbered)
     def _expand_path(self, path: str) -> str:
@@ -548,9 +564,9 @@ class ShellFileOperations(FileOperations):
         )
         return ''.join(diff)
     
-    # =========================================================================
+    # -------------------------------------------------------------------------
     # READ Implementation
-    # =========================================================================
+    # -------------------------------------------------------------------------
     
     def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
         """
@@ -567,8 +583,7 @@ class ShellFileOperations(FileOperations):
         # Expand ~ and other shell paths
         path = self._expand_path(path)
         
-        # Clamp limit
-        limit = min(limit, MAX_LINES)
+        offset, limit = normalize_read_pagination(offset, limit)
         
         # Check if file exists and get size (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
@@ -745,9 +760,9 @@ class ShellFileOperations(FileOperations):
             return WriteResult(error=f"Failed to move {src} -> {dst}: {result.stdout}")
         return WriteResult()
 
-    # =========================================================================
+    # -------------------------------------------------------------------------
     # WRITE Implementation
-    # =========================================================================
+    # -------------------------------------------------------------------------
 
     def write_file(self, path: str, content: str) -> WriteResult:
         """
@@ -803,9 +818,9 @@ class ShellFileOperations(FileOperations):
             dirs_created=dirs_created
         )
     
-    # =========================================================================
+    # -------------------------------------------------------------------------
     # PATCH Implementation (Replace Mode)
-    # =========================================================================
+    # -------------------------------------------------------------------------
     
     def patch_replace(self, path: str, old_string: str, new_string: str,
                       replace_all: bool = False) -> PatchResult:
@@ -844,12 +859,14 @@ class ShellFileOperations(FileOperations):
             content, old_string, new_string, replace_all
         )
         
-        if error:
-            return PatchResult(error=error)
-        
-        if match_count == 0:
-            return PatchResult(error=f"Could not find match for old_string in {path}")
-        
+        if error or match_count == 0:
+            err_msg = error or f"Could not find match for old_string in {path}"
+            try:
+                from tools.fuzzy_match import format_no_match_hint
+                err_msg += format_no_match_hint(err_msg, match_count, old_string, content)
+            except Exception:
+                pass
+            return PatchResult(error=err_msg)
         # Write back
         write_result = self.write_file(path, new_content)
         if write_result.error:
@@ -947,9 +964,9 @@ class ShellFileOperations(FileOperations):
             output=result.stdout.strip() if result.stdout.strip() else ""
         )
     
-    # =========================================================================
+    # -------------------------------------------------------------------------
     # SEARCH Implementation
-    # =========================================================================
+    # -------------------------------------------------------------------------
     
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
@@ -970,6 +987,8 @@ class ShellFileOperations(FileOperations):
         Returns:
             SearchResult with matches or file list
         """
+        offset, limit = normalize_search_pagination(offset, limit)
+
         # Expand ~ and other shell paths
         path = self._expand_path(path)
         

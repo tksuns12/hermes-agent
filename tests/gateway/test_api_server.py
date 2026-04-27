@@ -12,6 +12,8 @@ Tests cover:
 - Error handling (invalid JSON, missing fields)
 """
 
+# pyright: reportMissingImports=false
+
 import asyncio
 import base64
 import json
@@ -29,6 +31,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     OutputFileStore,
     ResponseStore,
+    _IdempotencyCache,
     _CORS_HEADERS,
     _derive_chat_session_id,
     check_api_server_requirements,
@@ -121,6 +124,95 @@ class TestOutputFileStore:
         assert fetched["filename"] == "report.txt"
         assert Path(fetched["path"]).read_text() == "hello file"
         assert store.get(stored["file_id"], user_id="bob") is None
+
+
+# ---------------------------------------------------------------------------
+# _IdempotencyCache
+# ---------------------------------------------------------------------------
+
+
+class TestIdempotencyCache:
+    @pytest.mark.asyncio
+    async def test_concurrent_same_key_and_fingerprint_runs_once(self):
+        cache = _IdempotencyCache()
+        gate = asyncio.Event()
+        started = asyncio.Event()
+        calls = 0
+
+        async def compute():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await gate.wait()
+            return ("response", {"total_tokens": 1})
+
+        first = asyncio.create_task(cache.get_or_set("idem-key", "fp-1", compute))
+        second = asyncio.create_task(cache.get_or_set("idem-key", "fp-1", compute))
+
+        await started.wait()
+        assert calls == 1
+
+        gate.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        assert first_result == second_result == ("response", {"total_tokens": 1})
+
+    @pytest.mark.asyncio
+    async def test_different_fingerprint_does_not_reuse_inflight_task(self):
+        cache = _IdempotencyCache()
+        gate = asyncio.Event()
+        started = asyncio.Event()
+        calls = 0
+
+        async def compute():
+            nonlocal calls
+            calls += 1
+            result = calls
+            if calls == 2:
+                started.set()
+            await gate.wait()
+            return result
+
+        first = asyncio.create_task(cache.get_or_set("idem-key", "fp-1", compute))
+        second = asyncio.create_task(cache.get_or_set("idem-key", "fp-2", compute))
+
+        await started.wait()
+        assert calls == 2
+
+        gate.set()
+        results = await asyncio.gather(first, second)
+
+        assert sorted(results) == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_waiter_does_not_drop_shared_inflight_task(self):
+        cache = _IdempotencyCache()
+        gate = asyncio.Event()
+        started = asyncio.Event()
+        calls = 0
+
+        async def compute():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await gate.wait()
+            return "response"
+
+        first = asyncio.create_task(cache.get_or_set("idem-key", "fp-1", compute))
+
+        await started.wait()
+        assert calls == 1
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(cache.get_or_set("idem-key", "fp-1", compute))
+        await asyncio.sleep(0)
+        assert calls == 1
+
+        gate.set()
+        assert await second == "response"
 
 
 # ---------------------------------------------------------------------------
@@ -1614,6 +1706,145 @@ class TestResponsesStreaming:
                 assert data["status"] == "completed"
                 assert data["output"][-1]["content"][0]["text"] == "Stored response"
 
+    @pytest.mark.asyncio
+    async def test_stream_cancelled_persists_incomplete_snapshot(self, adapter):
+        """Server-side asyncio.CancelledError (shutdown, request timeout) must
+        still leave an ``incomplete`` snapshot in ResponseStore so
+        GET /v1/responses/{id} and previous_response_id chaining keep
+        working.  Regression for PR #15171 follow-up.
+
+        Calls _write_sse_responses directly so the test can await the
+        handler to completion (TestClient disconnection races the server
+        handler, which makes end-to-end assertion on the final stored
+        snapshot flaky).
+        """
+        # Build a minimal fake request + stream queue the writer understands.
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        written_payloads: list[bytes] = []
+
+        class _FakeStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                written_payloads.append(payload)
+
+        # Patch web.StreamResponse for the duration of the writer call.
+        import gateway.platforms.api_server as api_mod
+        import queue as _q
+
+        stream_q: _q.Queue[str | None] = _q.Queue()
+
+        async def _agent_coro():
+            # Feed one partial delta into the stream queue...
+            stream_q.put("partial output")
+            # ...then give the drain loop a moment to pick it up before
+            # raising CancelledError to simulate a server-side cancel.
+            await asyncio.sleep(0.01)
+            raise asyncio.CancelledError()
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+
+        with patch.object(api_mod.web, "StreamResponse", return_value=_FakeStreamResponse()):
+            with pytest.raises(asyncio.CancelledError):
+                await adapter._write_sse_responses(
+                    request=fake_request,
+                    response_id=response_id,
+                    model="hermes-agent",
+                    created_at=int(time.time()),
+                    stream_q=stream_q,
+                    agent_task=agent_task,
+                    agent_ref=[None],
+                    conversation_history=[],
+                    storage_history=[],
+                    user_message="will be cancelled",
+                    stored_user_message="will be cancelled",
+                    instructions=None,
+                    conversation=None,
+                    store=True,
+                    session_id=None,
+                    tenant="default",
+                )
+
+        # The in_progress snapshot was persisted on response.created,
+        # and the CancelledError handler must have updated it to
+        # ``incomplete`` with the partial text it saw.
+        stored = adapter._response_store.get(response_id)
+        assert stored is not None, "snapshot must be retrievable after cancellation"
+        assert stored["response"]["status"] == "incomplete"
+        # Partial text captured before cancel should be preserved.
+        output_text = "".join(
+            part.get("text", "")
+            for item in stored["response"].get("output", [])
+            if item.get("type") == "message"
+            for part in item.get("content", [])
+        )
+        assert "partial output" in output_text
+
+    @pytest.mark.asyncio
+    async def test_stream_client_disconnect_persists_incomplete_snapshot(self, adapter):
+        """Client disconnect (ConnectionResetError) during streaming must
+        persist an ``incomplete`` snapshot in ResponseStore.  Regression
+        for PR #15171."""
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        write_call_count = {"n": 0}
+
+        class _DisconnectingStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                # First two writes succeed (prepare + response.created).
+                # On the third write (a text delta), the "client"
+                # disconnects — simulate with ConnectionResetError.
+                write_call_count["n"] += 1
+                if write_call_count["n"] >= 3:
+                    raise ConnectionResetError("simulated client disconnect")
+
+        import gateway.platforms.api_server as api_mod
+        import queue as _q
+
+        stream_q: _q.Queue[str | None] = _q.Queue()
+        stream_q.put("some streamed text")
+        stream_q.put(None)  # EOS sentinel
+
+        async def _agent_coro():
+            await asyncio.sleep(0.01)
+            return ({"final_response": "", "messages": [], "api_calls": 0},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+
+        with patch.object(api_mod.web, "StreamResponse", return_value=_DisconnectingStreamResponse()):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=[None],
+                conversation_history=[],
+                storage_history=[],
+                user_message="will disconnect",
+                stored_user_message="will disconnect",
+                instructions=None,
+                conversation=None,
+                store=True,
+                session_id=None,
+                tenant="default",
+            )
+
+        stored = adapter._response_store.get(response_id)
+        assert stored is not None, "snapshot must survive client disconnect"
+        assert stored["response"]["status"] == "incomplete"
+
 
 # ---------------------------------------------------------------------------
 # Auth on endpoints
@@ -1759,6 +1990,7 @@ class TestSendMethod:
         adapter = APIServerAdapter(config)
         result = await adapter.send("chat1", "hello")
         assert result.success is False
+        assert result.error is not None
         assert "HTTP request/response" in result.error
 
 
@@ -3141,7 +3373,9 @@ class TestRunsEndpoint:
                     if fake_agent.run_conversation.call_args is not None:
                         break
                     await asyncio.sleep(0.01)
+                assert fake_agent.run_conversation.call_args is not None
                 assert fake_agent.run_conversation.call_args.kwargs["conversation_history"] == []
+                assert mock_create_agent.call_args is not None
                 assert mock_create_agent.call_args.kwargs["user_id"] == "bob"
 
     @pytest.mark.asyncio
@@ -3186,11 +3420,13 @@ class TestRunsEndpoint:
                         break
                     await asyncio.sleep(0.01)
 
+                assert fake_agent.run_conversation.call_args is not None
                 call_kwargs = fake_agent.run_conversation.call_args.kwargs
                 assert "summarize this" in call_kwargs["user_message"]
                 assert "[input_file:report.xlsx" in call_kwargs["user_message"]
                 assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in call_kwargs["user_message"]
                 assert "tenant scoped workbook" not in call_kwargs["user_message"]
+                assert mock_create_agent.call_args is not None
                 assert mock_create_agent.call_args.kwargs["user_id"] == "owner"
 
     @pytest.mark.asyncio
@@ -3339,7 +3575,9 @@ class TestRunsEndpoint:
                         break
                     await asyncio.sleep(0.01)
 
+                assert fake_agent.run_conversation.call_args is not None
                 call_kwargs = fake_agent.run_conversation.call_args.kwargs
+                assert mock_create_agent.call_args is not None
                 assert mock_create_agent.call_args.kwargs["session_id"] == "session-files"
                 assert call_kwargs["conversation_history"] == sanitized
                 history_text = "\n".join(str(msg.get("content", "")) for msg in call_kwargs["conversation_history"])

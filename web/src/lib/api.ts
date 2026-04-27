@@ -1,5 +1,7 @@
 const BASE = "";
 
+import type { DashboardTheme } from "@/themes/types";
+
 // Ephemeral session token for protected endpoints.
 // Injected into index.html by the server — never fetched via API.
 declare global {
@@ -8,12 +10,19 @@ declare global {
     }
 }
 let _sessionToken: string | null = null;
+const SESSION_HEADER = "X-Hermes-Session-Token";
+
+function setSessionHeader(headers: Headers, token: string): void {
+  if (!headers.has(SESSION_HEADER)) {
+    headers.set(SESSION_HEADER, token);
+  }
+}
 
 function withSessionAuthHeaders(init?: RequestInit): Headers {
     const headers = new Headers(init?.headers);
     const token = window.__HERMES_SESSION_TOKEN__;
-    if (token && !headers.has("Authorization")) {
-        headers.set("Authorization", `Bearer ${token}`);
+    if (token) {
+        setSessionHeader(headers, token);
     }
     return headers;
 }
@@ -289,7 +298,7 @@ export const api = {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                Authorization: `Bearer ${token}`,
+                [SESSION_HEADER]: token,
             },
             body: JSON.stringify({ key }),
         });
@@ -592,7 +601,7 @@ export const api = {
             `/api/providers/oauth/${encodeURIComponent(providerId)}`,
             {
                 method: "DELETE",
-                headers: { Authorization: `Bearer ${token}` },
+                headers: { [SESSION_HEADER]: token },
             },
         );
     },
@@ -604,7 +613,7 @@ export const api = {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
-                    Authorization: `Bearer ${token}`,
+                    [SESSION_HEADER]: token,
                 },
                 body: "{}",
             },
@@ -618,7 +627,7 @@ export const api = {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
-                    Authorization: `Bearer ${token}`,
+                    [SESSION_HEADER]: token,
                 },
                 body: JSON.stringify({ session_id: sessionId, code }),
             },
@@ -634,10 +643,20 @@ export const api = {
             `/api/providers/oauth/sessions/${encodeURIComponent(sessionId)}`,
             {
                 method: "DELETE",
-                headers: { Authorization: `Bearer ${token}` },
+                headers: { [SESSION_HEADER]: token },
             },
         );
     },
+
+    // Gateway / update actions
+    restartGateway: () =>
+        fetchJSON<ActionResponse>("/api/gateway/restart", { method: "POST" }),
+    updateHermes: () =>
+        fetchJSON<ActionResponse>("/api/hermes/update", { method: "POST" }),
+    getActionStatus: (name: string, lines = 200) =>
+        fetchJSON<ActionStatusResponse>(
+            `/api/actions/${encodeURIComponent(name)}/status?lines=${lines}`,
+        ),
 
     // Dashboard plugins
     getPlugins: () =>
@@ -655,6 +674,20 @@ export const api = {
             body: JSON.stringify({ name }),
         }),
 };
+
+export interface ActionResponse {
+  name: string;
+  ok: boolean;
+  pid: number;
+}
+
+export interface ActionStatusResponse {
+  exit_code: number | null;
+  lines: string[];
+  name: string;
+  pid: number | null;
+  running: boolean;
+}
 
 export interface PlatformStatus {
     error_code?: string;
@@ -746,6 +779,7 @@ export interface AnalyticsDailyEntry {
     estimated_cost: number;
     actual_cost: number;
     sessions: number;
+    api_calls: number;
 }
 
 export interface AnalyticsModelEntry {
@@ -754,6 +788,7 @@ export interface AnalyticsModelEntry {
     output_tokens: number;
     estimated_cost: number;
     sessions: number;
+    api_calls: number;
 }
 
 export interface AnalyticsSkillEntry {
@@ -783,6 +818,7 @@ export interface AnalyticsResponse {
         total_estimated_cost: number;
         total_actual_cost: number;
         total_sessions: number;
+        total_api_calls: number;
     };
     skills: {
         summary: AnalyticsSkillsSummary;
@@ -1044,6 +1080,9 @@ export interface DashboardThemeSummary {
     description: string;
     label: string;
     name: string;
+    /** Full theme definition for user themes; undefined for built-ins
+     *  (which the frontend already has locally). */
+    definition?: DashboardTheme;
 }
 
 export interface DashboardThemesResponse {
@@ -1059,7 +1098,12 @@ export interface PluginManifestResponse {
     description: string;
     icon: string;
     version: string;
-    tab: { path: string; position: string };
+    tab: {
+        path: string;
+        position?: string;
+        override?: string;
+        hidden?: boolean;
+    };
     entry: string;
     css?: string | null;
     has_api: boolean;

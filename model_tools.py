@@ -24,6 +24,7 @@ import json
 import asyncio
 import logging
 import threading
+import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from hermes_constants import get_current_tenant, tenant_context
@@ -33,9 +34,9 @@ from toolsets import resolve_toolset, validate_toolset
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
+# -------------------------------------------------------------------------
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
-# =============================================================================
+# -------------------------------------------------------------------------
 
 _tool_loop = None          # persistent loop for the main (CLI) thread
 _tool_loop_lock = threading.Lock()
@@ -109,9 +110,15 @@ def _run_async(coro):
     if loop and loop.is_running():
         # Inside an async context (gateway, RL env) — run in a fresh thread.
         import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, coro)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(asyncio.run, coro)
+        try:
             return future.result(timeout=300)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     # If we're on a worker thread (e.g., parallel tool execution in
     # delegate_task), use a per-thread persistent loop.  This avoids
@@ -126,9 +133,9 @@ def _run_async(coro):
     return tool_loop.run_until_complete(coro)
 
 
-# =============================================================================
+# -------------------------------------------------------------------------
 # Tool Discovery  (importing each module triggers its registry.register calls)
-# =============================================================================
+# -------------------------------------------------------------------------
 
 discover_builtin_tools()
 
@@ -147,9 +154,9 @@ except Exception as e:
     logger.debug("Plugin discovery failed: %s", e)
 
 
-# =============================================================================
+# -------------------------------------------------------------------------
 # Backward-compat constants  (built once after discovery)
-# =============================================================================
+# -------------------------------------------------------------------------
 
 TOOL_TO_TOOLSET_MAP: Dict[str, str] = registry.get_tool_to_toolset_map()
 
@@ -160,9 +167,9 @@ TOOLSET_REQUIREMENTS: Dict[str, dict] = registry.get_toolset_requirements()
 _last_resolved_tool_names: List[str] = []
 
 
-# =============================================================================
+# -------------------------------------------------------------------------
 # Legacy toolset name mapping  (old _tools-suffixed names -> tool name lists)
-# =============================================================================
+# -------------------------------------------------------------------------
 
 _LEGACY_TOOLSET_MAP = {
     "web_tools": ["web_search", "web_extract"],
@@ -190,9 +197,9 @@ _LEGACY_TOOLSET_MAP = {
 }
 
 
-# =============================================================================
+# -------------------------------------------------------------------------
 # get_tool_definitions  (the main schema provider)
-# =============================================================================
+# -------------------------------------------------------------------------
 
 def get_tool_definitions(
     enabled_toolsets: List[str] = None,
@@ -283,30 +290,34 @@ def get_tool_definitions(
                 filtered_tools[i] = {"type": "function", "function": dynamic_schema}
                 break
 
-    # Rebuild discord_server schema based on the bot's privileged intents
-    # (detected from GET /applications/@me) and the user's action allowlist
-    # in config.  Hides actions the bot's intents don't support so the
-    # model never attempts them, and annotates fetch_messages when the
+    # Rebuild discord / discord_admin schemas based on the bot's privileged
+    # intents (detected from GET /applications/@me) and the user's action
+    # allowlist in config.  Hides actions the bot's intents don't support so
+    # the model never attempts them, and annotates fetch_messages when the
     # MESSAGE_CONTENT intent is missing.
-    if "discord_server" in available_tool_names:
-        try:
-            from tools.discord_tool import get_dynamic_schema
-            dynamic = get_dynamic_schema()
-        except Exception:  # pragma: no cover — defensive, fall back to static
-            dynamic = None
-        if dynamic is None:
-            # Tool filtered out entirely (empty allowlist or detection disabled
-            # the only remaining actions).  Drop it from the schema list.
-            filtered_tools = [
-                t for t in filtered_tools
-                if t.get("function", {}).get("name") != "discord_server"
-            ]
-            available_tool_names.discard("discord_server")
-        else:
-            for i, td in enumerate(filtered_tools):
-                if td.get("function", {}).get("name") == "discord_server":
-                    filtered_tools[i] = {"type": "function", "function": dynamic}
-                    break
+    _discord_schema_fns = {
+        "discord": "get_dynamic_schema_core",
+        "discord_admin": "get_dynamic_schema_admin",
+    }
+    for discord_tool_name in _discord_schema_fns:
+        if discord_tool_name in available_tool_names:
+            try:
+                from tools import discord_tool as _dt
+                schema_fn = getattr(_dt, _discord_schema_fns[discord_tool_name])
+                dynamic = schema_fn()
+            except Exception:
+                dynamic = None
+            if dynamic is None:
+                filtered_tools = [
+                    t for t in filtered_tools
+                    if t.get("function", {}).get("name") != discord_tool_name
+                ]
+                available_tool_names.discard(discord_tool_name)
+            else:
+                for i, td in enumerate(filtered_tools):
+                    if td.get("function", {}).get("name") == discord_tool_name:
+                        filtered_tools[i] = {"type": "function", "function": dynamic}
+                        break
 
     # Strip web tool cross-references from browser_navigate description when
     # web_search / web_extract are not available.  The static schema says
@@ -338,12 +349,24 @@ def get_tool_definitions(
     global _last_resolved_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
 
+    # Sanitize schemas for broad backend compatibility. llama.cpp's
+    # json-schema-to-grammar converter (used by its OAI server to build
+    # GBNF tool-call parsers) rejects some shapes that cloud providers
+    # silently accept — bare "type": "object" with no properties,
+    # string-valued schema nodes from malformed MCP servers, etc. This
+    # is a no-op for schemas that are already well-formed.
+    try:
+        from tools.schema_sanitizer import sanitize_tool_schemas
+        filtered_tools = sanitize_tool_schemas(filtered_tools)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning("Schema sanitization skipped: %s", e)
+
     return filtered_tools
 
 
-# =============================================================================
+# -------------------------------------------------------------------------
 # handle_function_call  (the main dispatcher)
-# =============================================================================
+# -------------------------------------------------------------------------
 
 # Tools whose execution is intercepted by the agent loop (run_agent.py)
 # because they need agent-level state (TodoStore, MemoryStore, etc.).
@@ -353,9 +376,9 @@ _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
-# =========================================================================
+# -------------------------------------------------------------------------
 # Tool argument type coercion
-# =========================================================================
+# -------------------------------------------------------------------------
 
 def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Coerce tool call arguments to match their JSON Schema types.
@@ -413,6 +436,31 @@ def _coerce_value(value: str, expected_type):
         return _coerce_number(value, integer_only=(expected_type == "integer"))
     if expected_type == "boolean":
         return _coerce_boolean(value)
+    if expected_type == "array":
+        return _coerce_json(value, list)
+    if expected_type == "object":
+        return _coerce_json(value, dict)
+    return value
+
+
+def _coerce_json(value: str, expected_python_type: type):
+    """Parse *value* as JSON when the schema expects an array or object.
+
+    Handles model output drift where a complex oneOf/discriminated-union schema
+    causes the LLM to emit the array/object as a JSON string instead of a native
+    structure.  Returns the original string if parsing fails or yields the wrong
+    Python type.
+    """
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return value
+    if isinstance(parsed, expected_python_type):
+        logger.debug(
+            "coerce_tool_args: coerced string to %s via json.loads",
+            expected_python_type.__name__,
+        )
+        return parsed
     return value
 
 
@@ -422,9 +470,9 @@ def _coerce_number(value: str, integer_only: bool = False):
         f = float(value)
     except (ValueError, OverflowError):
         return value
-    # Guard against inf/nan before int() conversion
+    # Guard against inf/nan — not JSON-serializable, keep original string
     if f != f or f == float("inf") or f == float("-inf"):
-        return f
+        return value
     # If it looks like an integer (no fractional part), return int
     if f == int(f):
         return int(f)
@@ -526,6 +574,14 @@ def handle_function_call(
             except Exception:
                 pass  # file_tools may not be loaded yet
 
+            # Measure tool dispatch latency so post_tool_call and
+            # transform_tool_result hooks can observe per-tool duration.
+            # Inspired by Claude Code 2.1.119, which added ``duration_ms`` to
+            # PostToolUse hook inputs so plugin authors can build latency
+            # dashboards, budget alerts, and regression canaries without having
+            # to wrap every tool manually.  We use monotonic() so the value is
+            # unaffected by wall-clock adjustments during the call.
+            _dispatch_start = time.monotonic()
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
@@ -541,6 +597,7 @@ def handle_function_call(
                     task_id=task_id,
                     user_task=user_task,
                 )
+            duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
             try:
                 from hermes_cli.plugins import invoke_hook
@@ -552,6 +609,7 @@ def handle_function_call(
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
+                    duration_ms=duration_ms,
                 )
             except Exception:
                 pass
@@ -572,6 +630,7 @@ def handle_function_call(
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
+                    duration_ms=duration_ms,
                 )
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
@@ -588,9 +647,9 @@ def handle_function_call(
             return json.dumps({"error": error_msg}, ensure_ascii=False)
 
 
-# =============================================================================
+# -------------------------------------------------------------------------
 # Backward-compat wrapper functions
-# =============================================================================
+# -------------------------------------------------------------------------
 
 def get_all_tool_names() -> List[str]:
     """Return all registered tool names."""

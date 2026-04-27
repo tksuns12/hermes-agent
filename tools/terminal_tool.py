@@ -59,9 +59,9 @@ from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — r
 
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Custom Singularity Environment with more space
-# =============================================================================
+# ---------------------------------------------------------------------------
 
 # Singularity helpers (scratch dir, SIF cache) now live in tools/environments/singularity.py
 from tools.environments.singularity import _get_scratch_dir
@@ -73,11 +73,48 @@ from tools.tool_backend_helpers import (
 )
 
 
+def _safe_parse_import_env(
+    name: str,
+    default: Any,
+    converter,
+    type_label: str,
+):
+    """Parse module-level numeric env vars without breaking import.
+
+    Terminal tool is imported by CLI, ACP, tests, and tool discovery. A single
+    malformed env var must not make the whole module unloadable at import time.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return converter(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid value for %s: %r (expected %s). Falling back to %r.",
+            name,
+            raw,
+            type_label,
+            default,
+        )
+        return default
+
+
 # Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
-FOREGROUND_MAX_TIMEOUT = int(os.getenv("TERMINAL_MAX_FOREGROUND_TIMEOUT", "600"))
+FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
+    "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+    600,
+    int,
+    "integer",
+)
 
 # Disk usage warning threshold (in GB)
-DISK_USAGE_WARNING_THRESHOLD_GB = float(os.getenv("TERMINAL_DISK_WARNING_GB", "500"))
+DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
+    "TERMINAL_DISK_WARNING_GB",
+    500.0,
+    float,
+    "number",
+)
 
 
 def _check_disk_usage_warning():
@@ -115,26 +152,48 @@ _cached_sudo_password: str = ""
 # Optional UI callbacks for interactive prompts. When set, these are called
 # instead of the default /dev/tty or input() readers. The CLI registers these
 # so prompts route through prompt_toolkit's event loop.
-#   _sudo_password_callback() -> str  (return password or "" to skip)
-#   _approval_callback(command, description) -> str  ("once"/"session"/"always"/"deny")
-_sudo_password_callback = None
-_approval_callback = None
+# Callback slots used by the approval prompt and sudo password prompt
+# routines. Stored in thread-local state so overlapping ACP sessions —
+# each running in its own ThreadPoolExecutor thread — don't stomp on
+# each other's callbacks. See GHSA-qg5c-hvr5-hjgr.
+#
+# CLI mode is single-threaded, so each thread (the only one) holds its
+# own callback exactly like before. Gateway mode resolves approvals via
+# the per-session queue in tools.approval, not through these callbacks,
+# so it's unaffected.
+import threading
+_callback_tls = threading.local()
+
+
+def _get_sudo_password_callback():
+    return getattr(_callback_tls, "sudo_password", None)
+
+
+def _get_approval_callback():
+    return getattr(_callback_tls, "approval", None)
 
 
 def set_sudo_password_callback(cb):
-    """Register a callback for sudo password prompts (used by CLI)."""
-    global _sudo_password_callback
-    _sudo_password_callback = cb
+    """Register a callback for sudo password prompts (used by CLI).
+
+    Per-thread scope — ACP sessions that run concurrently in a
+    ThreadPoolExecutor each have their own callback slot.
+    """
+    _callback_tls.sudo_password = cb
 
 
 def set_approval_callback(cb):
-    """Register a callback for dangerous command approval prompts (used by CLI)."""
-    global _approval_callback
-    _approval_callback = cb
+    """Register a callback for dangerous command approval prompts.
 
-# =============================================================================
+    Per-thread scope — ACP sessions that run concurrently in a
+    ThreadPoolExecutor each have their own callback slot. See
+    GHSA-qg5c-hvr5-hjgr.
+    """
+    _callback_tls.approval = cb
+
+# ---------------------------------------------------------------------------
 # Dangerous Command Approval System
-# =============================================================================
+# ---------------------------------------------------------------------------
 
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
@@ -145,7 +204,7 @@ from tools.approval import (
 def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_approval_callback)
+                                  approval_callback=_get_approval_callback())
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -218,12 +277,12 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
     directly from /dev/tty with echo disabled.
     """
     import sys
-    import time as time_module
     
     # Use the registered callback when available (prompt_toolkit-compatible)
-    if _sudo_password_callback is not None:
+    _sudo_cb = _get_sudo_password_callback()
+    if _sudo_cb is not None:
         try:
-            return _sudo_password_callback() or ""
+            return _sudo_cb() or ""
         except Exception:
             return ""
 
@@ -279,7 +338,7 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
     
     try:
         os.environ["HERMES_SPINNER_PAUSE"] = "1"
-        time_module.sleep(0.2)
+        time.sleep(0.2)
         
         print()
         print("┌" + "─" * 58 + "┐")
@@ -748,7 +807,32 @@ def clear_task_env_overrides(task_id: str):
     _task_env_overrides.pop(runtime_key, None)
 
 
-# Configuration from environment variables
+def _resolve_container_task_id(task_id: Optional[str]) -> str:
+    """
+    Map a tool-call ``task_id`` to the container/sandbox key used by
+    ``_active_environments``.
+
+    The top-level agent passes ``task_id=None`` and lands on ``"default"``.
+    ``delegate_task`` children pass their own subagent ID so that
+    file-state tracking, the active-subagents registry, and TUI events stay
+    distinct per child -- but we deliberately collapse that ID back to
+    ``"default"`` here so subagents share the parent's long-lived container
+    (one bash, one /workspace, one set of installed packages).
+
+    Exception: RL / benchmark environments (TerminalBench2, HermesSweEnv, ...)
+    call ``register_task_env_overrides(task_id, {...})`` to request a
+    per-task Docker/Modal image. When an override is registered for a
+    task_id, we honour it by returning the task_id unchanged -- those
+    rollouts need their own isolated sandbox, which is the whole point of
+    the override.
+    """
+    runtime_key, tenant, _ = resolve_runtime_key(task_id)
+    if task_id and (runtime_key in _task_env_overrides or task_id in _task_env_overrides):
+        return runtime_key
+    default_runtime_key, _, _ = resolve_runtime_key("default", tenant)
+    return default_runtime_key
+
+
 # Configuration from environment variables
 
 def _parse_env_var(name: str, default: str, converter=int, type_label: str = "integer"):
@@ -1087,8 +1171,9 @@ def _stop_cleanup_thread():
 
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
+    lookup = _resolve_container_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(task_id)
+        return _active_environments.get(lookup) or _active_environments.get(task_id)
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -1257,9 +1342,9 @@ def _atexit_cleanup():
 atexit.register(_atexit_cleanup)
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Exit Code Context for Common CLI Tools
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Many Unix commands use non-zero exit codes for informational purposes, not
 # to indicate failure.  The model sees a raw exit_code=1 from `grep` and
 # wastes a turn investigating something that just means "no matches".
@@ -1403,6 +1488,33 @@ def _foreground_background_guidance(command: str) -> str | None:
     return None
 
 
+def _resolve_notification_flag_conflict(
+    *,
+    notify_on_complete: bool,
+    watch_patterns,
+    background: bool,
+) -> tuple:
+    """Decide what to do when both notify_on_complete and watch_patterns are set.
+
+    These flags produce duplicate, delayed notifications when combined — one
+    notification per watch-pattern match AND one on process exit, with async
+    delivery that can spam the user long after the process ends. When both are
+    set, we drop watch_patterns in favor of notify_on_complete (the more useful
+    "let me know when it's done" signal) and return a human-readable note.
+
+    Returns:
+        (watch_patterns_to_use, conflict_note). conflict_note is "" when there
+        is no conflict.
+    """
+    if background and notify_on_complete and watch_patterns:
+        note = (
+            "watch_patterns ignored because notify_on_complete=True; "
+            "these two flags produce duplicate notifications when combined"
+        )
+        return None, note
+    return watch_patterns, ""
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -1425,8 +1537,8 @@ def terminal_tool(
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
-        notify_on_complete: If True and background=True, auto-notify the agent when the process exits
-        watch_patterns: List of strings to watch for in background output; fires a notification on first match per pattern. Use ONLY for mid-process signals (errors, readiness markers) that appear before exit. For end-of-run markers use notify_on_complete instead — stacking both produces duplicate, delayed notifications.
+        notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
+        watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -1462,7 +1574,12 @@ def terminal_tool(
         env_type = config["env_type"]
 
         # Use tenant-aware runtime key for environment isolation
-        runtime_key, tenant, effective_task_id = resolve_runtime_key(task_id)
+        # Use task_id for environment isolation. By default all subagent
+        # task_ids collapse back to "default" so the top-level agent and
+        # every delegate_task child share one container; only task_ids with
+        # a registered env override (RL benchmarks) get isolated sandboxes.
+        runtime_key = _resolve_container_task_id(task_id)
+        tenant, effective_task_id = split_runtime_key(runtime_key)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config
@@ -1562,6 +1679,8 @@ def terminal_tool(
                                 "modal_mode": config.get("modal_mode", "auto"),
                                 "docker_volumes": config.get("docker_volumes", []),
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                                "docker_forward_env": config.get("docker_forward_env", []),
+                                "docker_env": config.get("docker_env", {}),
                             }
 
                         local_config = None
@@ -1714,6 +1833,22 @@ def terminal_tool(
                         proc_session.watcher_user_name = _gw_user_name
                         proc_session.watcher_thread_id = _gw_thread_id
 
+                # Mutual exclusion: if both notify_on_complete and watch_patterns
+                # are set, drop watch_patterns. The combination produces duplicate
+                # notifications (one per match + one on exit) that deliver
+                # asynchronously and can spam the user long after the process ends.
+                # notify_on_complete is the more useful signal for "let me know
+                # when the task finishes"; watch_patterns should be reserved for
+                # standalone mid-process signals on long-lived processes.
+                watch_patterns, conflict_note = _resolve_notification_flag_conflict(
+                    notify_on_complete=bool(notify_on_complete),
+                    watch_patterns=watch_patterns,
+                    background=bool(background),
+                )
+                if conflict_note:
+                    logger.warning("background proc %s: %s", proc_session.id, conflict_note)
+                    result_data["watch_patterns_ignored"] = conflict_note
+
                 # Mark for agent notification on completion
                 if notify_on_complete and background:
                     proc_session.notify_on_complete = True
@@ -1792,7 +1927,7 @@ def terminal_tool(
             # Extract output
             output = result.get("output", "")
             returncode = result.get("returncode", 0)
-            
+
             # Add helpful message for sudo failures in messaging context
             output = _handle_sudo_failure(output, env_type)
 
@@ -1818,7 +1953,8 @@ def terminal_tool(
                 pass
             
             # Truncate output if too long, keeping both head and tail
-            MAX_OUTPUT_CHARS = 50000
+            from tools.tool_output_limits import get_max_bytes
+            MAX_OUTPUT_CHARS = get_max_bytes()
             if len(output) > MAX_OUTPUT_CHARS:
                 head_chars = int(MAX_OUTPUT_CHARS * 0.4)  # 40% head (error messages often appear early)
                 tail_chars = MAX_OUTPUT_CHARS - head_chars  # 60% tail (most recent/relevant output)
@@ -2051,13 +2187,13 @@ TERMINAL_SCHEMA = {
             },
             "notify_on_complete": {
                 "type": "boolean",
-                "description": "When true (and background=true), you'll be automatically notified when the process finishes — no polling needed. Use this for tasks that take a while (tests, builds, deployments) so you can keep working on other things in the meantime.",
+                "description": "When true (and background=true), you'll be automatically notified exactly once when the process finishes. **This is the right choice for almost every long-running task** — tests, builds, deployments, multi-item batch jobs, anything that takes over a minute and has a defined end. Use this and keep working on other things; the system notifies you on exit. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
                 "default": False
             },
             "watch_patterns": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Strings to watch for in background process output. Fires a notification the first time each pattern matches a line of output. **Use ONLY for mid-process signals** you want to react to before the process exits — errors, readiness markers, intermediate step markers (e.g. [\"ERROR\", \"Traceback\", \"listening on port\"]). Do NOT use for end-of-run markers (summary headers, 'DONE', 'PASS' printed right before exit) — use `notify_on_complete` for that instead. Stacking end-of-run patterns on top of `notify_on_complete` produces duplicate, delayed notifications that arrive after you've already moved on, since delivery is asynchronous and continues after the process exits."
+                "description": "Strings to watch for in background process output. HARD RATE LIMIT: at most 1 notification per 15 seconds per process — matches arriving inside the cooldown are dropped. After 3 consecutive 15-second windows with dropped matches, watch_patterns is automatically disabled for that process and promoted to notify_on_complete behavior (one notification on exit, no more mid-process spam). USE ONLY for truly rare, one-shot mid-process signals on LONG-LIVED processes that will never exit on their own — e.g. ['Application startup complete'] on a server so you know when to hit its endpoint, or ['migration done'] on a daemon. DO NOT use for: (1) end-of-run markers like 'DONE'/'PASS' — use notify_on_complete instead; (2) error patterns like 'ERROR'/'Traceback' in loops or multi-item batch jobs — they fire on every iteration and you'll hit the strike limit fast; (3) anything you'd ever combine with notify_on_complete. When in doubt, choose notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both."
             }
         },
         "required": ["command"]
