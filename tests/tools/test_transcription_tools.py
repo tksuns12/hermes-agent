@@ -414,6 +414,10 @@ class TestTranscribeLocalCommand:
 # _transcribe_local — additional tests
 # ============================================================================
 
+@pytest.mark.skipif(
+    not __import__("importlib").util.find_spec("faster_whisper"),
+    reason="faster_whisper not installed",
+)
 class TestTranscribeLocalExtended:
     def test_model_reuse_on_second_call(self, tmp_path):
         """Second call with same model should NOT reload the model."""
@@ -763,6 +767,7 @@ class TestValidateAudioFileEdgeCases:
              patch("pathlib.Path.is_file", return_value=True), \
              patch("pathlib.Path.stat", side_effect=OSError("disk error")):
             result = _validate_audio_file(str(f))
+
         assert result is not None
         assert "Failed to access" in result["error"]
 
